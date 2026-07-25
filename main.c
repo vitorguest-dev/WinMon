@@ -24,6 +24,7 @@
 #define ID_EXPORT_SNAPSHOT 1001
 #define WM_TRAYICON (WM_APP + 1)
 #define ID_TRAY_ICON 1
+#define MAX_CORES 64 // Limite de núcleos monitorizados individualmente (suficiente para uso doméstico)
 
 // Limites que disparam alerta visual
 #define LIMITE_RAM_PERCENT 90.0
@@ -61,6 +62,9 @@ HWND hMainWindow = NULL;
 HWND hEdit;
 PDH_HQUERY hQuery;
 PDH_HCOUNTER hCounterCPU;
+PDH_HCOUNTER hCounterCoresCPU[MAX_CORES];
+PDH_HCOUNTER hCounterDiskRead = NULL;
+PDH_HCOUNTER hCounterDiskWrite = NULL;
 HFONT hFontMonitor = NULL;
 HMODULE hRichEditLib = NULL;
 NOTIFYICONDATAA nid;
@@ -69,6 +73,7 @@ DWORDLONG lastIn = 0;
 DWORDLONG lastOut = 0;
 int firstNetworkRead = 1;
 int numProcessadores = 1;
+int numNucleosMonitorizados = 0; // min(numProcessadores, MAX_CORES) — limita o array de contadores por núcleo
 
 // Estado do último ciclo, usado para o export de snapshot (Ctrl+S) e para o tooltip do tray
 static char ultimoSnapshot[BUFFER_SIZE];
@@ -160,9 +165,10 @@ void MonitorarSistema(char *buffer, size_t size, size_t *offset) {
     *offset += snprintf(buffer + *offset, size - *offset, "\r\n");
 }
 
-// 2. Leitura da CPU via PDH
+// 2. Leitura da CPU via PDH (total + detalhe por núcleo)
 void MonitorarCPU(char *buffer, size_t size, size_t *offset) {
     PDH_FMT_COUNTERVALUE counterVal;
+    // Este PdhCollectQueryData atualiza TODOS os contadores da query (total, por núcleo, disco I/O)
     PdhCollectQueryData(hQuery);
     PdhGetFormattedCounterValue(hCounterCPU, PDH_FMT_DOUBLE, NULL, &counterVal);
 
@@ -171,8 +177,51 @@ void MonitorarCPU(char *buffer, size_t size, size_t *offset) {
 
     *offset += snprintf(buffer + *offset, size - *offset,
                         "=== [ PROCESSADOR ] ===\r\n"
-                        "Uso Atual da CPU: %.1f%%\r\n\r\n",
+                        "Uso Atual da CPU (Total): %.1f%%\r\n",
                         cpuAtual);
+
+    // Detalhe por núcleo, 4 valores por linha para não ficar demasiado comprido
+    if (numNucleosMonitorizados > 0) {
+        *offset += snprintf(buffer + *offset, size - *offset, "Por Nucleo: ");
+        for (int i = 0; i < numNucleosMonitorizados; i++) {
+            PDH_FMT_COUNTERVALUE coreVal;
+            double corePercent = 0.0;
+            if (PdhGetFormattedCounterValue(hCounterCoresCPU[i], PDH_FMT_DOUBLE, NULL, &coreVal) == ERROR_SUCCESS
+                && coreVal.CStatus == ERROR_SUCCESS) {
+                corePercent = coreVal.doubleValue;
+            }
+            *offset += snprintf(buffer + *offset, size - *offset, "C%d:%5.1f%%  ", i, corePercent);
+            if ((i + 1) % 4 == 0 && (i + 1) < numNucleosMonitorizados) {
+                *offset += snprintf(buffer + *offset, size - *offset, "\r\n            ");
+            }
+        }
+        *offset += snprintf(buffer + *offset, size - *offset, "\r\n");
+    }
+    *offset += snprintf(buffer + *offset, size - *offset, "\r\n");
+}
+
+// Velocidade de leitura/escrita de disco (total de todos os discos físicos), via PDH
+void MonitorarDiscoIO(char *buffer, size_t size, size_t *offset) {
+    PDH_FMT_COUNTERVALUE readVal, writeVal;
+    double bytesLeitura = 0.0, bytesEscrita = 0.0;
+
+    if (hCounterDiskRead && PdhGetFormattedCounterValue(hCounterDiskRead, PDH_FMT_DOUBLE, NULL, &readVal) == ERROR_SUCCESS
+        && readVal.CStatus == ERROR_SUCCESS) {
+        bytesLeitura = readVal.doubleValue;
+    }
+    if (hCounterDiskWrite && PdhGetFormattedCounterValue(hCounterDiskWrite, PDH_FMT_DOUBLE, NULL, &writeVal) == ERROR_SUCCESS
+        && writeVal.CStatus == ERROR_SUCCESS) {
+        bytesEscrita = writeVal.doubleValue;
+    }
+
+    char leituraStr[32], escritaStr[32];
+    FormatarBytes(bytesLeitura, leituraStr, sizeof(leituraStr));
+    FormatarBytes(bytesEscrita, escritaStr, sizeof(escritaStr));
+
+    *offset += snprintf(buffer + *offset, size - *offset,
+                        "=== [ DISCO - VELOCIDADE I/O (TOTAL) ] ===\r\n"
+                        "Leitura: %-10s/s | Escrita: %-10s/s\r\n\r\n",
+                        leituraStr, escritaStr);
 }
 
 // 3. Memória RAM Global (com deteção de alerta se uso > LIMITE_RAM_PERCENT)
@@ -438,6 +487,7 @@ void AtualizarMonitor() {
     MonitorarCPU(buffer, BUFFER_SIZE, &offset);
     MonitorarRAM(buffer, BUFFER_SIZE, &offset);
     MonitorarDiscos(buffer, BUFFER_SIZE, &offset);
+    MonitorarDiscoIO(buffer, BUFFER_SIZE, &offset);
     MonitorarRede(buffer, BUFFER_SIZE, &offset);
     MonitorarProcessos(buffer, BUFFER_SIZE, &offset);
 
@@ -484,6 +534,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             // Inicialização do PDH
             PdhOpenQuery(NULL, 0, &hQuery);
             PdhAddEnglishCounter(hQuery, "\\Processor(_Total)\\% Processor Time", 0, &hCounterCPU);
+
+            // Contador por núcleo (um por processador lógico, até MAX_CORES)
+            numNucleosMonitorizados = (numProcessadores < MAX_CORES) ? numProcessadores : MAX_CORES;
+            for (int i = 0; i < numNucleosMonitorizados; i++) {
+                char pathContador[64];
+                snprintf(pathContador, sizeof(pathContador), "\\Processor(%d)\\%% Processor Time", i);
+                PdhAddEnglishCounter(hQuery, pathContador, 0, &hCounterCoresCPU[i]);
+            }
+
+            // Contadores de velocidade de leitura/escrita em disco (todos os discos físicos)
+            PdhAddEnglishCounter(hQuery, "\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0, &hCounterDiskRead);
+            PdhAddEnglishCounter(hQuery, "\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", 0, &hCounterDiskWrite);
+
             PdhCollectQueryData(hQuery);
 
             // Preparação do ícone do tray (só é adicionado quando a janela é minimizada)
