@@ -22,16 +22,32 @@
 typedef struct {
     DWORD pid;
     SIZE_T memUsageMB;
+    double cpuPercent;
     char exeFile[MAX_PATH];
 } ProcessoInfo;
+
+// Estrutura para guardar os tempos de CPU anteriores de cada processo (para calcular delta)
+typedef struct {
+    DWORD pid;
+    ULONGLONG lastKernelTime;
+    ULONGLONG lastUserTime;
+    int valido;
+} ProcessoCpuHistorico;
+
+#define MAX_HISTORICO 2048
+static ProcessoCpuHistorico historicoCpu[MAX_HISTORICO];
+static int totalHistorico = 0;
+static ULONGLONG lastSystemTime = 0;
 
 // Variáveis Globais de Estado
 HWND hEdit;
 PDH_HQUERY hQuery;
 PDH_HCOUNTER hCounterCPU;
+HFONT hFontMonitor = NULL;
 DWORDLONG lastIn = 0;
 DWORDLONG lastOut = 0;
 int firstNetworkRead = 1;
+int numProcessadores = 1;
 
 // Buffer estático para armazenar a lista de processos sem alocação dinâmica no heap a cada ciclo
 static ProcessoInfo listaProcessos[MAX_PROCESSES];
@@ -44,12 +60,37 @@ void FormatarBytes(double bytes, char *buffer, size_t size) {
     else snprintf(buffer, size, "%.0f B", bytes);
 }
 
+// Converte FILETIME para um único valor de 64 bits (100-ns intervals)
+static ULONGLONG FileTimeToU64(FILETIME ft) {
+    ULARGE_INTEGER uli;
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+    return uli.QuadPart;
+}
+
+// Procura o histórico de CPU de um PID; devolve NULL se não existir
+static ProcessoCpuHistorico *EncontrarHistorico(DWORD pid) {
+    for (int i = 0; i < totalHistorico; i++) {
+        if (historicoCpu[i].pid == pid) return &historicoCpu[i];
+    }
+    return NULL;
+}
+
 // Comparador para o qsort (ordem decrescente de RAM)
-int CompararProcessos(const void *a, const void *b) {
+int CompararProcessosPorRAM(const void *a, const void *b) {
     const ProcessoInfo *p1 = (const ProcessoInfo *)a;
     const ProcessoInfo *p2 = (const ProcessoInfo *)b;
     if (p1->memUsageMB < p2->memUsageMB) return 1;
     if (p1->memUsageMB > p2->memUsageMB) return -1;
+    return 0;
+}
+
+// Comparador para o qsort (ordem decrescente de CPU)
+int CompararProcessosPorCPU(const void *a, const void *b) {
+    const ProcessoInfo *p1 = (const ProcessoInfo *)a;
+    const ProcessoInfo *p2 = (const ProcessoInfo *)b;
+    if (p1->cpuPercent < p2->cpuPercent) return 1;
+    if (p1->cpuPercent > p2->cpuPercent) return -1;
     return 0;
 }
 
@@ -133,7 +174,7 @@ void MonitorarDiscos(char *buffer, size_t size, size_t *offset) {
     *offset += snprintf(buffer + *offset, size - *offset, "\r\n");
 }
 
-// 5. Tráfego de Rede
+// 5. Tráfego de Rede (GetIfTable — API clássica, mas amplamente suportada em qualquer toolchain)
 void MonitorarRede(char *buffer, size_t size, size_t *offset) {
     ULONG outBufLen = 0;
     GetIfTable(NULL, &outBufLen, FALSE);
@@ -160,36 +201,71 @@ void MonitorarRede(char *buffer, size_t size, size_t *offset) {
         lastIn = currentIn;
         lastOut = currentOut;
         firstNetworkRead = 0;
-        free(pIfTable);
     }
+    if (pIfTable) free(pIfTable);
 }
 
-// 6. Processos + Ordenação por Consumo de RAM
+// 6. Processos + Ordenação por RAM e cálculo de % CPU por processo
 void MonitorarProcessos(char *buffer, size_t size, size_t *offset) {
-    *offset += snprintf(buffer + *offset, size - *offset, "=== [ TOP 12 PROCESSOS (MAIOR CONSUMO RAM) ] ===\r\n");
+    *offset += snprintf(buffer + *offset, size - *offset, "=== [ TOP 12 PROCESSOS (MAIOR CONSUMO CPU) ] ===\r\n");
+
+    // Tempo de sistema atual (para calcular delta de tempo decorrido)
+    FILETIME ftIdle, ftKernelSys, ftUserSys;
+    GetSystemTimes(&ftIdle, &ftKernelSys, &ftUserSys);
+    ULONGLONG currentSystemTime = FileTimeToU64(ftKernelSys) + FileTimeToU64(ftUserSys);
+    ULONGLONG deltaSystemTime = (lastSystemTime != 0) ? (currentSystemTime - lastSystemTime) : 0;
 
     HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hProcessSnap == INVALID_HANDLE_VALUE) return;
 
     PROCESSENTRY32 pe32 = {.dwSize = sizeof(PROCESSENTRY32)};
     int totalProcessos = 0;
+    ProcessoCpuHistorico novoHistorico[MAX_HISTORICO];
+    int totalNovoHistorico = 0;
 
     if (Process32First(hProcessSnap, &pe32)) {
         do {
             if (pe32.th32ProcessID != 0 && totalProcessos < MAX_PROCESSES) {
-                HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe32.th32ProcessID);
+                HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe32.th32ProcessID);
                 SIZE_T memUsageMB = 0;
+                double cpuPercent = 0.0;
 
                 if (hProcess) {
                     PROCESS_MEMORY_COUNTERS pmc;
                     if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
                         memUsageMB = pmc.WorkingSetSize / (1024 * 1024);
                     }
+
+                    FILETIME ftCreate, ftExit, ftKernel, ftUser;
+                    if (GetProcessTimes(hProcess, &ftCreate, &ftExit, &ftKernel, &ftUser)) {
+                        ULONGLONG kernelU64 = FileTimeToU64(ftKernel);
+                        ULONGLONG userU64 = FileTimeToU64(ftUser);
+                        ULONGLONG totalProcTime = kernelU64 + userU64;
+
+                        ProcessoCpuHistorico *hist = EncontrarHistorico(pe32.th32ProcessID);
+                        if (hist && deltaSystemTime > 0) {
+                            ULONGLONG deltaProc = totalProcTime - (hist->lastKernelTime + hist->lastUserTime);
+                            // Percentagem relativa ao total do sistema, multiplicada pelo nº de núcleos
+                            cpuPercent = ((double)deltaProc / (double)deltaSystemTime) * 100.0 * numProcessadores;
+                            if (cpuPercent < 0.0) cpuPercent = 0.0;
+                            if (cpuPercent > 100.0 * numProcessadores) cpuPercent = 100.0 * numProcessadores;
+                        }
+
+                        // Guarda para o próximo ciclo
+                        if (totalNovoHistorico < MAX_HISTORICO) {
+                            novoHistorico[totalNovoHistorico].pid = pe32.th32ProcessID;
+                            novoHistorico[totalNovoHistorico].lastKernelTime = kernelU64;
+                            novoHistorico[totalNovoHistorico].lastUserTime = userU64;
+                            novoHistorico[totalNovoHistorico].valido = 1;
+                            totalNovoHistorico++;
+                        }
+                    }
                     CloseHandle(hProcess);
                 }
 
                 listaProcessos[totalProcessos].pid = pe32.th32ProcessID;
                 listaProcessos[totalProcessos].memUsageMB = memUsageMB;
+                listaProcessos[totalProcessos].cpuPercent = cpuPercent;
                 strncpy_s(listaProcessos[totalProcessos].exeFile, MAX_PATH, pe32.szExeFile, _TRUNCATE);
 
                 totalProcessos++;
@@ -198,15 +274,32 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset) {
     }
     CloseHandle(hProcessSnap);
 
-    // Ordenação QuickSort em memória
-    qsort(listaProcessos, totalProcessos, sizeof(ProcessoInfo), CompararProcessos);
+    // Atualiza o histórico global para o próximo ciclo
+    memcpy(historicoCpu, novoHistorico, sizeof(ProcessoCpuHistorico) * totalNovoHistorico);
+    totalHistorico = totalNovoHistorico;
+    lastSystemTime = currentSystemTime;
 
-    // Renderiza apenas os 12 mais pesados
+    // Ordena por CPU (mais relevante que RAM para identificar picos de uso)
+    qsort(listaProcessos, totalProcessos, sizeof(ProcessoInfo), CompararProcessosPorCPU);
+
     int limite = (totalProcessos < 12) ? totalProcessos : 12;
     for (int i = 0; i < limite; i++) {
         *offset += snprintf(buffer + *offset, size - *offset,
-                            "PID: %-6u | RAM: %5lu MB | %s\r\n",
-                            listaProcessos[i].pid, (unsigned long)listaProcessos[i].memUsageMB, listaProcessos[i].exeFile);
+                            "PID: %-6u | CPU: %5.1f%% | RAM: %5lu MB | %s\r\n",
+                            listaProcessos[i].pid, listaProcessos[i].cpuPercent,
+                            (unsigned long)listaProcessos[i].memUsageMB, listaProcessos[i].exeFile);
+    }
+    *offset += snprintf(buffer + *offset, size - *offset, "\r\n");
+
+    // Também mostra o top 5 por RAM, para não perder essa informação
+    *offset += snprintf(buffer + *offset, size - *offset, "=== [ TOP 5 PROCESSOS (MAIOR CONSUMO RAM) ] ===\r\n");
+    qsort(listaProcessos, totalProcessos, sizeof(ProcessoInfo), CompararProcessosPorRAM);
+    int limiteRAM = (totalProcessos < 5) ? totalProcessos : 5;
+    for (int i = 0; i < limiteRAM; i++) {
+        *offset += snprintf(buffer + *offset, size - *offset,
+                            "PID: %-6u | RAM: %5lu MB | CPU: %5.1f%% | %s\r\n",
+                            listaProcessos[i].pid, (unsigned long)listaProcessos[i].memUsageMB,
+                            listaProcessos[i].cpuPercent, listaProcessos[i].exeFile);
     }
 }
 
@@ -229,15 +322,23 @@ void AtualizarMonitor() {
 // Trata os Eventos da Janela (Win32 Message Loop)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
-        case WM_CREATE:
+        case WM_CREATE: {
+            SYSTEM_INFO sysInfo;
+            GetSystemInfo(&sysInfo);
+            numProcessadores = (int)sysInfo.dwNumberOfProcessors;
+            if (numProcessadores < 1) numProcessadores = 1;
+
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+
             hEdit = CreateWindowEx(0, "EDIT", "A recolher dados do sistema...",
                                    WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
-                                   10, 10, 580, 720, hwnd, NULL, NULL, NULL);
+                                   10, 10, rc.right - 20, rc.bottom - 20, hwnd, NULL, NULL, NULL);
 
-            HFONT hFont = CreateFont(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
+            hFontMonitor = CreateFont(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                                      FIXED_PITCH | FF_MODERN, "Consolas");
-            SendMessage(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(hEdit, WM_SETFONT, (WPARAM)hFontMonitor, TRUE);
 
             // Inicialização do PDH
             PdhOpenQuery(NULL, 0, &hQuery);
@@ -247,6 +348,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             // Timer de 1000ms (1 segundo)
             SetTimer(hwnd, TIMER_ID, 1000, NULL);
             return 0;
+        }
+
+        case WM_SIZE: {
+            // Redimensiona o controlo de edição para acompanhar o tamanho da janela
+            if (hEdit != NULL) {
+                int largura = LOWORD(lParam);
+                int altura = HIWORD(lParam);
+                MoveWindow(hEdit, 10, 10, largura - 20, altura - 20, TRUE);
+            }
+            return 0;
+        }
+
+        case WM_GETMINMAXINFO: {
+            // Define um tamanho mínimo razoável para a janela
+            MINMAXINFO *mmi = (MINMAXINFO *)lParam;
+            mmi->ptMinTrackSize.x = 400;
+            mmi->ptMinTrackSize.y = 300;
+            return 0;
+        }
 
         case WM_TIMER:
             AtualizarMonitor();
@@ -255,6 +375,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_ID);
             PdhCloseQuery(hQuery);
+            if (hFontMonitor != NULL) {
+                DeleteObject(hFontMonitor);
+                hFontMonitor = NULL;
+            }
             PostQuitMessage(0);
             return 0;
     }
@@ -262,7 +386,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    const char CLASS_NAME[] = "HardwareMonitorClassV3";
+    // DPI awareness: evita que a janela fique desfocada em ecrãs de alto DPI.
+    // SetProcessDpiAwarenessContext é a API mais recente (Windows 10 1703+);
+    // se não existir (versões antigas), cai-se em SetProcessDPIAware como fallback.
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        typedef BOOL (WINAPI *SetDpiCtxFunc)(DPI_AWARENESS_CONTEXT);
+        SetDpiCtxFunc pSetDpiCtx = (SetDpiCtxFunc)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        if (pSetDpiCtx) {
+            pSetDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        } else {
+            SetProcessDPIAware();
+        }
+    } else {
+        SetProcessDPIAware();
+    }
+
+    const char CLASS_NAME[] = "HardwareMonitorClassV4";
 
     WNDCLASS wc = {0};
     wc.lpfnWndProc   = WindowProc;
@@ -273,9 +413,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     RegisterClass(&wc);
 
+    // WS_THICKFRAME e WS_MAXIMIZEBOX adicionados para permitir redimensionar a janela
     HWND hwnd = CreateWindowEx(
-        0, CLASS_NAME, "Monitor de Hardware & Sistema (Win32)",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        0, CLASS_NAME, "Monitor de Hardware & Sistema (Win32) v4",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, 616, 780,
         NULL, NULL, hInstance, NULL);
 
