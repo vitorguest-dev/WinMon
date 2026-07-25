@@ -3,6 +3,8 @@
 #include <tlhelp32.h>
 #include <iphlpapi.h>
 #include <psapi.h>
+#include <shellapi.h>
+#include <richedit.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,10 +15,19 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define TIMER_ID 1
 #define BUFFER_SIZE 16384 // Buffer alargado para 16KB para evitar qualquer overflow
 #define MAX_PROCESSES 2048
+#define MAX_ALERT_RANGES 32
+#define ID_EXPORT_SNAPSHOT 1001
+#define WM_TRAYICON (WM_APP + 1)
+#define ID_TRAY_ICON 1
+
+// Limites que disparam alerta visual
+#define LIMITE_RAM_PERCENT 90.0
+#define LIMITE_DISCO_PERCENT 95.0
 
 // Estrutura para armazenar dados de cada processo na ordenação
 typedef struct {
@@ -34,20 +45,40 @@ typedef struct {
     int valido;
 } ProcessoCpuHistorico;
 
+// Um intervalo de texto (início/fim em caracteres) que deve ser colorido de vermelho
+typedef struct {
+    long inicio;
+    long fim;
+} IntervaloAlerta;
+
 #define MAX_HISTORICO 2048
 static ProcessoCpuHistorico historicoCpu[MAX_HISTORICO];
 static int totalHistorico = 0;
 static ULONGLONG lastSystemTime = 0;
 
 // Variáveis Globais de Estado
+HWND hMainWindow = NULL;
 HWND hEdit;
 PDH_HQUERY hQuery;
 PDH_HCOUNTER hCounterCPU;
 HFONT hFontMonitor = NULL;
+HMODULE hRichEditLib = NULL;
+NOTIFYICONDATAA nid;
+int trayIconAtivo = 0;
 DWORDLONG lastIn = 0;
 DWORDLONG lastOut = 0;
 int firstNetworkRead = 1;
 int numProcessadores = 1;
+
+// Estado do último ciclo, usado para o export de snapshot (Ctrl+S) e para o tooltip do tray
+static char ultimoSnapshot[BUFFER_SIZE];
+static double ultimoRamPercent = 0.0;
+static double ultimoCpuPercent = 0.0;
+
+// Intervalos de alerta detetados no ciclo atual (para colorir a vermelho)
+static IntervaloAlerta intervalosAlerta[MAX_ALERT_RANGES];
+static int totalIntervalosAlerta = 0;
+static int alertaGlobalAtivo = 0;
 
 // Buffer estático para armazenar a lista de processos sem alocação dinâmica no heap a cada ciclo
 static ProcessoInfo listaProcessos[MAX_PROCESSES];
@@ -74,6 +105,16 @@ static ProcessoCpuHistorico *EncontrarHistorico(DWORD pid) {
         if (historicoCpu[i].pid == pid) return &historicoCpu[i];
     }
     return NULL;
+}
+
+// Regista um intervalo de texto [inicio, fim) a colorir de vermelho por estar em alerta
+static void RegistarAlerta(long inicio, long fim) {
+    if (totalIntervalosAlerta < MAX_ALERT_RANGES) {
+        intervalosAlerta[totalIntervalosAlerta].inicio = inicio;
+        intervalosAlerta[totalIntervalosAlerta].fim = fim;
+        totalIntervalosAlerta++;
+    }
+    alertaGlobalAtivo = 1;
 }
 
 // Comparador para o qsort (ordem decrescente de RAM)
@@ -125,28 +166,38 @@ void MonitorarCPU(char *buffer, size_t size, size_t *offset) {
     PdhCollectQueryData(hQuery);
     PdhGetFormattedCounterValue(hCounterCPU, PDH_FMT_DOUBLE, NULL, &counterVal);
 
+    double cpuAtual = (counterVal.CStatus == ERROR_SUCCESS) ? counterVal.doubleValue : 0.0;
+    ultimoCpuPercent = cpuAtual;
+
     *offset += snprintf(buffer + *offset, size - *offset,
                         "=== [ PROCESSADOR ] ===\r\n"
                         "Uso Atual da CPU: %.1f%%\r\n\r\n",
-                        (counterVal.CStatus == ERROR_SUCCESS) ? counterVal.doubleValue : 0.0);
+                        cpuAtual);
 }
 
-// 3. Memória RAM Global
+// 3. Memória RAM Global (com deteção de alerta se uso > LIMITE_RAM_PERCENT)
 void MonitorarRAM(char *buffer, size_t size, size_t *offset) {
     MEMORYSTATUSEX memInfo = {.dwLength = sizeof(MEMORYSTATUSEX)};
     if (GlobalMemoryStatusEx(&memInfo)) {
         DWORDLONG totalRAM = memInfo.ullTotalPhys / (1024 * 1024);
         DWORDLONG livreRAM = memInfo.ullAvailPhys / (1024 * 1024);
         DWORDLONG usadaRAM = totalRAM - livreRAM;
+        ultimoRamPercent = (double)memInfo.dwMemoryLoad;
 
+        long inicioLinha = (long)*offset;
         *offset += snprintf(buffer + *offset, size - *offset,
                             "=== [ MEMORIA RAM GERAL ] ===\r\n"
                             "Uso: %ld%% | Usada: %llu MB | Livre: %llu MB (Total: %llu MB)\r\n\r\n",
                             memInfo.dwMemoryLoad, usadaRAM, livreRAM, totalRAM);
+        long fimLinha = (long)*offset;
+
+        if (memInfo.dwMemoryLoad > LIMITE_RAM_PERCENT) {
+            RegistarAlerta(inicioLinha, fimLinha);
+        }
     }
 }
 
-// 4. Discos de Armazenamento
+// 4. Discos de Armazenamento (com deteção de alerta por disco se uso > LIMITE_DISCO_PERCENT)
 void MonitorarDiscos(char *buffer, size_t size, size_t *offset) {
     *offset += snprintf(buffer + *offset, size - *offset, "=== [ DISCOS DE ARMAZENAMENTO ] ===\r\n");
 
@@ -164,9 +215,15 @@ void MonitorarDiscos(char *buffer, size_t size, size_t *offset) {
                     double usadaGB = totalGB - livreGB;
                     double percentUsado = (usadaGB / totalGB) * 100.0;
 
+                    long inicioLinha = (long)*offset;
                     *offset += snprintf(buffer + *offset, size - *offset,
                                         "Drive %s  Uso: %5.1f%%  (%.1f GB usad. de %.1f GB)\r\n",
                                         driveLetter, percentUsado, usadaGB, totalGB);
+                    long fimLinha = (long)*offset;
+
+                    if (percentUsado > LIMITE_DISCO_PERCENT) {
+                        RegistarAlerta(inicioLinha, fimLinha);
+                    }
                 }
             }
         }
@@ -174,7 +231,7 @@ void MonitorarDiscos(char *buffer, size_t size, size_t *offset) {
     *offset += snprintf(buffer + *offset, size - *offset, "\r\n");
 }
 
-// 5. Tráfego de Rede (GetIfTable — API clássica, mas amplamente suportada em qualquer toolchain)
+// 5. Tráfego de Rede (GetIfTable — API clássica, amplamente suportada em qualquer toolchain)
 void MonitorarRede(char *buffer, size_t size, size_t *offset) {
     ULONG outBufLen = 0;
     GetIfTable(NULL, &outBufLen, FALSE);
@@ -303,10 +360,79 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset) {
     }
 }
 
+// Aplica a coloração de vermelho aos intervalos de alerta detetados neste ciclo,
+// e repõe a cor por omissão (preto) no resto do texto.
+void AplicarCoresDeAlerta() {
+    CHARFORMAT2A cf;
+    ZeroMemory(&cf, sizeof(cf));
+    cf.cbSize = sizeof(CHARFORMAT2A);
+    cf.dwMask = CFM_COLOR;
+
+    // 1. Repõe a cor preta em todo o texto
+    SendMessage(hEdit, EM_SETSEL, 0, -1);
+    cf.crTextColor = RGB(0, 0, 0);
+    cf.dwEffects = 0;
+    SendMessage(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+
+    // 2. Colore de vermelho cada intervalo em alerta
+    cf.crTextColor = RGB(200, 0, 0);
+    for (int i = 0; i < totalIntervalosAlerta; i++) {
+        SendMessage(hEdit, EM_SETSEL, intervalosAlerta[i].inicio, intervalosAlerta[i].fim);
+        SendMessage(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    }
+
+    // 3. Remove a seleção visível (volta ao início, sem texto selecionado)
+    SendMessage(hEdit, EM_SETSEL, 0, 0);
+}
+
+// Atualiza o título da janela principal para refletir se há algum alerta ativo
+void AtualizarTituloJanela() {
+    if (alertaGlobalAtivo) {
+        SetWindowTextA(hMainWindow, "Monitor de Hardware & Sistema (Win32) v5  —  [!] ALERTA: RAM ou disco acima do limite");
+    } else {
+        SetWindowTextA(hMainWindow, "Monitor de Hardware & Sistema (Win32) v5");
+    }
+}
+
+// Atualiza o tooltip do ícone do tray com CPU/RAM atuais (só relevante quando minimizado para o tray)
+void AtualizarTooltipTray() {
+    if (!trayIconAtivo) return;
+    snprintf(nid.szTip, sizeof(nid.szTip), "Monitor de Hardware\r\nCPU: %.1f%% | RAM: %.0f%%",
+             ultimoCpuPercent, ultimoRamPercent);
+    Shell_NotifyIconA(NIM_MODIFY, &nid);
+}
+
+// Grava o snapshot atual (texto simples, sem formatação) num ficheiro .txt com timestamp
+void ExportarSnapshot() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    char nomeFicheiro[MAX_PATH];
+    snprintf(nomeFicheiro, sizeof(nomeFicheiro),
+             "snapshot_%04d%02d%02d_%02d%02d%02d.txt",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    FILE *f = NULL;
+    errno_t err = fopen_s(&f, nomeFicheiro, "wb");
+    if (err == 0 && f != NULL) {
+        fwrite(ultimoSnapshot, 1, strlen(ultimoSnapshot), f);
+        fclose(f);
+
+        char msg[MAX_PATH + 64];
+        snprintf(msg, sizeof(msg), "Snapshot gravado como:\r\n%s", nomeFicheiro);
+        MessageBoxA(hMainWindow, msg, "Export concluído", MB_OK | MB_ICONINFORMATION);
+    } else {
+        MessageBoxA(hMainWindow, "Não foi possível gravar o ficheiro de snapshot.", "Erro", MB_OK | MB_ICONERROR);
+    }
+}
+
 // Função principal de montagem dos dados e envio para a janela
 void AtualizarMonitor() {
     static char buffer[BUFFER_SIZE];
     size_t offset = 0;
+
+    totalIntervalosAlerta = 0;
+    alertaGlobalAtivo = 0;
 
     MonitorarSistema(buffer, BUFFER_SIZE, &offset);
     MonitorarCPU(buffer, BUFFER_SIZE, &offset);
@@ -315,14 +441,24 @@ void AtualizarMonitor() {
     MonitorarRede(buffer, BUFFER_SIZE, &offset);
     MonitorarProcessos(buffer, BUFFER_SIZE, &offset);
 
+    // Guarda cópia para o export de snapshot (Ctrl+S)
+    strncpy_s(ultimoSnapshot, BUFFER_SIZE, buffer, _TRUNCATE);
+
     // Atualiza o controlo da janela numa única operação
     SetWindowTextA(hEdit, buffer);
+
+    // Aplica cores de alerta (RichEdit) e atualiza título/tooltip
+    AplicarCoresDeAlerta();
+    AtualizarTituloJanela();
+    AtualizarTooltipTray();
 }
 
 // Trata os Eventos da Janela (Win32 Message Loop)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE: {
+            hMainWindow = hwnd;
+
             SYSTEM_INFO sysInfo;
             GetSystemInfo(&sysInfo);
             numProcessadores = (int)sysInfo.dwNumberOfProcessors;
@@ -331,7 +467,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             RECT rc;
             GetClientRect(hwnd, &rc);
 
-            hEdit = CreateWindowEx(0, "EDIT", "A recolher dados do sistema...",
+            // Carrega a biblioteca do RichEdit (necessária para o controlo RICHEDIT50W)
+            hRichEditLib = LoadLibraryA("Msftedit.dll");
+
+            hEdit = CreateWindowExA(0, "RICHEDIT50W", "A recolher dados do sistema...",
                                    WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
                                    10, 10, rc.right - 20, rc.bottom - 20, hwnd, NULL, NULL, NULL);
 
@@ -339,11 +478,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                                      FIXED_PITCH | FF_MODERN, "Consolas");
             SendMessage(hEdit, WM_SETFONT, (WPARAM)hFontMonitor, TRUE);
+            // Limite alto de texto (por omissão o RichEdit corta ~32KB em alguns casos)
+            SendMessage(hEdit, EM_EXLIMITTEXT, 0, (LPARAM)(BUFFER_SIZE * 2));
 
             // Inicialização do PDH
             PdhOpenQuery(NULL, 0, &hQuery);
             PdhAddEnglishCounter(hQuery, "\\Processor(_Total)\\% Processor Time", 0, &hCounterCPU);
             PdhCollectQueryData(hQuery);
+
+            // Preparação do ícone do tray (só é adicionado quando a janela é minimizada)
+            ZeroMemory(&nid, sizeof(nid));
+            nid.cbSize = sizeof(NOTIFYICONDATAA);
+            nid.hWnd = hwnd;
+            nid.uID = ID_TRAY_ICON;
+            nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+            nid.uCallbackMessage = WM_TRAYICON;
+            nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+            strncpy_s(nid.szTip, sizeof(nid.szTip), "Monitor de Hardware", _TRUNCATE);
 
             // Timer de 1000ms (1 segundo)
             SetTimer(hwnd, TIMER_ID, 1000, NULL);
@@ -368,6 +519,41 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
+        case WM_SYSCOMMAND: {
+            // Intercepta o botão de minimizar: esconde a janela e mostra o ícone no tray.
+            // O botão de fechar (X) continua a ter o comportamento normal (não passa por aqui).
+            if ((wParam & 0xFFF0) == SC_MINIMIZE) {
+                ShowWindow(hwnd, SW_HIDE);
+                if (!trayIconAtivo) {
+                    Shell_NotifyIconA(NIM_ADD, &nid);
+                    trayIconAtivo = 1;
+                }
+                return 0;
+            }
+            return DefWindowProc(hwnd, uMsg, wParam, lParam);
+        }
+
+        case WM_TRAYICON: {
+            // Clique (simples ou duplo) no ícone do tray restaura a janela
+            if (lParam == WM_LBUTTONDBLCLK || lParam == WM_LBUTTONUP) {
+                if (trayIconAtivo) {
+                    Shell_NotifyIconA(NIM_DELETE, &nid);
+                    trayIconAtivo = 0;
+                }
+                ShowWindow(hwnd, SW_SHOW);
+                SetForegroundWindow(hwnd);
+            }
+            return 0;
+        }
+
+        case WM_COMMAND: {
+            if (LOWORD(wParam) == ID_EXPORT_SNAPSHOT) {
+                ExportarSnapshot();
+                return 0;
+            }
+            return DefWindowProc(hwnd, uMsg, wParam, lParam);
+        }
+
         case WM_TIMER:
             AtualizarMonitor();
             return 0;
@@ -378,6 +564,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             if (hFontMonitor != NULL) {
                 DeleteObject(hFontMonitor);
                 hFontMonitor = NULL;
+            }
+            if (trayIconAtivo) {
+                Shell_NotifyIconA(NIM_DELETE, &nid);
+                trayIconAtivo = 0;
+            }
+            if (hRichEditLib != NULL) {
+                FreeLibrary(hRichEditLib);
+                hRichEditLib = NULL;
             }
             PostQuitMessage(0);
             return 0;
@@ -402,7 +596,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         SetProcessDPIAware();
     }
 
-    const char CLASS_NAME[] = "HardwareMonitorClassV4";
+    const char CLASS_NAME[] = "HardwareMonitorClassV5";
 
     WNDCLASS wc = {0};
     wc.lpfnWndProc   = WindowProc;
@@ -415,19 +609,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // WS_THICKFRAME e WS_MAXIMIZEBOX adicionados para permitir redimensionar a janela
     HWND hwnd = CreateWindowEx(
-        0, CLASS_NAME, "Monitor de Hardware & Sistema (Win32) v4",
+        0, CLASS_NAME, "Monitor de Hardware & Sistema (Win32) v5",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, 616, 780,
         NULL, NULL, hInstance, NULL);
 
     if (hwnd == NULL) return 0;
 
+    // Tabela de aceleradores: Ctrl+S para exportar o snapshot atual
+    ACCEL accels[] = {
+        { FVIRTKEY | FCONTROL, 'S', ID_EXPORT_SNAPSHOT }
+    };
+    HACCEL hAccel = CreateAcceleratorTable(accels, 1);
+
     ShowWindow(hwnd, nCmdShow);
 
     MSG msg = {0};
     while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        if (!TranslateAccelerator(hwnd, hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
     }
 
     return 0;
