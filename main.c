@@ -280,12 +280,12 @@ static void AdicionarHistorico(double cpu, double ram,
     historico.netUp[historico.pos] = netUp;
 
     for (i = 0; i < numNucleosMonitorizados; i++) {
-        /* O valor do nucleo e colocado por MonitorarCPU no mesmo ponto. */
-        /* Se nao houver valor neste ciclo, fica 0. */
-        if (historico.count == 0)
-            historico.core[i][historico.pos] = 0.0;
+        /* Inicializar sempre a 0; AtualizarMonitor escreve o valor real a seguir. */
+        historico.core[i][historico.pos] = 0.0;
     }
 
+    /* Inicializar; AtualizarMonitor escreve processoCpuAtual/processoRamAtual
+     * neste mesmo pos logo a seguir a chamar AdicionarHistorico. */
     processoCpuTop[historico.pos] = 0.0;
     processoRamTop[historico.pos] = 0.0;
 
@@ -890,11 +890,6 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type) {
 
     switch (type) {
         case GRAPH_CPU: {
-            static double seriesTotal[HISTORICO_PONTOS];
-
-            for (i = 0; i < historico.count; i++)
-                seriesTotal[i] = historico.cpu[HistoricoIndex(i)];
-
             names[0] = "CPU total";
             colors[0] = RGB(35, 115, 210);
             n = 1;
@@ -905,7 +900,7 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type) {
             DrawGraphLegend(hdc, &client, "CPU — ultimos 120 segundos",
                             names, colors, n, currentText);
             DrawGraphGrid(hdc, graph, 100.0);
-            DrawSeries(hdc, graph, seriesTotal, historico.count,
+            DrawSeries(hdc, graph, historico.cpu, historico.count,
                        100.0, colors[0], 2);
 
             /* Pequenos graficos dos nucleos na parte inferior se houver espaco. */
@@ -971,12 +966,11 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type) {
         case GRAPH_DISK: {
             double maxVal = 1024.0 * 1024.0;
 
-            for (i = 0; i < historico.count; i++) {
-                int idx = HistoricoIndex(i);
-                if (historico.diskRead[idx] > maxVal)
-                    maxVal = historico.diskRead[idx];
-                if (historico.diskWrite[idx] > maxVal)
-                    maxVal = historico.diskWrite[idx];
+            for (i = 0; i < HISTORICO_PONTOS; i++) {
+                if (historico.diskRead[i] > maxVal)
+                    maxVal = historico.diskRead[i];
+                if (historico.diskWrite[i] > maxVal)
+                    maxVal = historico.diskWrite[i];
             }
 
             names[0] = "Leitura";
@@ -1004,12 +998,11 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type) {
         case GRAPH_NET: {
             double maxVal = 1024.0 * 1024.0;
 
-            for (i = 0; i < historico.count; i++) {
-                int idx = HistoricoIndex(i);
-                if (historico.netDown[idx] > maxVal)
-                    maxVal = historico.netDown[idx];
-                if (historico.netUp[idx] > maxVal)
-                    maxVal = historico.netUp[idx];
+            for (i = 0; i < HISTORICO_PONTOS; i++) {
+                if (historico.netDown[i] > maxVal)
+                    maxVal = historico.netDown[i];
+                if (historico.netUp[i] > maxVal)
+                    maxVal = historico.netUp[i];
             }
 
             names[0] = "Download";
@@ -1038,12 +1031,11 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type) {
             double maxCpu = 100.0;
             double maxRam = 1024.0;
 
-            for (i = 0; i < historico.count; i++) {
-                int idx = HistoricoIndex(i);
-                if (processoCpuTop[idx] > maxCpu)
-                    maxCpu = processoCpuTop[idx];
-                if (processoRamTop[idx] > maxRam)
-                    maxRam = processoRamTop[idx];
+            for (i = 0; i < HISTORICO_PONTOS; i++) {
+                if (processoCpuTop[i] > maxCpu)
+                    maxCpu = processoCpuTop[i];
+                if (processoRamTop[i] > maxRam)
+                    maxRam = processoRamTop[i];
             }
 
             /*
@@ -1342,8 +1334,10 @@ void AtualizarMonitor() {
     MonitorarProcessos(buffer, BUFFER_SIZE, &offset);
 
     /*
-     * MonitorarProcessos usa historico.pos para guardar o processo lider.
-     * Guardamos esses valores antes de avancar o historico geral.
+     * AdicionarHistorico avanca historico.pos para o novo slot e inicializa
+     * os arrays de nucleos e tops a 0. De seguida escrevemos os valores reais
+     * nesse mesmo slot, garantindo que todos os dados do mesmo ciclo ficam
+     * alinhados na mesma posicao do buffer circular.
      */
     AdicionarHistorico(
         ultimoCpuPercent,
