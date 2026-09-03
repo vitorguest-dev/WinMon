@@ -33,6 +33,8 @@
 #include <stdarg.h>
 #include <errno.h>
 
+/* Nota: o manifesto UAC (requireAdministrator) e embutido via winmon.rc + windres,
+ * pois o #pragma comment(linker,/manifestuac) so funciona com MSVC. */
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "user32.lib")
@@ -40,6 +42,24 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "wbemuuid.lib")
+
+/* WMI para temperatura.
+ * Definir os GUIDs inline evita depender de wbemuuid.lib/-luuid no MinGW,
+ * onde CLSID_WbemLocator e IID_IWbemLocator nao estao incluidos em -luuid. */
+#define _WIN32_DCOM
+#include <wbemidl.h>
+
+/* GUIDs necessarios para o WMI — definidos aqui para compatibilidade MinGW. */
+static const CLSID LOCAL_CLSID_WbemLocator =
+    {0x4590f811,0x1d3a,0x11d0,{0x89,0x1f,0x00,0xaa,0x00,0x4b,0x2e,0x24}};
+static const IID   LOCAL_IID_IWbemLocator  =
+    {0xdc12a687,0x737f,0x11cf,{0x88,0x4d,0x00,0xaa,0x00,0x4b,0x2e,0x24}};
+
+#define CLSID_WbemLocator LOCAL_CLSID_WbemLocator
+#define IID_IWbemLocator  LOCAL_IID_IWbemLocator
 
 #define TIMER_ID 1
 #define BUFFER_SIZE 16384
@@ -50,8 +70,21 @@
 #define ID_TRAY_ICON 1
 #define MAX_CORES 64
 
-#define LIMITE_RAM_PERCENT 90.0
-#define LIMITE_DISCO_PERCENT 95.0
+/* Limites de alerta — podem ser alterados em runtime via dialogo. */
+#define LIMITE_RAM_PERCENT_DEFAULT    90.0
+#define LIMITE_DISCO_PERCENT_DEFAULT  95.0
+#define LIMITE_CPU_PERCENT_DEFAULT    90.0
+
+/* Logging CSV */
+#define LOG_INTERVALO_SEGUNDOS  10      /* escreve no CSV a cada N ticks */
+#define ID_TOGGLE_LOG          1002
+#define ID_CONFIG_ALERTAS      1003
+
+/* Temperatura CPU (WMI — MSAcpi_ThermalZoneTemperature, root\wmi) */
+#define MAX_TEMP_ZONAS  16
+
+/* Notificacoes balloon */
+#define BALLOON_COOLDOWN_SEGUNDOS  30   /* minimo de segundos entre balloons */
 
 /* Historico dos graficos: 120 segundos, um ponto por segundo. */
 #define HISTORICO_PONTOS 120
@@ -98,6 +131,25 @@ typedef struct {
 } HistoricoMonitor;
 
 #define MAX_HISTORICO 2048
+
+/* ---- Limites de alerta configuráveis em runtime ---- */
+static double limiteCpuPercent   = LIMITE_CPU_PERCENT_DEFAULT;
+static double limiteRamPercent   = LIMITE_RAM_PERCENT_DEFAULT;
+static double limiteDiscoPercent = LIMITE_DISCO_PERCENT_DEFAULT;
+
+/* ---- Logging CSV ---- */
+static FILE   *hLogCSV       = NULL;
+static int     logAtivo      = 0;
+static int     logTickContador = 0;
+static char    logNomeFicheiro[MAX_PATH] = {0};
+
+/* ---- Temperatura CPU (WMI) ---- */
+static int    numZonasTemp = 0;
+static double tempAtual[MAX_TEMP_ZONAS];
+static char   tempNome[MAX_TEMP_ZONAS][64];
+
+/* ---- Notificacoes balloon ---- */
+static ULONGLONG ultimoBalloonTick = 0;
 
 static ProcessoCpuHistorico historicoCpu[MAX_HISTORICO];
 static int totalHistorico = 0;
@@ -337,8 +389,13 @@ void MonitorarCPU(char *buffer, size_t size, size_t *offset) {
 
     ultimoCpuPercent = cpuAtual;
 
-    AppendFormat(buffer, size, offset, "=== [ PROCESSADOR ] ===\r\n"
-        "Uso Atual da CPU (Total): %.1f%%\r\n", cpuAtual);
+    {
+        long inicioLinha = (long)*offset;
+        AppendFormat(buffer, size, offset, "=== [ PROCESSADOR ] ===\r\n"
+            "Uso Atual da CPU (Total): %.1f%%\r\n", cpuAtual);
+        if (cpuAtual > limiteCpuPercent)
+            RegistarAlerta(inicioLinha, (long)*offset);
+    }
 
     if (numNucleosMonitorizados > 0) {
         AppendFormat(buffer, size, offset, "Por Nucleo: ");
@@ -417,7 +474,7 @@ void MonitorarRAM(char *buffer, size_t size, size_t *offset) {
                 "Uso: %ld%% | Usada: %llu MB | Livre: %llu MB (Total: %llu MB)\r\n\r\n",
                 memInfo.dwMemoryLoad, usadaRAM, livreRAM, totalRAM);
 
-            if (memInfo.dwMemoryLoad > LIMITE_RAM_PERCENT)
+            if ((double)memInfo.dwMemoryLoad > limiteRamPercent)
                 RegistarAlerta(inicioLinha, (long)*offset);
         }
     }
@@ -452,7 +509,7 @@ void MonitorarDiscos(char *buffer, size_t size, size_t *offset) {
                     AppendFormat(buffer, size, offset, "Drive %s  Uso: %5.1f%%  (%.1f GB usad. de %.1f GB)\r\n",
                         driveLetter, percentUsado, usadaGB, totalGB);
 
-                    if (percentUsado > LIMITE_DISCO_PERCENT)
+                    if (percentUsado > limiteDiscoPercent)
                         RegistarAlerta(inicioLinha, (long)*offset);
                 }
             }
@@ -661,6 +718,22 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset) {
         }
     }
 }
+
+/* ------------------------------------------------------------------------- */
+/* Declaracoes antecipadas (forward declarations)                            */
+/* ------------------------------------------------------------------------- */
+
+static void IniciarLogCSV(void);
+static void FecharLogCSV(void);
+static void EscreverLinhaLog(void);
+static void MostrarDialogoAlertas(HWND hwndPai);
+static void CarregarConfigIni(void);
+static void GravarConfigIni(void);
+static void InicializarTemperaturaCPU(void);
+static void LerTemperaturaCPU(char *buffer, size_t size, size_t *offset);
+static void TerminarWMI(void);
+static void EnviarBalloon(const char *titulo, const char *msg);
+static void VerificarAlertasBalloon(void);
 
 /* ------------------------------------------------------------------------- */
 /* Graficos GDI                                                              */
@@ -1316,6 +1389,531 @@ static void CriarAbas(HWND hwnd) {
     MostrarAba(0);
 }
 
+/* ========================================================================= */
+/* FUNCIONALIDADE 1 — Logging CSV continuo                                   */
+/* ========================================================================= */
+
+static void IniciarLogCSV(void) {
+    SYSTEMTIME st;
+    errno_t err;
+
+    if (hLogCSV) return; /* ja aberto */
+
+    GetLocalTime(&st);
+    snprintf(logNomeFicheiro, sizeof(logNomeFicheiro),
+        "winmon_log_%04d%02d%02d_%02d%02d%02d.csv",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond);
+
+    err = fopen_s(&hLogCSV, logNomeFicheiro, "a");
+    if (err != 0 || !hLogCSV) {
+        MessageBoxA(hMainWindow,
+            "Nao foi possivel criar o ficheiro de log.",
+            "Erro de Log", MB_OK | MB_ICONERROR);
+        hLogCSV  = NULL;
+        logAtivo = 0;
+        return;
+    }
+
+    /* Cabecalho CSV */
+    fprintf(hLogCSV,
+        "timestamp,cpu_pct,ram_pct,disk_read_bps,disk_write_bps,"
+        "net_down_bps,net_up_bps");
+
+    {
+        int i;
+        for (i = 0; i < numNucleosMonitorizados; i++)
+            fprintf(hLogCSV, ",core%d_pct", i);
+        for (i = 0; i < numZonasTemp; i++)
+            fprintf(hLogCSV, ",temp_zona%d_c", i);
+    }
+
+    fprintf(hLogCSV, "\n");
+    fflush(hLogCSV);
+
+    logAtivo      = 1;
+    logTickContador = 0;
+}
+
+static void FecharLogCSV(void) {
+    if (hLogCSV) {
+        fclose(hLogCSV);
+        hLogCSV  = NULL;
+    }
+    logAtivo = 0;
+}
+
+static void EscreverLinhaLog(void) {
+    SYSTEMTIME st;
+    int i;
+
+    if (!logAtivo || !hLogCSV) return;
+
+    logTickContador++;
+    if (logTickContador < LOG_INTERVALO_SEGUNDOS) return;
+    logTickContador = 0;
+
+    GetLocalTime(&st);
+
+    fprintf(hLogCSV,
+        "%04d-%02d-%02d %02d:%02d:%02d,"
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond,
+        ultimoCpuPercent, ultimoRamPercent,
+        ultimoDiskRead,   ultimoDiskWrite,
+        ultimoNetDown,    ultimoNetUp);
+
+    for (i = 0; i < numNucleosMonitorizados; i++)
+        fprintf(hLogCSV, ",%.2f", coresCpuAtuais[i]);
+
+    for (i = 0; i < numZonasTemp; i++)
+        fprintf(hLogCSV, ",%.1f", tempAtual[i]);
+
+    fprintf(hLogCSV, "\n");
+    fflush(hLogCSV);
+}
+
+/* ========================================================================= */
+/* FUNCIONALIDADE 2 — Alertas configuráveis + persistência .ini              */
+/* ========================================================================= */
+
+#define INI_FICHEIRO "winmon.ini"
+#define INI_SECAO    "Alertas"
+
+static void CarregarConfigIni(void) {
+    char val[32];
+
+    GetPrivateProfileStringA(INI_SECAO, "LimiteCPU",    "90.0",
+                             val, sizeof(val), INI_FICHEIRO);
+    limiteCpuPercent = atof(val);
+
+    GetPrivateProfileStringA(INI_SECAO, "LimiteRAM",    "90.0",
+                             val, sizeof(val), INI_FICHEIRO);
+    limiteRamPercent = atof(val);
+
+    GetPrivateProfileStringA(INI_SECAO, "LimiteDisco",  "95.0",
+                             val, sizeof(val), INI_FICHEIRO);
+    limiteDiscoPercent = atof(val);
+
+    /* Validacao basica */
+    if (limiteCpuPercent   < 1.0 || limiteCpuPercent   > 100.0) limiteCpuPercent   = LIMITE_CPU_PERCENT_DEFAULT;
+    if (limiteRamPercent   < 1.0 || limiteRamPercent   > 100.0) limiteRamPercent   = LIMITE_RAM_PERCENT_DEFAULT;
+    if (limiteDiscoPercent < 1.0 || limiteDiscoPercent > 100.0) limiteDiscoPercent = LIMITE_DISCO_PERCENT_DEFAULT;
+}
+
+static void GravarConfigIni(void) {
+    char val[32];
+
+    snprintf(val, sizeof(val), "%.1f", limiteCpuPercent);
+    WritePrivateProfileStringA(INI_SECAO, "LimiteCPU",   val, INI_FICHEIRO);
+
+    snprintf(val, sizeof(val), "%.1f", limiteRamPercent);
+    WritePrivateProfileStringA(INI_SECAO, "LimiteRAM",   val, INI_FICHEIRO);
+
+    snprintf(val, sizeof(val), "%.1f", limiteDiscoPercent);
+    WritePrivateProfileStringA(INI_SECAO, "LimiteDisco", val, INI_FICHEIRO);
+}
+
+/* IDs dos controlos do dialogo de alertas */
+#define IDC_EDIT_CPU    3001
+#define IDC_EDIT_RAM    3002
+#define IDC_EDIT_DISCO  3003
+
+static INT_PTR CALLBACK DialogoAlertasProc(HWND hDlg, UINT msg,
+                                            WPARAM wParam, LPARAM lParam) {
+    (void)lParam;
+
+    switch (msg) {
+        case WM_INITDIALOG: {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.1f", limiteCpuPercent);
+            SetDlgItemTextA(hDlg, IDC_EDIT_CPU, buf);
+
+            snprintf(buf, sizeof(buf), "%.1f", limiteRamPercent);
+            SetDlgItemTextA(hDlg, IDC_EDIT_RAM, buf);
+
+            snprintf(buf, sizeof(buf), "%.1f", limiteDiscoPercent);
+            SetDlgItemTextA(hDlg, IDC_EDIT_DISCO, buf);
+            return TRUE;
+        }
+
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                char buf[16];
+                double v;
+
+                GetDlgItemTextA(hDlg, IDC_EDIT_CPU,   buf, sizeof(buf)); v = atof(buf);
+                if (v >= 1.0 && v <= 100.0) limiteCpuPercent   = v;
+
+                GetDlgItemTextA(hDlg, IDC_EDIT_RAM,   buf, sizeof(buf)); v = atof(buf);
+                if (v >= 1.0 && v <= 100.0) limiteRamPercent   = v;
+
+                GetDlgItemTextA(hDlg, IDC_EDIT_DISCO, buf, sizeof(buf)); v = atof(buf);
+                if (v >= 1.0 && v <= 100.0) limiteDiscoPercent = v;
+
+                GravarConfigIni();
+                EndDialog(hDlg, IDOK);
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDCANCEL) {
+                EndDialog(hDlg, IDCANCEL);
+                return TRUE;
+            }
+            break;
+
+        case WM_CLOSE:
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * Cria o dialogo de configuracao de alertas em memoria (sem ficheiro .rc).
+ * Layout: 3 linhas de label + edit, botoes OK/Cancelar.
+ */
+static void MostrarDialogoAlertas(HWND hwndPai) {
+    /*
+     * Construir um DLGTEMPLATE em memoria.
+     * Estrutura: DLGTEMPLATE | DLGITEMTEMPLATE* (alinhados a DWORD).
+     */
+    #define DLG_ITEMS 5   /* 3 labels + 3 edits + 2 botoes = 8 itens */
+
+    /* Usamos um buffer estatico suficientemente grande. */
+    static WORD dlgBuf[512];
+    WORD *p = dlgBuf;
+
+    /* Helper: escrever uma string UNICODE inline no template. */
+    #define WRITE_STR_W(s) \
+        do { \
+            const wchar_t *_ws = (s); \
+            while (*_ws) *p++ = (WORD)*_ws++; \
+            *p++ = 0; \
+        } while(0)
+
+    #define ALIGN_DWORD() \
+        if (((ULONG_PTR)p) & 2) p++
+
+    /* ---- DLGTEMPLATE ---- */
+    DLGTEMPLATE *dt = (DLGTEMPLATE *)p;
+    dt->style      = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT;
+    dt->dwExtendedStyle = 0;
+    dt->cdit       = 8;   /* nr de itens */
+    dt->x          = 0; dt->y = 0;
+    dt->cx         = 200; dt->cy = 130;
+    p += sizeof(DLGTEMPLATE) / sizeof(WORD);
+
+    /* menu = 0, windowClass = 0, title */
+    *p++ = 0; *p++ = 0;
+    WRITE_STR_W(L"Configurar Limites de Alerta (%)");
+    /* fonte */
+    *p++ = 9; /* tamanho em pt */
+    WRITE_STR_W(L"Segoe UI");
+
+    /* ---- Macro para cada item ---- */
+    #define ADD_ITEM(sty, ex, xx, yy, ww, hh, iid, cls, txt) \
+        do { \
+            ALIGN_DWORD(); \
+            { DLGITEMTEMPLATE *_it = (DLGITEMTEMPLATE *)p; \
+              _it->style = (sty); _it->dwExtendedStyle = (ex); \
+              _it->x = (xx); _it->y = (yy); \
+              _it->cx = (ww); _it->cy = (hh); \
+              _it->id = (iid); \
+              p += sizeof(DLGITEMTEMPLATE)/sizeof(WORD); } \
+            *p++ = 0xFFFF; *p++ = (cls); /* classe pre-definida */ \
+            WRITE_STR_W(txt); \
+            *p++ = 0; /* sem dados extra */ \
+        } while(0)
+
+    /* Labels */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT, 0,
+             7,  14, 70, 10, -1,  0x0082 /*STATIC*/, L"Limite CPU (%):");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT, 0,
+             7,  34, 70, 10, -1,  0x0082,             L"Limite RAM (%):");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT, 0,
+             7,  54, 70, 10, -1,  0x0082,             L"Limite Disco (%):");
+
+    /* Edits */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 0,
+             80, 12, 40, 12, IDC_EDIT_CPU,   0x0081 /*EDIT*/, L"");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 0,
+             80, 32, 40, 12, IDC_EDIT_RAM,   0x0081,           L"");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 0,
+             80, 52, 40, 12, IDC_EDIT_DISCO, 0x0081,           L"");
+
+    /* Botoes */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 0,
+             34, 108, 60, 14, IDOK,     0x0080 /*BUTTON*/, L"OK");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,    0,
+             106,108, 60, 14, IDCANCEL, 0x0080,             L"Cancelar");
+
+    DialogBoxIndirectA(GetModuleHandle(NULL),
+                       (LPDLGTEMPLATE)dlgBuf,
+                       hwndPai,
+                       DialogoAlertasProc);
+
+    #undef WRITE_STR_W
+    #undef ALIGN_DWORD
+    #undef ADD_ITEM
+    #undef DLG_ITEMS
+}
+
+/* ========================================================================= */
+/* FUNCIONALIDADE 3 — Notificacoes balloon com cooldown                      */
+/* ========================================================================= */
+
+static void EnviarBalloon(const char *titulo, const char *msg) {
+    ULONGLONG agora = GetTickCount64();
+
+    /* Respeitar cooldown */
+    if (agora - ultimoBalloonTick <
+        (ULONGLONG)BALLOON_COOLDOWN_SEGUNDOS * 1000ULL) return;
+
+    /* Garantir que o icone de tray esta ativo */
+    if (!trayIconAtivo) {
+        Shell_NotifyIconA(NIM_ADD, &nid);
+        trayIconAtivo = 1;
+    }
+
+    nid.uFlags |= NIF_INFO;
+    nid.dwInfoFlags = NIIF_WARNING;
+    strncpy_s(nid.szInfoTitle, sizeof(nid.szInfoTitle), titulo, _TRUNCATE);
+    strncpy_s(nid.szInfo,      sizeof(nid.szInfo),      msg,    _TRUNCATE);
+    nid.uTimeout = 5000;
+
+    Shell_NotifyIconA(NIM_MODIFY, &nid);
+
+    nid.uFlags &= ~NIF_INFO; /* limpar para nao repetir */
+    ultimoBalloonTick = agora;
+}
+
+static void VerificarAlertasBalloon(void) {
+    if (!alertaGlobalAtivo) return;
+
+    {
+        char msgBalloon[256];
+        char partes[3][64];
+        int n = 0;
+
+        partes[0][0] = partes[1][0] = partes[2][0] = '\0';
+
+        if (ultimoCpuPercent > limiteCpuPercent)
+            snprintf(partes[n++], 64, "CPU %.0f%%", ultimoCpuPercent);
+        if (ultimoRamPercent > limiteRamPercent)
+            snprintf(partes[n++], 64, "RAM %.0f%%", ultimoRamPercent);
+
+        if (n == 0) return; /* so disco => sem balloon (ja visivel no titulo) */
+
+        msgBalloon[0] = '\0';
+        {
+            int i;
+            for (i = 0; i < n; i++) {
+                if (i > 0) strncat_s(msgBalloon, sizeof(msgBalloon), " | ", _TRUNCATE);
+                strncat_s(msgBalloon, sizeof(msgBalloon), partes[i], _TRUNCATE);
+            }
+        }
+
+        EnviarBalloon("WinMon — Alerta de Recursos", msgBalloon);
+    }
+}
+
+/* ========================================================================= */
+/* FUNCIONALIDADE 4 — Temperatura da CPU via WMI                             */
+/*                                                                           */
+/* Usa MSAcpi_ThermalZoneTemperature em root\wmi. Requer elevacao UAC,       */
+/* garantida pelo manifesto inline (/manifestuac:requireAdministrator).      */
+/*                                                                           */
+/* InicializarTemperaturaCPU() — chama CoInitializeEx uma vez no WM_CREATE. */
+/* LerTemperaturaCPU()         — abre/fecha a query a cada tick para nao    */
+/*                               manter IWbemServices vivo entre ciclos.    */
+/* ========================================================================= */
+
+static IWbemLocator  *g_pWbemLoc = NULL;
+static IWbemServices *g_pWbemSvc = NULL;
+static int            g_wmiPronto = 0;
+
+static void InicializarTemperaturaCPU(void) {
+    HRESULT hr;
+
+    numZonasTemp = 0;
+    g_wmiPronto  = 0;
+
+    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return;
+
+    hr = CoInitializeSecurity(
+        NULL, -1, NULL, NULL,
+        RPC_C_AUTHN_LEVEL_DEFAULT,
+        RPC_C_IMP_LEVEL_IMPERSONATE,
+        NULL, EOAC_NONE, NULL);
+    /* E_ALREADY_INITIALIZED e aceitavel */
+    if (FAILED(hr) && hr != RPC_E_TOO_LATE) return;
+
+    hr = CoCreateInstance(
+        &CLSID_WbemLocator, NULL,
+        CLSCTX_INPROC_SERVER,
+        &IID_IWbemLocator,
+        (LPVOID *)&g_pWbemLoc);
+    if (FAILED(hr) || !g_pWbemLoc) return;
+
+    {
+        BSTR bstrNs = SysAllocString(L"ROOT\\WMI");
+        if (!bstrNs) return;
+
+        hr = g_pWbemLoc->lpVtbl->ConnectServer(
+            g_pWbemLoc, bstrNs,
+            NULL, NULL, NULL, 0, NULL, NULL,
+            &g_pWbemSvc);
+
+        SysFreeString(bstrNs);
+    }
+
+    if (FAILED(hr) || !g_pWbemSvc) return;
+
+    hr = CoSetProxyBlanket(
+        (IUnknown *)g_pWbemSvc,
+        RPC_C_AUTHN_WINNT,
+        RPC_C_AUTHZ_NONE,
+        NULL,
+        RPC_C_AUTHN_LEVEL_CALL,
+        RPC_C_IMP_LEVEL_IMPERSONATE,
+        NULL,
+        EOAC_NONE);
+
+    if (FAILED(hr)) return;
+
+    g_wmiPronto = 1;
+}
+
+static void LerTemperaturaCPU(char *buffer, size_t size, size_t *offset) {
+    HRESULT          hr;
+    BSTR             bstrQuery = NULL;
+    BSTR             bstrWql   = NULL;
+    IEnumWbemClassObject *pEnum = NULL;
+    IWbemClassObject     *pObj  = NULL;
+    ULONG            retorno;
+    int              algumValido = 0;
+
+    if (!g_wmiPronto || !g_pWbemSvc) return;
+
+    numZonasTemp = 0;
+
+    bstrWql   = SysAllocString(L"WQL");
+    bstrQuery = SysAllocString(
+        L"SELECT InstanceName, CurrentTemperature "
+        L"FROM MSAcpi_ThermalZoneTemperature");
+
+    if (!bstrWql || !bstrQuery) goto cleanup;
+
+    hr = g_pWbemSvc->lpVtbl->ExecQuery(
+        g_pWbemSvc, bstrWql, bstrQuery,
+        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+        NULL, &pEnum);
+
+    if (FAILED(hr) || !pEnum) goto cleanup;
+
+    while (numZonasTemp < MAX_TEMP_ZONAS) {
+        VARIANT vtTemp, vtName;
+        double  celsius;
+
+        hr = pEnum->lpVtbl->Next(pEnum,
+            WBEM_INFINITE, 1, &pObj, &retorno);
+        if (FAILED(hr) || retorno == 0) break;
+
+        VariantInit(&vtTemp);
+        VariantInit(&vtName);
+
+        /* CurrentTemperature: decimos de Kelvin (ex: 3232 = 323.2 K) */
+        hr = pObj->lpVtbl->Get(pObj,
+            L"CurrentTemperature", 0, &vtTemp, NULL, NULL);
+        if (SUCCEEDED(hr) && vtTemp.vt == VT_I4) {
+            celsius = (vtTemp.lVal / 10.0) - 273.15;
+        } else if (SUCCEEDED(hr) && vtTemp.vt == VT_R8) {
+            celsius = (vtTemp.dblVal / 10.0) - 273.15;
+        } else {
+            VariantClear(&vtTemp);
+            VariantClear(&vtName);
+            pObj->lpVtbl->Release(pObj);
+            continue;
+        }
+
+        /* Sanidade */
+        if (celsius < -10.0 || celsius > 150.0) {
+            VariantClear(&vtTemp);
+            VariantClear(&vtName);
+            pObj->lpVtbl->Release(pObj);
+            continue;
+        }
+
+        tempAtual[numZonasTemp] = celsius;
+        algumValido = 1;
+
+        /* InstanceName para label */
+        hr = pObj->lpVtbl->Get(pObj,
+            L"InstanceName", 0, &vtName, NULL, NULL);
+        if (SUCCEEDED(hr) && vtName.vt == VT_BSTR && vtName.bstrVal) {
+            WideCharToMultiByte(CP_ACP, 0,
+                vtName.bstrVal, -1,
+                tempNome[numZonasTemp],
+                sizeof(tempNome[numZonasTemp]),
+                NULL, NULL);
+        } else {
+            snprintf(tempNome[numZonasTemp],
+                     sizeof(tempNome[numZonasTemp]),
+                     "Zona %d", numZonasTemp);
+        }
+
+        VariantClear(&vtTemp);
+        VariantClear(&vtName);
+        pObj->lpVtbl->Release(pObj);
+        pObj = NULL;
+
+        numZonasTemp++;
+    }
+
+cleanup:
+    if (pObj)   pObj->lpVtbl->Release(pObj);
+    if (pEnum)  pEnum->lpVtbl->Release(pEnum);
+    SysFreeString(bstrQuery);
+    SysFreeString(bstrWql);
+
+    if (!algumValido || numZonasTemp == 0) return;
+
+    if (buffer && size > 0 && offset) {
+        int i;
+        AppendFormat(buffer, size, offset,
+            "=== [ TEMPERATURA CPU (WMI) ] ===\r\n");
+
+        for (i = 0; i < numZonasTemp; i++) {
+            /* Encurtar o InstanceName para mostrar so a parte final */
+            const char *label = tempNome[i];
+            const char *barra = strrchr(label, '\\');
+            if (barra) label = barra + 1;
+
+            AppendFormat(buffer, size, offset,
+                "%-14s %.1f \xB0\x43\r\n", label, tempAtual[i]);
+        }
+
+        AppendFormat(buffer, size, offset, "\r\n");
+    }
+}
+
+static void TerminarWMI(void) {
+    if (g_pWbemSvc) {
+        g_pWbemSvc->lpVtbl->Release(g_pWbemSvc);
+        g_pWbemSvc = NULL;
+    }
+    if (g_pWbemLoc) {
+        g_pWbemLoc->lpVtbl->Release(g_pWbemLoc);
+        g_pWbemLoc = NULL;
+    }
+    CoUninitialize();
+    g_wmiPronto = 0;
+}
+
+/* ========================================================================= */
+
 void AtualizarMonitor() {
     static char buffer[BUFFER_SIZE];
     size_t offset = 0;
@@ -1327,6 +1925,7 @@ void AtualizarMonitor() {
 
     MonitorarSistema(buffer, BUFFER_SIZE, &offset);
     MonitorarCPU(buffer, BUFFER_SIZE, &offset);
+    LerTemperaturaCPU(buffer, BUFFER_SIZE, &offset);
     MonitorarRAM(buffer, BUFFER_SIZE, &offset);
     MonitorarDiscos(buffer, BUFFER_SIZE, &offset);
     MonitorarDiscoIO(buffer, BUFFER_SIZE, &offset);
@@ -1362,6 +1961,8 @@ void AtualizarMonitor() {
     AplicarCoresDeAlerta();
     AtualizarTituloJanela();
     AtualizarTooltipTray();
+    VerificarAlertasBalloon();
+    EscreverLinhaLog();
 
     InvalidateRect(hGraphCPU, NULL, FALSE);
     InvalidateRect(hGraphRAM, NULL, FALSE);
@@ -1434,6 +2035,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 PdhCollectQueryData(hQuery);
             }
 
+            /* Temperatura via WMI (independente do PDH). */
+            InicializarTemperaturaCPU();
+
+            /* Carregar configuracao de alertas do .ini (se existir). */
+            CarregarConfigIni();
+
             ZeroMemory(&nid, sizeof(nid));
             nid.cbSize = sizeof(NOTIFYICONDATAA);
             nid.hWnd = hwnd;
@@ -1503,6 +2110,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 ExportarSnapshot();
                 return 0;
             }
+            if (LOWORD(wParam) == ID_TOGGLE_LOG) {
+                if (logAtivo) {
+                    FecharLogCSV();
+                    MessageBoxA(hwnd, "Log CSV interrompido.", "WinMon", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    IniciarLogCSV();
+                    if (logAtivo) {
+                        char msg[MAX_PATH + 64];
+                        snprintf(msg, sizeof(msg), "Log CSV iniciado:\n%s", logNomeFicheiro);
+                        MessageBoxA(hwnd, msg, "WinMon", MB_OK | MB_ICONINFORMATION);
+                    }
+                }
+                return 0;
+            }
+            if (LOWORD(wParam) == ID_CONFIG_ALERTAS) {
+                MostrarDialogoAlertas(hwnd);
+                return 0;
+            }
             return DefWindowProc(hwnd, uMsg, wParam, lParam);
 
         case WM_TIMER:
@@ -1533,6 +2158,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 trayIconAtivo = 0;
             }
 
+            FecharLogCSV();
+            TerminarWMI();
+
             if (hRichEditLib) {
                 FreeLibrary(hRichEditLib);
                 hRichEditLib = NULL;
@@ -1555,7 +2183,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     WNDCLASSA wc;
     HWND hwnd;
     ACCEL accels[] = {
-        { FVIRTKEY | FCONTROL, 'S', ID_EXPORT_SNAPSHOT }
+        { FVIRTKEY | FCONTROL, 'S', ID_EXPORT_SNAPSHOT },
+        { FVIRTKEY | FCONTROL, 'L', ID_TOGGLE_LOG      },
+        { FVIRTKEY | FCONTROL, 'A', ID_CONFIG_ALERTAS  }
     };
     HACCEL hAccel;
     MSG msg;
@@ -1624,7 +2254,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (!hwnd)
         return 0;
 
-    hAccel = CreateAcceleratorTableA(accels, 1);
+    hAccel = CreateAcceleratorTableA(accels, 3);
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);

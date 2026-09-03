@@ -1,0 +1,3 @@
+/* Embute o manifesto UAC no executavel.
+ * RT_MANIFEST (24) com ID 1 = manifesto de aplicacao. */
+1 24 "winmon.manifest"
