@@ -45,6 +45,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "advapi32.lib")
 
 /* WMI para temperatura.
  * Definir os GUIDs inline evita depender de wbemuuid.lib/-luuid no MinGW,
@@ -89,10 +90,17 @@ static const IID   LOCAL_IID_IWbemLocator  =
 /* Historico dos graficos: 120 segundos, um ponto por segundo. */
 #define HISTORICO_PONTOS 120
 
-/* ---- Overlay compacto (estilo RTSS) ---- */
-#define ID_TOGGLE_OVERLAY  1004
-#define OVERLAY_TIMER_ID   2
-#define OVERLAY_CLASS_NAME "WinMonOverlayClass"
+/* ---- Overlay alargado (estilo RTSS) ---- */
+#define ID_TOGGLE_OVERLAY   1004
+#define ID_CONFIG_OVERLAY   1005
+#define OVERLAY_CLASS_NAME  "WinMonOverlayClass"
+
+/* Número de colunas de métricas no overlay */
+#define OV_NUM_COLUNAS  5   /* CPU | RAM | NET | TEMP | DISCO */
+
+/* Limites do tamanho de fonte do overlay */
+#define OV_FONT_MIN  8
+#define OV_FONT_MAX  32
 
 /* IDs das abas */
 #define TAB_RESUMO     2001
@@ -202,9 +210,22 @@ static IntervaloAlerta intervalosAlerta[MAX_ALERT_RANGES];
 static int totalIntervalosAlerta = 0;
 static int alertaGlobalAtivo = 0;
 
-/* ---- Overlay compacto ---- */
-static HWND  hOverlay      = NULL;
-static int   overlayAtivo  = 0;
+/* ---- Overlay alargado — configuração em runtime ---- */
+static HWND  hOverlay         = NULL;
+static int   overlayAtivo     = 0;
+
+/* Configurações ajustáveis (persistidas no Registry) */
+static int   ovFontSize       = 13;          /* tamanho da fonte em pt */
+static char  ovFontName[64]   = "Consolas";  /* nome da fonte */
+static BYTE  ovOpacity        = 210;         /* 0-255 */
+static int   ovMostrarTemp    = 1;           /* mostrar coluna de temperatura */
+static int   ovMostrarDisco   = 1;           /* mostrar coluna de disco */
+
+/* Dimensões calculadas dinamicamente em RecalcOverlaySize() */
+static int   ovColW           = 120;  /* largura de cada coluna */
+static int   ovRowH           = 0;    /* altura de linha (calculada) */
+static int   ovTotalW         = 0;
+static int   ovTotalH         = 0;
 
 static ProcessoInfo listaProcessos[MAX_PROCESSES];
 static HistoricoMonitor historico;
@@ -748,6 +769,10 @@ static void CriarOverlay(void);
 static void FecharOverlay(void);
 static void ToggleOverlay(void);
 static void AtualizarOverlay(void);
+static void RecalcOverlaySize(void);
+static void MostrarDialogoConfigOverlay(HWND hwndPai);
+static void GravarConfigOverlay(void);
+static void CarregarConfigOverlay(void);
 
 /* ------------------------------------------------------------------------- */
 /* Graficos GDI                                                              */
@@ -1319,9 +1344,18 @@ static void RedimensionarConteudo(HWND hwnd) {
 
     GetClientRect(hwnd, &rc);
 
-    /* Botao overlay: canto superior-direito, sobreposto ao tab (fora das abas). */
+    /* Botoes overlay: canto superior-direito, sobrepostos ao tab.
+     *   [⚙][  Overlay [Ctrl+O]  ]
+     */
     if (hBtnOverlay)
-        MoveWindow(hBtnOverlay, rc.right - 126, 3, 120, 22, TRUE);
+        MoveWindow(hBtnOverlay, rc.right - 122, 3, 118, 22, TRUE);
+
+    /* Botão de configuração — à esquerda do toggle */
+    {
+        HWND hBtnCfg = GetDlgItem(hwnd, ID_CONFIG_OVERLAY);
+        if (hBtnCfg)
+            MoveWindow(hBtnCfg, rc.right - 150, 3, 26, 22, TRUE);
+    }
 
     if (hTab) {
         MoveWindow(hTab, 0, 0, rc.right, rc.bottom, TRUE);
@@ -1409,12 +1443,22 @@ static void CriarAbas(HWND hwnd) {
     hBtnOverlay = CreateWindowExA(
         0, "BUTTON", "Overlay [Ctrl+O]",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        0, 0, 120, 22,
+        0, 0, 118, 22,
         hwnd, (HMENU)(UINT_PTR)ID_TOGGLE_OVERLAY,
         GetModuleHandle(NULL), NULL);
 
-    if (hFontUI)
+    /* Botao de configuracao do overlay (engrenagem) */
+    CreateWindowExA(
+        0, "BUTTON", "\xE2\x9A\x99",   /* UTF-8 ⚙ (fallback: usa "CFG") */
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 26, 22,
+        hwnd, (HMENU)(UINT_PTR)ID_CONFIG_OVERLAY,
+        GetModuleHandle(NULL), NULL);
+
+    if (hFontUI) {
         SendMessage(hBtnOverlay, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+        /* O botao de config usa a fonte do sistema — sem forçar */
+    }
 
     MostrarAba(0);
 }
@@ -1943,168 +1987,550 @@ static void TerminarWMI(void) {
 }
 
 /* ========================================================================= */
-/* OVERLAY COMPACTO (estilo RTSS)                                            */
+/* OVERLAY ALARGADO (estilo RTSS) — horizontal, multi-coluna, configurável   */
 /* ========================================================================= */
 
 /*
- * Janela filha-de-desktop, always-on-top, click-through, sem barra de título.
- * Mostra CPU%, RAM% e rede (down/up) actualizados a cada segundo.
- * Posicionada no canto superior-direito; pode ser arrastada com o rato.
+ * Layout horizontal:
  *
- * Transparência: usa WS_EX_LAYERED + SetLayeredWindowAttributes com
- * colorkey RGB(1,1,1) para o fundo (nunca puro-preto para não apagar texto).
+ *   [ WinMon ][ CPU ][ RAM ][ NET ][ TEMP ][ DISCO ]
+ *
+ * Cada coluna tem:
+ *   - Label colorido (label row)
+ *   - Valor principal grande
+ *   - Mini-barra de progresso (onde aplicável)
+ *   - Sub-valor (ex.: MHz para CPU, MB usados para RAM, ↓↑ para NET)
+ *
+ * A janela redimensiona-se automaticamente consoante o tamanho de fonte
+ * (ovFontSize). O botão direito abre o diálogo de configuração.
+ * O botão esquerdo arrasta. Duplo-clique fecha.
  */
 
-#define OVERLAY_W  320
-#define OVERLAY_H   102
-#define OVERLAY_MARGIN 12   /* distancia ao canto da janela principal */
-
-/* Cor de fundo do overlay — usada como colorkey na transparência */
-#define OV_BG  RGB(18, 18, 18)
+#define OV_PAD         6    /* padding interno horizontal/vertical */
+#define OV_BAR_H       5    /* altura da mini-barra de progresso */
+#define OV_MARGIN_SCR  12   /* distância ao canto do ecrã */
+#define OV_BG          RGB(14, 14, 16)
+#define OV_BORDA       RGB(60, 63, 70)
+#define OV_SEP         RGB(45, 47, 52)  /* cor do separador entre colunas */
 
 static BOOL  ovArrastar   = FALSE;
 static POINT ovPtArrastar = {0, 0};
+
+/* ---- Persistência no Registry ------------------------------------------ */
+
+static void GravarConfigOverlay(void) {
+    HKEY hk;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER,
+            "Software\\WinMon\\Overlay", 0, NULL,
+            REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hk, NULL) != ERROR_SUCCESS)
+        return;
+
+    DWORD v;
+    v = (DWORD)ovFontSize;
+    RegSetValueExA(hk, "FontSize", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    RegSetValueExA(hk, "FontName", 0, REG_SZ,
+                   (BYTE*)ovFontName, (DWORD)(strlen(ovFontName)+1));
+    v = (DWORD)ovOpacity;
+    RegSetValueExA(hk, "Opacity", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = (DWORD)ovMostrarTemp;
+    RegSetValueExA(hk, "ShowTemp", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = (DWORD)ovMostrarDisco;
+    RegSetValueExA(hk, "ShowDisk", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    RegCloseKey(hk);
+}
+
+static void CarregarConfigOverlay(void) {
+    HKEY hk;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+            "Software\\WinMon\\Overlay", 0, KEY_QUERY_VALUE, &hk) != ERROR_SUCCESS)
+        return;
+
+    DWORD v, sz = sizeof(DWORD);
+    if (RegQueryValueExA(hk, "FontSize", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+        ovFontSize = (int)v;
+    sz = sizeof(ovFontName);
+    RegQueryValueExA(hk, "FontName", NULL, NULL, (BYTE*)ovFontName, &sz);
+    sz = sizeof(DWORD);
+    if (RegQueryValueExA(hk, "Opacity", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+        ovOpacity = (BYTE)v;
+    if (RegQueryValueExA(hk, "ShowTemp", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+        ovMostrarTemp = (int)v;
+    if (RegQueryValueExA(hk, "ShowDisk", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+        ovMostrarDisco = (int)v;
+    RegCloseKey(hk);
+
+    /* Limites de segurança */
+    if (ovFontSize < OV_FONT_MIN) ovFontSize = OV_FONT_MIN;
+    if (ovFontSize > OV_FONT_MAX) ovFontSize = OV_FONT_MAX;
+    if (ovFontName[0] == '\0') strncpy_s(ovFontName, sizeof(ovFontName), "Consolas", _TRUNCATE);
+    if (ovOpacity < 30)  ovOpacity = 30;
+    if (ovOpacity > 255) ovOpacity = 255;
+}
+
+/* ---- Cálculo dinâmico do tamanho da janela ----------------------------- */
+
+/*
+ * Recalcula ovColW, ovRowH, ovTotalW, ovTotalH com base em ovFontSize.
+ * Deve ser chamada sempre que ovFontSize ou as colunas visíveis mudam.
+ * Se o overlay já existe, aplica o novo tamanho imediatamente.
+ */
+static void RecalcOverlaySize(void) {
+    /* Estimativa proporcional: Consolas 13pt ≈ largura de char 8px, alt. linha 20px */
+    int charW   = (ovFontSize * 8)  / 13;
+    if (charW < 5) charW = 5;
+    int lineH   = (ovFontSize * 20) / 13;
+    if (lineH < 12) lineH = 12;
+
+    ovRowH  = lineH;
+
+    /* Largura da coluna: suficiente para ~11 chars + padding */
+    ovColW  = charW * 11 + OV_PAD * 2;
+    if (ovColW < 80) ovColW = 80;
+
+    /* Número de colunas visíveis: CPU + RAM + NET + (TEMP?) + (DISCO?) */
+    int ncols = 3;
+    if (ovMostrarTemp)  ncols++;
+    if (ovMostrarDisco) ncols++;
+
+    /* Cada coluna: 1 linha label + 1 linha valor grande + barra + 1 linha sub-valor */
+    int nlinhas = 3;   /* label | valor | sub */
+
+    ovTotalW = OV_PAD + ncols * ovColW + OV_PAD;
+    ovTotalH = OV_PAD + nlinhas * ovRowH + OV_BAR_H + OV_PAD * 2;
+
+    if (hOverlay && overlayAtivo) {
+        /* Preservar posição, só alterar tamanho */
+        RECT wr;
+        GetWindowRect(hOverlay, &wr);
+        SetWindowPos(hOverlay, HWND_TOPMOST,
+            wr.left, wr.top, ovTotalW, ovTotalH,
+            SWP_NOACTIVATE);
+    }
+}
+
+/* ---- Desenho de uma mini-barra de progresso ----------------------------- */
+
+static void DrawMiniBar(HDC hdc, int x, int y, int w, double pct,
+                        COLORREF corFill, COLORREF corBg) {
+    RECT bar = { x, y, x + w, y + OV_BAR_H };
+    HBRUSH bg = CreateSolidBrush(corBg);
+    FillRect(hdc, &bar, bg);
+    DeleteObject(bg);
+
+    if (pct > 0.0) {
+        int fill = (int)(w * (pct / 100.0));
+        if (fill > w) fill = w;
+        if (fill > 0) {
+            RECT filled = { x, y, x + fill, y + OV_BAR_H };
+            HBRUSH fg = CreateSolidBrush(corFill);
+            FillRect(hdc, &filled, fg);
+            DeleteObject(fg);
+        }
+    }
+}
+
+/* ---- Desenha uma coluna de métrica -------------------------------------- */
+
+typedef struct {
+    const char *label;
+    COLORREF    corLabel;
+    const char *valorStr;    /* linha principal */
+    const char *subStr;      /* linha secundária (pode ser NULL) */
+    double      barPct;      /* -1 = sem barra */
+    COLORREF    corBar;
+} OvColuna;
+
+static void DrawOvColuna(HDC hdc, int x, int y,
+                         HFONT fLabel, HFONT fValor, HFONT fSub,
+                         const OvColuna *c) {
+    int lh = ovRowH;
+    int cw = ovColW;
+    RECT tr;
+
+    /* Label */
+    SelectObject(hdc, fLabel);
+    SetTextColor(hdc, c->corLabel);
+    tr = (RECT){ x + OV_PAD, y, x + cw - OV_PAD, y + lh };
+    DrawTextA(hdc, c->label, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    y += lh;
+
+    /* Valor principal */
+    SelectObject(hdc, fValor);
+    SetTextColor(hdc, RGB(230, 232, 235));
+    tr = (RECT){ x + OV_PAD, y, x + cw - OV_PAD, y + lh };
+    DrawTextA(hdc, c->valorStr, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    y += lh;
+
+    /* Mini-barra */
+    if (c->barPct >= 0.0) {
+        DrawMiniBar(hdc, x + OV_PAD, y, cw - OV_PAD * 2,
+                    c->barPct, c->corBar, RGB(40, 42, 46));
+    }
+    y += OV_BAR_H + 2;
+
+    /* Sub-valor */
+    if (c->subStr && c->subStr[0]) {
+        SelectObject(hdc, fSub);
+        SetTextColor(hdc, RGB(150, 153, 158));
+        tr = (RECT){ x + OV_PAD, y, x + cw - OV_PAD, y + lh };
+        DrawTextA(hdc, c->subStr, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    }
+}
+
+/* ---- OverlayProc -------------------------------------------------------- */
 
 static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
                                     WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg) {
 
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hwnd, &ps);
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
 
-            /* Fundo escuro quase opaco */
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            HBRUSH bgBrush = CreateSolidBrush(OV_BG);
-            FillRect(hdc, &rc, bgBrush);
-            DeleteObject(bgBrush);
+        /* Fundo */
+        HBRUSH bgBrush = CreateSolidBrush(OV_BG);
+        FillRect(hdc, &rc, bgBrush);
+        DeleteObject(bgBrush);
 
-            /* Borda fina */
-            HPEN penBorda = CreatePen(PS_SOLID, 1, RGB(80, 80, 80));
-            HPEN penVelho = (HPEN)SelectObject(hdc, penBorda);
-            MoveToEx(hdc, 0, 0, NULL);          LineTo(hdc, rc.right-1, 0);
-            LineTo(hdc, rc.right-1, rc.bottom-1);
-            LineTo(hdc, 0, rc.bottom-1);        LineTo(hdc, 0, 0);
-            SelectObject(hdc, penVelho);
-            DeleteObject(penBorda);
+        /* Borda */
+        HPEN penBorda = CreatePen(PS_SOLID, 1, OV_BORDA);
+        HPEN penVelho = (HPEN)SelectObject(hdc, penBorda);
+        MoveToEx(hdc, 0, 0, NULL);
+        LineTo(hdc, rc.right-1, 0);
+        LineTo(hdc, rc.right-1, rc.bottom-1);
+        LineTo(hdc, 0, rc.bottom-1);
+        LineTo(hdc, 0, 0);
+        SelectObject(hdc, penVelho);
+        DeleteObject(penBorda);
 
-            SetBkMode(hdc, TRANSPARENT);
+        SetBkMode(hdc, TRANSPARENT);
 
-            /* ---- Titulo ---- */
-            HFONT fTitulo = CreateFontA(
-                11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
-            HFONT fValor = CreateFontA(
-                13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+        /* Fontes */
+        HFONT fLabel = CreateFontA(
+            ovFontSize - 1, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, ovFontName);
+        HFONT fValor = CreateFontA(
+            ovFontSize + 1, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, ovFontName);
+        HFONT fSub = CreateFontA(
+            max(ovFontSize - 3, OV_FONT_MIN), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, ovFontName);
 
-            HFONT fVelho;
-            char buf[64];
-            RECT tr;
+        HFONT fOrig = (HFONT)SelectObject(hdc, fLabel);
 
-            /* Cabeçalho */
-            fVelho = (HFONT)SelectObject(hdc, fTitulo);
-            SetTextColor(hdc, RGB(180, 180, 180));
-            tr = (RECT){ 6, 4, rc.right-4, 18 };
-            DrawTextA(hdc, "WinMon", -1, &tr, DT_LEFT | DT_SINGLELINE);
+        int cx = OV_PAD;
+        int cy = OV_PAD;
+        OvColuna col;
+        char vBuf[64], sBuf[64];
+        char dBuf[32], uBuf[32];
+        HPEN penSep = CreatePen(PS_SOLID, 1, OV_SEP);
 
-            /* CPU */
-            SelectObject(hdc, fTitulo);
-            SetTextColor(hdc, RGB(120, 200, 255));
-            tr = (RECT){ 6, 22, 50, 38 };
-            DrawTextA(hdc, "CPU", -1, &tr, DT_LEFT | DT_SINGLELINE);
+        /* ---- CPU ---- */
+        snprintf(vBuf, sizeof(vBuf), "%.1f%%", ultimoCpuPercent);
+        /* Sub: temperatura média se disponível */
+        if (numZonasTemp > 0) {
+            double t = 0.0;
+            int i;
+            for (i = 0; i < numZonasTemp; i++) t += tempAtual[i];
+            t /= numZonasTemp;
+            snprintf(sBuf, sizeof(sBuf), "%.0f\xB0" "C", t);
+        } else {
+            snprintf(sBuf, sizeof(sBuf), "%d cores", numNucleosMonitorizados);
+        }
+        col = (OvColuna){ "CPU", RGB(100, 190, 255), vBuf, sBuf,
+                          ultimoCpuPercent, RGB(100, 190, 255) };
+        DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+        cx += ovColW;
 
-            SelectObject(hdc, fValor);
-            SetTextColor(hdc, RGB(220, 220, 220));
-            snprintf(buf, sizeof(buf), "%5.1f%%", ultimoCpuPercent);
-            tr = (RECT){ 44, 21, rc.right-4, 37 };
-            DrawTextA(hdc, buf, -1, &tr, DT_LEFT | DT_SINGLELINE);
+        SelectObject(hdc, penSep);
+        MoveToEx(hdc, cx, cy, NULL);
+        LineTo(hdc, cx, rc.bottom - OV_PAD);
 
-            /* RAM */
-            SelectObject(hdc, fTitulo);
-            SetTextColor(hdc, RGB(130, 230, 160));
-            tr = (RECT){ 6, 40, 50, 56 };
-            DrawTextA(hdc, "RAM", -1, &tr, DT_LEFT | DT_SINGLELINE);
-
-            SelectObject(hdc, fValor);
-            SetTextColor(hdc, RGB(220, 220, 220));
-            snprintf(buf, sizeof(buf), "%5.1f%%", ultimoRamPercent);
-            tr = (RECT){ 44, 39, rc.right-4, 55 };
-            DrawTextA(hdc, buf, -1, &tr, DT_LEFT | DT_SINGLELINE);
-
-            /* Rede */
-            SelectObject(hdc, fTitulo);
-            SetTextColor(hdc, RGB(255, 200, 100));
-            tr = (RECT){ 6, 58, 50, 74 };
-            DrawTextA(hdc, "NET", -1, &tr, DT_LEFT | DT_SINGLELINE);
-
-            {
-                char downStr[24], upStr[24];
-                FormatarBytes(ultimoNetDown, downStr, sizeof(downStr));
-                FormatarBytes(ultimoNetUp,   upStr,   sizeof(upStr));
-                SelectObject(hdc, fValor);
-                SetTextColor(hdc, RGB(220, 220, 220));
-                snprintf(buf, sizeof(buf), "\x19%s \x18%s", downStr, upStr);
-                tr = (RECT){ 44, 57, rc.right-4, 73 };
-                DrawTextA(hdc, buf, -1, &tr, DT_LEFT | DT_SINGLELINE);
+        /* ---- RAM ---- */
+        {
+            MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms);
+            DWORDLONG usedMB = 0, totalMB = 0;
+            if (GlobalMemoryStatusEx(&ms)) {
+                totalMB = ms.ullTotalPhys  / (1024*1024);
+                usedMB  = totalMB - ms.ullAvailPhys / (1024*1024);
             }
+            snprintf(vBuf, sizeof(vBuf), "%.1f%%", ultimoRamPercent);
+            snprintf(sBuf, sizeof(sBuf), "%llu/%llu MB",
+                     (unsigned long long)usedMB,
+                     (unsigned long long)totalMB);
+        }
+        col = (OvColuna){ "RAM", RGB(110, 220, 140), vBuf, sBuf,
+                          ultimoRamPercent, RGB(110, 220, 140) };
+        DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+        cx += ovColW;
 
-            SelectObject(hdc, fVelho);
-            DeleteObject(fTitulo);
-            DeleteObject(fValor);
+        SelectObject(hdc, penSep);
+        MoveToEx(hdc, cx, cy, NULL);
+        LineTo(hdc, cx, rc.bottom - OV_PAD);
 
-            EndPaint(hwnd, &ps);
-            return 0;
+        /* ---- NET ---- */
+        FormatarBytes(ultimoNetDown, dBuf, sizeof(dBuf));
+        FormatarBytes(ultimoNetUp,   uBuf, sizeof(uBuf));
+        snprintf(vBuf, sizeof(vBuf), "\x19%s/s", dBuf);
+        snprintf(sBuf, sizeof(sBuf), "\x18%s/s", uBuf);
+        col = (OvColuna){ "NET", RGB(255, 195, 80), vBuf, sBuf, -1.0, 0 };
+        DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+        cx += ovColW;
+
+        /* ---- TEMP (opcional) ---- */
+        if (ovMostrarTemp) {
+            SelectObject(hdc, penSep);
+            MoveToEx(hdc, cx, cy, NULL);
+            LineTo(hdc, cx, rc.bottom - OV_PAD);
+
+            if (numZonasTemp > 0) {
+                double tMax = 0.0, tMedia = 0.0;
+                int i;
+                for (i = 0; i < numZonasTemp; i++) {
+                    tMedia += tempAtual[i];
+                    if (tempAtual[i] > tMax) tMax = tempAtual[i];
+                }
+                tMedia /= numZonasTemp;
+                snprintf(vBuf, sizeof(vBuf), "%.0f\xB0" "C", tMedia);
+                snprintf(sBuf, sizeof(sBuf), "max %.0f\xB0" "C", tMax);
+                double barPct = (tMax > 0.0) ? (tMedia / 110.0) * 100.0 : 0.0;
+                COLORREF cTemp = (tMedia > 85.0) ? RGB(255,80,80)
+                               : (tMedia > 65.0) ? RGB(255,180,50)
+                               :                   RGB(80, 200,160);
+                col = (OvColuna){ "TEMP", RGB(255, 140, 140), vBuf, sBuf,
+                                  barPct, cTemp };
+            } else {
+                col = (OvColuna){ "TEMP", RGB(255, 140, 140), "N/A", "WMI off", -1.0, 0 };
+            }
+            DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+            cx += ovColW;
         }
 
-        /* Arrastar o overlay com botão esquerdo */
-        case WM_LBUTTONDOWN:
-            ovArrastar = TRUE;
-            ovPtArrastar.x = LOWORD(lParam);
-            ovPtArrastar.y = HIWORD(lParam);
-            SetCapture(hwnd);
-            return 0;
+        /* ---- DISCO (opcional) ---- */
+        if (ovMostrarDisco) {
+            SelectObject(hdc, penSep);
+            MoveToEx(hdc, cx, cy, NULL);
+            LineTo(hdc, cx, rc.bottom - OV_PAD);
 
-        case WM_MOUSEMOVE:
-            if (ovArrastar) {
-                POINT pt;
-                RECT  wr;
-                GetCursorPos(&pt);
-                GetWindowRect(hwnd, &wr);
-                int dx = pt.x - (wr.left + ovPtArrastar.x);
-                int dy = pt.y - (wr.top  + ovPtArrastar.y);
-                SetWindowPos(hwnd, NULL,
-                    wr.left + dx, wr.top + dy, 0, 0,
-                    SWP_NOSIZE | SWP_NOZORDER);
-            }
-            return 0;
+            FormatarBytes(ultimoDiskRead,  dBuf, sizeof(dBuf));
+            FormatarBytes(ultimoDiskWrite, uBuf, sizeof(uBuf));
+            snprintf(vBuf, sizeof(vBuf), "R %s/s", dBuf);
+            snprintf(sBuf, sizeof(sBuf), "W %s/s", uBuf);
+            col = (OvColuna){ "DISCO", RGB(180, 140, 255), vBuf, sBuf, -1.0, 0 };
+            DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+        }
 
-        case WM_LBUTTONUP:
-            ovArrastar = FALSE;
-            ReleaseCapture();
-            return 0;
+        SelectObject(hdc, penVelho);
+        DeleteObject(penSep);
+        SelectObject(hdc, fOrig);
+        DeleteObject(fLabel);
+        DeleteObject(fValor);
+        DeleteObject(fSub);
 
-        /* Duplo-clique fecha o overlay */
-        case WM_LBUTTONDBLCLK:
-            ToggleOverlay();
-            return 0;
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
 
-        case WM_DESTROY:
-            hOverlay     = NULL;
-            overlayAtivo = 0;
-            return 0;
+    /* Arrastar com botão esquerdo */
+    case WM_LBUTTONDOWN:
+        ovArrastar = TRUE;
+        ovPtArrastar.x = LOWORD(lParam);
+        ovPtArrastar.y = HIWORD(lParam);
+        SetCapture(hwnd);
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (ovArrastar) {
+            POINT pt;
+            RECT  wr;
+            GetCursorPos(&pt);
+            GetWindowRect(hwnd, &wr);
+            SetWindowPos(hwnd, NULL,
+                wr.left + (pt.x - wr.left - ovPtArrastar.x),
+                wr.top  + (pt.y - wr.top  - ovPtArrastar.y),
+                0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        ovArrastar = FALSE;
+        ReleaseCapture();
+        return 0;
+
+    /* Botão direito → diálogo de configuração */
+    case WM_RBUTTONUP:
+        MostrarDialogoConfigOverlay(hwnd);
+        return 0;
+
+    /* Duplo-clique → fechar */
+    case WM_LBUTTONDBLCLK:
+        ToggleOverlay();
+        return 0;
+
+    /* Scroll do rato → ajustar tamanho de fonte */
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        ovFontSize += (delta > 0) ? 1 : -1;
+        if (ovFontSize < OV_FONT_MIN) ovFontSize = OV_FONT_MIN;
+        if (ovFontSize > OV_FONT_MAX) ovFontSize = OV_FONT_MAX;
+        RecalcOverlaySize();
+        InvalidateRect(hwnd, NULL, FALSE);
+        GravarConfigOverlay();
+        return 0;
+    }
+
+    case WM_DESTROY:
+        hOverlay     = NULL;
+        overlayAtivo = 0;
+        return 0;
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
+/* ---- Diálogo de configuração do overlay --------------------------------- */
+
+#define IDC_OV_FONTSIZE  3001
+#define IDC_OV_FONTNAME  3002
+#define IDC_OV_OPACITY   3003
+#define IDC_OV_TEMP      3004
+#define IDC_OV_DISCO     3005
+
+static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
+                                                  WPARAM wParam, LPARAM lParam)
+{
+    (void)lParam;
+    switch (uMsg) {
+    case WM_INITDIALOG: {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", ovFontSize);
+        SetDlgItemTextA(hDlg, IDC_OV_FONTSIZE, buf);
+        SetDlgItemTextA(hDlg, IDC_OV_FONTNAME, ovFontName);
+        snprintf(buf, sizeof(buf), "%d", (int)ovOpacity);
+        SetDlgItemTextA(hDlg, IDC_OV_OPACITY, buf);
+        CheckDlgButton(hDlg, IDC_OV_TEMP,  ovMostrarTemp  ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_DISCO, ovMostrarDisco ? BST_CHECKED : BST_UNCHECKED);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK) {
+            char buf[64];
+            /* Tamanho de fonte */
+            GetDlgItemTextA(hDlg, IDC_OV_FONTSIZE, buf, sizeof(buf));
+            int fs = atoi(buf);
+            if (fs >= OV_FONT_MIN && fs <= OV_FONT_MAX) ovFontSize = fs;
+            /* Nome da fonte */
+            GetDlgItemTextA(hDlg, IDC_OV_FONTNAME, ovFontName, sizeof(ovFontName));
+            if (ovFontName[0] == '\0')
+                strncpy_s(ovFontName, sizeof(ovFontName), "Consolas", _TRUNCATE);
+            /* Opacidade */
+            GetDlgItemTextA(hDlg, IDC_OV_OPACITY, buf, sizeof(buf));
+            int op = atoi(buf);
+            if (op < 30)  op = 30;
+            if (op > 255) op = 255;
+            ovOpacity = (BYTE)op;
+            /* Colunas */
+            ovMostrarTemp  = (IsDlgButtonChecked(hDlg, IDC_OV_TEMP)  == BST_CHECKED) ? 1 : 0;
+            ovMostrarDisco = (IsDlgButtonChecked(hDlg, IDC_OV_DISCO) == BST_CHECKED) ? 1 : 0;
+
+            /* Aplicar imediatamente */
+            if (hOverlay && overlayAtivo) {
+                SetLayeredWindowAttributes(hOverlay, 0, ovOpacity, LWA_ALPHA);
+                RecalcOverlaySize();
+                InvalidateRect(hOverlay, NULL, FALSE);
+            }
+            GravarConfigOverlay();
+            EndDialog(hDlg, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL) {
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    case WM_CLOSE:
+        EndDialog(hDlg, IDCANCEL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void MostrarDialogoConfigOverlay(HWND hwndPai) {
+    static WORD dlgBuf[640];
+    WORD *p = dlgBuf;
+
+    #define WRITE_STR_W(s) \
+        do { const wchar_t *_ws=(s); while(*_ws) *p++=(WORD)*_ws++; *p++=0; } while(0)
+    #define ALIGN_DWORD() if(((ULONG_PTR)p)&2) p++
+    #define ADD_ITEM(sty,ex,xx,yy,ww,hh,iid,cls,txt) \
+        do { ALIGN_DWORD(); \
+             { DLGITEMTEMPLATE *_it=(DLGITEMTEMPLATE*)p; \
+               _it->style=(sty); _it->dwExtendedStyle=(ex); \
+               _it->x=(xx); _it->y=(yy); _it->cx=(ww); _it->cy=(hh); \
+               _it->id=(iid); \
+               p+=sizeof(DLGITEMTEMPLATE)/sizeof(WORD); } \
+             *p++=0xFFFF; *p++=(cls); \
+             WRITE_STR_W(txt); \
+             *p++=0; } while(0)
+
+    /* DLGTEMPLATE */
+    DLGTEMPLATE *dt = (DLGTEMPLATE*)p;
+    dt->style = WS_POPUP|WS_CAPTION|WS_SYSMENU|DS_MODALFRAME|DS_CENTER|DS_SETFONT;
+    dt->dwExtendedStyle = 0;
+    dt->cdit  = 12;   /* labels + edits + checks + botoes */
+    dt->x=0; dt->y=0; dt->cx=220; dt->cy=155;
+    p += sizeof(DLGTEMPLATE)/sizeof(WORD);
+    *p++=0; *p++=0;
+    WRITE_STR_W(L"Configurar Overlay");
+    *p++=9; WRITE_STR_W(L"Segoe UI");
+
+    /* Linha 1: Tamanho de fonte */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT,0,  7, 12, 90,10, -1,         0x0082,L"Tamanho fonte (pt):");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER,0, 100,10, 35,12, IDC_OV_FONTSIZE, 0x0081,L"");
+
+    /* Linha 2: Nome da fonte */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT,0,  7, 30, 90,10, -1,         0x0082,L"Fonte:");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER,  0, 100,28,110,12, IDC_OV_FONTNAME, 0x0081,L"");
+
+    /* Linha 3: Opacidade */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT,0,  7, 48, 90,10, -1,         0x0082,L"Opacidade (30-255):");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER,0,100,46, 35,12, IDC_OV_OPACITY,  0x0081,L"");
+
+    /* Checkboxes */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0, 7,66,100,12, IDC_OV_TEMP,  0x0080,L"Mostrar Temperatura");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0, 7,82,100,12, IDC_OV_DISCO, 0x0080,L"Mostrar Disco I/O");
+
+    /* Dica scroll */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT,0, 7,100,206,10, -1, 0x0082,
+             L"Dica: scroll do rato sobre o overlay ajusta a fonte.");
+
+    /* Botoes */
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,0,  40,128, 60,14, IDOK,     0x0080,L"OK");
+    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,   0, 114,128, 60,14, IDCANCEL, 0x0080,L"Cancelar");
+
+    DialogBoxIndirectA(GetModuleHandle(NULL),
+                       (LPDLGTEMPLATE)dlgBuf, hwndPai,
+                       DialogoConfigOverlayProc);
+
+    #undef WRITE_STR_W
+    #undef ALIGN_DWORD
+    #undef ADD_ITEM
+}
+
+/* ---- Ciclo de vida do overlay ------------------------------------------- */
+
 static void CriarOverlay(void) {
     HINSTANCE hInst = GetModuleHandle(NULL);
 
-    /* Registar classe (só uma vez) */
+    CarregarConfigOverlay();
+    RecalcOverlaySize();   /* calcula ovTotalW / ovTotalH */
+
+    /* Registar classe (ignora erro se já registada) */
     {
         WNDCLASSA wc;
         ZeroMemory(&wc, sizeof(wc));
@@ -2112,30 +2538,27 @@ static void CriarOverlay(void) {
         wc.hInstance     = hInst;
         wc.lpszClassName = OVERLAY_CLASS_NAME;
         wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = NULL;   /* pintamos nós próprios */
+        wc.hbrBackground = NULL;
         wc.style         = CS_DBLCLKS;
-        RegisterClassA(&wc);       /* ignora erro se já registada */
+        RegisterClassA(&wc);
     }
 
-    /* Posição inicial: canto superior-direito do ecrã de trabalho */
-    RECT workArea = {0};
-    SystemParametersInfoA(SPI_GETWORKAREA, 0, &workArea, 0);
-    int x = workArea.right  - OVERLAY_W - OVERLAY_MARGIN;
-    int y = workArea.top    + OVERLAY_MARGIN;
+    /* Posição inicial: canto superior-direito da área de trabalho */
+    RECT wa = {0};
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = wa.right  - ovTotalW - OV_MARGIN_SCR;
+    int y = wa.top    + OV_MARGIN_SCR;
 
     hOverlay = CreateWindowExA(
         WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         OVERLAY_CLASS_NAME, "WinMon Overlay",
         WS_POPUP,
-        x, y, OVERLAY_W, OVERLAY_H,
+        x, y, ovTotalW, ovTotalH,
         NULL, NULL, hInst, NULL);
 
     if (!hOverlay) return;
 
-    /* Alpha 210/255 (~82% opaco); o colorkey não é necessário pois
-     * usamos ULW_ALPHA, mas combinamos os dois para compatibilidade. */
-    SetLayeredWindowAttributes(hOverlay, 0, 210, LWA_ALPHA);
-
+    SetLayeredWindowAttributes(hOverlay, 0, ovOpacity, LWA_ALPHA);
     ShowWindow(hOverlay, SW_SHOWNOACTIVATE);
     UpdateWindow(hOverlay);
     overlayAtivo = 1;
@@ -2150,10 +2573,8 @@ static void FecharOverlay(void) {
 }
 
 static void ToggleOverlay(void) {
-    if (overlayAtivo)
-        FecharOverlay();
-    else
-        CriarOverlay();
+    if (overlayAtivo) FecharOverlay();
+    else              CriarOverlay();
 }
 
 static void AtualizarOverlay(void) {
@@ -2381,6 +2802,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             }
             if (LOWORD(wParam) == ID_TOGGLE_OVERLAY) {
                 ToggleOverlay();
+                return 0;
+            }
+            if (LOWORD(wParam) == ID_CONFIG_OVERLAY) {
+                MostrarDialogoConfigOverlay(hwnd);
                 return 0;
             }
             return DefWindowProc(hwnd, uMsg, wParam, lParam);
