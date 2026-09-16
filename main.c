@@ -89,6 +89,11 @@ static const IID   LOCAL_IID_IWbemLocator  =
 /* Historico dos graficos: 120 segundos, um ponto por segundo. */
 #define HISTORICO_PONTOS 120
 
+/* ---- Overlay compacto (estilo RTSS) ---- */
+#define ID_TOGGLE_OVERLAY  1004
+#define OVERLAY_TIMER_ID   2
+#define OVERLAY_CLASS_NAME "WinMonOverlayClass"
+
 /* IDs das abas */
 #define TAB_RESUMO     2001
 #define TAB_CPU        2002
@@ -155,10 +160,11 @@ static ProcessoCpuHistorico historicoCpu[MAX_HISTORICO];
 static int totalHistorico = 0;
 static ULONGLONG lastSystemTime = 0;
 
-HWND hMainWindow = NULL;
-HWND hEdit = NULL;
-HWND hTab = NULL;
-HWND hGraphCPU = NULL;
+HWND hMainWindow  = NULL;
+HWND hEdit        = NULL;
+HWND hTab         = NULL;
+HWND hBtnOverlay  = NULL;
+HWND hGraphCPU    = NULL;
 HWND hGraphRAM = NULL;
 HWND hGraphDisk = NULL;
 HWND hGraphNet = NULL;
@@ -195,6 +201,10 @@ static double ultimoNetUp = 0.0;
 static IntervaloAlerta intervalosAlerta[MAX_ALERT_RANGES];
 static int totalIntervalosAlerta = 0;
 static int alertaGlobalAtivo = 0;
+
+/* ---- Overlay compacto ---- */
+static HWND  hOverlay      = NULL;
+static int   overlayAtivo  = 0;
 
 static ProcessoInfo listaProcessos[MAX_PROCESSES];
 static HistoricoMonitor historico;
@@ -734,6 +744,10 @@ static void LerTemperaturaCPU(char *buffer, size_t size, size_t *offset);
 static void TerminarWMI(void);
 static void EnviarBalloon(const char *titulo, const char *msg);
 static void VerificarAlertasBalloon(void);
+static void CriarOverlay(void);
+static void FecharOverlay(void);
+static void ToggleOverlay(void);
+static void AtualizarOverlay(void);
 
 /* ------------------------------------------------------------------------- */
 /* Graficos GDI                                                              */
@@ -1305,6 +1319,10 @@ static void RedimensionarConteudo(HWND hwnd) {
 
     GetClientRect(hwnd, &rc);
 
+    /* Botao overlay: canto superior-direito, sobreposto ao tab (fora das abas). */
+    if (hBtnOverlay)
+        MoveWindow(hBtnOverlay, rc.right - 126, 3, 120, 22, TRUE);
+
     if (hTab) {
         MoveWindow(hTab, 0, 0, rc.right, rc.bottom, TRUE);
 
@@ -1385,6 +1403,18 @@ static void CriarAbas(HWND hwnd) {
     hGraphDisk = CriarGrafico(hwnd, GRAPH_DISK);
     hGraphNet = CriarGrafico(hwnd, GRAPH_NET);
     hGraphProcesses = CriarGrafico(hwnd, GRAPH_PROCESS);
+
+    /* Botao "Overlay" no canto superior-direito da barra de abas.
+     * Posição provisória — RedimensionarConteudo ajusta. */
+    hBtnOverlay = CreateWindowExA(
+        0, "BUTTON", "Overlay [Ctrl+O]",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 120, 22,
+        hwnd, (HMENU)(UINT_PTR)ID_TOGGLE_OVERLAY,
+        GetModuleHandle(NULL), NULL);
+
+    if (hFontUI)
+        SendMessage(hBtnOverlay, WM_SETFONT, (WPARAM)hFontUI, TRUE);
 
     MostrarAba(0);
 }
@@ -1913,6 +1943,225 @@ static void TerminarWMI(void) {
 }
 
 /* ========================================================================= */
+/* OVERLAY COMPACTO (estilo RTSS)                                            */
+/* ========================================================================= */
+
+/*
+ * Janela filha-de-desktop, always-on-top, click-through, sem barra de título.
+ * Mostra CPU%, RAM% e rede (down/up) actualizados a cada segundo.
+ * Posicionada no canto superior-direito; pode ser arrastada com o rato.
+ *
+ * Transparência: usa WS_EX_LAYERED + SetLayeredWindowAttributes com
+ * colorkey RGB(1,1,1) para o fundo (nunca puro-preto para não apagar texto).
+ */
+
+#define OVERLAY_W  320
+#define OVERLAY_H   102
+#define OVERLAY_MARGIN 12   /* distancia ao canto da janela principal */
+
+/* Cor de fundo do overlay — usada como colorkey na transparência */
+#define OV_BG  RGB(18, 18, 18)
+
+static BOOL  ovArrastar   = FALSE;
+static POINT ovPtArrastar = {0, 0};
+
+static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
+                                    WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg) {
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+
+            /* Fundo escuro quase opaco */
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HBRUSH bgBrush = CreateSolidBrush(OV_BG);
+            FillRect(hdc, &rc, bgBrush);
+            DeleteObject(bgBrush);
+
+            /* Borda fina */
+            HPEN penBorda = CreatePen(PS_SOLID, 1, RGB(80, 80, 80));
+            HPEN penVelho = (HPEN)SelectObject(hdc, penBorda);
+            MoveToEx(hdc, 0, 0, NULL);          LineTo(hdc, rc.right-1, 0);
+            LineTo(hdc, rc.right-1, rc.bottom-1);
+            LineTo(hdc, 0, rc.bottom-1);        LineTo(hdc, 0, 0);
+            SelectObject(hdc, penVelho);
+            DeleteObject(penBorda);
+
+            SetBkMode(hdc, TRANSPARENT);
+
+            /* ---- Titulo ---- */
+            HFONT fTitulo = CreateFontA(
+                11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+            HFONT fValor = CreateFontA(
+                13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+
+            HFONT fVelho;
+            char buf[64];
+            RECT tr;
+
+            /* Cabeçalho */
+            fVelho = (HFONT)SelectObject(hdc, fTitulo);
+            SetTextColor(hdc, RGB(180, 180, 180));
+            tr = (RECT){ 6, 4, rc.right-4, 18 };
+            DrawTextA(hdc, "WinMon", -1, &tr, DT_LEFT | DT_SINGLELINE);
+
+            /* CPU */
+            SelectObject(hdc, fTitulo);
+            SetTextColor(hdc, RGB(120, 200, 255));
+            tr = (RECT){ 6, 22, 50, 38 };
+            DrawTextA(hdc, "CPU", -1, &tr, DT_LEFT | DT_SINGLELINE);
+
+            SelectObject(hdc, fValor);
+            SetTextColor(hdc, RGB(220, 220, 220));
+            snprintf(buf, sizeof(buf), "%5.1f%%", ultimoCpuPercent);
+            tr = (RECT){ 44, 21, rc.right-4, 37 };
+            DrawTextA(hdc, buf, -1, &tr, DT_LEFT | DT_SINGLELINE);
+
+            /* RAM */
+            SelectObject(hdc, fTitulo);
+            SetTextColor(hdc, RGB(130, 230, 160));
+            tr = (RECT){ 6, 40, 50, 56 };
+            DrawTextA(hdc, "RAM", -1, &tr, DT_LEFT | DT_SINGLELINE);
+
+            SelectObject(hdc, fValor);
+            SetTextColor(hdc, RGB(220, 220, 220));
+            snprintf(buf, sizeof(buf), "%5.1f%%", ultimoRamPercent);
+            tr = (RECT){ 44, 39, rc.right-4, 55 };
+            DrawTextA(hdc, buf, -1, &tr, DT_LEFT | DT_SINGLELINE);
+
+            /* Rede */
+            SelectObject(hdc, fTitulo);
+            SetTextColor(hdc, RGB(255, 200, 100));
+            tr = (RECT){ 6, 58, 50, 74 };
+            DrawTextA(hdc, "NET", -1, &tr, DT_LEFT | DT_SINGLELINE);
+
+            {
+                char downStr[24], upStr[24];
+                FormatarBytes(ultimoNetDown, downStr, sizeof(downStr));
+                FormatarBytes(ultimoNetUp,   upStr,   sizeof(upStr));
+                SelectObject(hdc, fValor);
+                SetTextColor(hdc, RGB(220, 220, 220));
+                snprintf(buf, sizeof(buf), "\x19%s \x18%s", downStr, upStr);
+                tr = (RECT){ 44, 57, rc.right-4, 73 };
+                DrawTextA(hdc, buf, -1, &tr, DT_LEFT | DT_SINGLELINE);
+            }
+
+            SelectObject(hdc, fVelho);
+            DeleteObject(fTitulo);
+            DeleteObject(fValor);
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        /* Arrastar o overlay com botão esquerdo */
+        case WM_LBUTTONDOWN:
+            ovArrastar = TRUE;
+            ovPtArrastar.x = LOWORD(lParam);
+            ovPtArrastar.y = HIWORD(lParam);
+            SetCapture(hwnd);
+            return 0;
+
+        case WM_MOUSEMOVE:
+            if (ovArrastar) {
+                POINT pt;
+                RECT  wr;
+                GetCursorPos(&pt);
+                GetWindowRect(hwnd, &wr);
+                int dx = pt.x - (wr.left + ovPtArrastar.x);
+                int dy = pt.y - (wr.top  + ovPtArrastar.y);
+                SetWindowPos(hwnd, NULL,
+                    wr.left + dx, wr.top + dy, 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER);
+            }
+            return 0;
+
+        case WM_LBUTTONUP:
+            ovArrastar = FALSE;
+            ReleaseCapture();
+            return 0;
+
+        /* Duplo-clique fecha o overlay */
+        case WM_LBUTTONDBLCLK:
+            ToggleOverlay();
+            return 0;
+
+        case WM_DESTROY:
+            hOverlay     = NULL;
+            overlayAtivo = 0;
+            return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+static void CriarOverlay(void) {
+    HINSTANCE hInst = GetModuleHandle(NULL);
+
+    /* Registar classe (só uma vez) */
+    {
+        WNDCLASSA wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.lpfnWndProc   = OverlayProc;
+        wc.hInstance     = hInst;
+        wc.lpszClassName = OVERLAY_CLASS_NAME;
+        wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = NULL;   /* pintamos nós próprios */
+        wc.style         = CS_DBLCLKS;
+        RegisterClassA(&wc);       /* ignora erro se já registada */
+    }
+
+    /* Posição inicial: canto superior-direito do ecrã de trabalho */
+    RECT workArea = {0};
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &workArea, 0);
+    int x = workArea.right  - OVERLAY_W - OVERLAY_MARGIN;
+    int y = workArea.top    + OVERLAY_MARGIN;
+
+    hOverlay = CreateWindowExA(
+        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        OVERLAY_CLASS_NAME, "WinMon Overlay",
+        WS_POPUP,
+        x, y, OVERLAY_W, OVERLAY_H,
+        NULL, NULL, hInst, NULL);
+
+    if (!hOverlay) return;
+
+    /* Alpha 210/255 (~82% opaco); o colorkey não é necessário pois
+     * usamos ULW_ALPHA, mas combinamos os dois para compatibilidade. */
+    SetLayeredWindowAttributes(hOverlay, 0, 210, LWA_ALPHA);
+
+    ShowWindow(hOverlay, SW_SHOWNOACTIVATE);
+    UpdateWindow(hOverlay);
+    overlayAtivo = 1;
+}
+
+static void FecharOverlay(void) {
+    if (hOverlay) {
+        DestroyWindow(hOverlay);
+        hOverlay     = NULL;
+    }
+    overlayAtivo = 0;
+}
+
+static void ToggleOverlay(void) {
+    if (overlayAtivo)
+        FecharOverlay();
+    else
+        CriarOverlay();
+}
+
+static void AtualizarOverlay(void) {
+    if (hOverlay && overlayAtivo)
+        InvalidateRect(hOverlay, NULL, FALSE);
+}
+
+/* ========================================================================= */
 
 void AtualizarMonitor() {
     static char buffer[BUFFER_SIZE];
@@ -1969,6 +2218,8 @@ void AtualizarMonitor() {
     InvalidateRect(hGraphDisk, NULL, FALSE);
     InvalidateRect(hGraphNet, NULL, FALSE);
     InvalidateRect(hGraphProcesses, NULL, FALSE);
+
+    AtualizarOverlay();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2128,6 +2379,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 MostrarDialogoAlertas(hwnd);
                 return 0;
             }
+            if (LOWORD(wParam) == ID_TOGGLE_OVERLAY) {
+                ToggleOverlay();
+                return 0;
+            }
             return DefWindowProc(hwnd, uMsg, wParam, lParam);
 
         case WM_TIMER:
@@ -2137,6 +2392,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
 
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_ID);
+
+            FecharOverlay();
 
             if (hQuery) {
                 PdhCloseQuery(hQuery);
@@ -2185,7 +2442,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ACCEL accels[] = {
         { FVIRTKEY | FCONTROL, 'S', ID_EXPORT_SNAPSHOT },
         { FVIRTKEY | FCONTROL, 'L', ID_TOGGLE_LOG      },
-        { FVIRTKEY | FCONTROL, 'A', ID_CONFIG_ALERTAS  }
+        { FVIRTKEY | FCONTROL, 'A', ID_CONFIG_ALERTAS  },
+        { FVIRTKEY | FCONTROL, 'O', ID_TOGGLE_OVERLAY  }
     };
     HACCEL hAccel;
     MSG msg;
@@ -2194,7 +2452,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     HANDLE hInstanceMutex = NULL;
 
     (void)hPrevInstance;
-    (void)lpCmdLine;
+
+    /* Flag de linha de comandos: winmon.exe --overlay  (ou -overlay) */
+    int flagOverlay = (lpCmdLine &&
+        (strstr(lpCmdLine, "--overlay") != NULL ||
+         strstr(lpCmdLine, "-overlay")  != NULL));
 
     hInstanceMutex = CreateMutexW(
         NULL, TRUE, L"Local\\WinMon-HardwareMonitor-V6");
@@ -2254,10 +2516,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (!hwnd)
         return 0;
 
-    hAccel = CreateAcceleratorTableA(accels, 3);
+    hAccel = CreateAcceleratorTableA(accels, 4);
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+
+    /* Activar overlay se pedido via linha de comandos */
+    if (flagOverlay)
+        CriarOverlay();
 
     ZeroMemory(&msg, sizeof(msg));
 
