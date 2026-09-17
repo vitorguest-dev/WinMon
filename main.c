@@ -95,12 +95,16 @@ static const IID   LOCAL_IID_IWbemLocator  =
 #define ID_CONFIG_OVERLAY   1005
 #define OVERLAY_CLASS_NAME  "WinMonOverlayClass"
 
-/* Número de colunas de métricas no overlay */
-#define OV_NUM_COLUNAS  5   /* CPU | RAM | NET | TEMP | DISCO */
-
 /* Limites do tamanho de fonte do overlay */
-#define OV_FONT_MIN  8
+#define OV_FONT_MIN   8
 #define OV_FONT_MAX  32
+
+/* Snap magnetico: distancia ao canto do ecra para encaixar (px) */
+#define OV_SNAP_DIST  40
+
+/* Perfis de overlay */
+#define OV_MAX_PERFIS  16
+#define OV_NOME_MAX    32
 
 /* IDs das abas */
 #define TAB_RESUMO     2001
@@ -210,22 +214,40 @@ static IntervaloAlerta intervalosAlerta[MAX_ALERT_RANGES];
 static int totalIntervalosAlerta = 0;
 static int alertaGlobalAtivo = 0;
 
-/* ---- Overlay alargado — configuração em runtime ---- */
-static HWND  hOverlay         = NULL;
-static int   overlayAtivo     = 0;
+/* ---- Overlay alargado — estado e configuracao ---- */
+static HWND  hOverlay     = NULL;
+static int   overlayAtivo = 0;
 
-/* Configurações ajustáveis (persistidas no Registry) */
-static int   ovFontSize       = 13;          /* tamanho da fonte em pt */
-static char  ovFontName[64]   = "Consolas";  /* nome da fonte */
-static BYTE  ovOpacity        = 210;         /* 0-255 */
-static int   ovMostrarTemp    = 1;           /* mostrar coluna de temperatura */
-static int   ovMostrarDisco   = 1;           /* mostrar coluna de disco */
+/* Perfil de overlay: configuracao completa que pode ser guardada/carregada */
+typedef struct {
+    char nome[OV_NOME_MAX];  /* nome do perfil */
+    int  fontePt;            /* tamanho da fonte em pt */
+    char fonteNome[64];      /* nome da fonte */
+    BYTE opacidade;          /* 0-255 */
+    int  mostrarTemp;        /* coluna temperatura */
+    int  mostrarDisco;       /* coluna disco */
+    int  mostrarNet;         /* coluna rede */
+    int  clickThrough;       /* passa cliques para janelas por baixo */
+} OvPerfil;
 
-/* Dimensões calculadas dinamicamente em RecalcOverlaySize() */
-static int   ovColW           = 120;  /* largura de cada coluna */
-static int   ovRowH           = 0;    /* altura de linha (calculada) */
-static int   ovTotalW         = 0;
-static int   ovTotalH         = 0;
+static int      ovPerfilActivo = 0;
+static int      ovNumPerfis    = 0;
+static OvPerfil ovPerfis[OV_MAX_PERFIS];
+
+/* Atalhos para a config do perfil activo */
+#define OV_FONTE_PT    (ovPerfis[ovPerfilActivo].fontePt)
+#define OV_FONTE_NOME  (ovPerfis[ovPerfilActivo].fonteNome)
+#define OV_OPACIDADE   (ovPerfis[ovPerfilActivo].opacidade)
+#define OV_TEMP        (ovPerfis[ovPerfilActivo].mostrarTemp)
+#define OV_DISCO       (ovPerfis[ovPerfilActivo].mostrarDisco)
+#define OV_NET         (ovPerfis[ovPerfilActivo].mostrarNet)
+#define OV_CLICKTHRU   (ovPerfis[ovPerfilActivo].clickThrough)
+
+/* Dimensoes calculadas por RecalcOverlaySize() */
+static int ovColW   = 120;
+static int ovRowH   = 0;
+static int ovTotalW = 0;
+static int ovTotalH = 0;
 
 static ProcessoInfo listaProcessos[MAX_PROCESSES];
 static HistoricoMonitor historico;
@@ -770,9 +792,13 @@ static void FecharOverlay(void);
 static void ToggleOverlay(void);
 static void AtualizarOverlay(void);
 static void RecalcOverlaySize(void);
+static void AplicarClickThrough(void);
+static void SnapOverlayAoCanto(void);
+static void InicializarPerfisOverlay(void);
+static void GravarPerfisOverlay(void);
+static void CarregarPerfisOverlay(void);
+static void AtivarPerfil(int idx);
 static void MostrarDialogoConfigOverlay(HWND hwndPai);
-static void GravarConfigOverlay(void);
-static void CarregarConfigOverlay(void);
 
 /* ------------------------------------------------------------------------- */
 /* Graficos GDI                                                              */
@@ -1986,120 +2012,312 @@ static void TerminarWMI(void) {
     g_wmiPronto = 0;
 }
 
+
 /* ========================================================================= */
-/* OVERLAY ALARGADO (estilo RTSS) — horizontal, multi-coluna, configurável   */
+/* OVERLAY ALARGADO — snap magnético, click-through, perfis híbridos         */
 /* ========================================================================= */
 
 /*
- * Layout horizontal:
+ * Layout horizontal — colunas: CPU | RAM | NET | [TEMP] | [DISCO]
  *
- *   [ WinMon ][ CPU ][ RAM ][ NET ][ TEMP ][ DISCO ]
+ * Novas funcionalidades nesta versão:
  *
- * Cada coluna tem:
- *   - Label colorido (label row)
- *   - Valor principal grande
- *   - Mini-barra de progresso (onde aplicável)
- *   - Sub-valor (ex.: MHz para CPU, MB usados para RAM, ↓↑ para NET)
+ *  1. SNAP MAGNÉTICO (OV_SNAP_DIST = 40 px)
+ *     Ao largar o overlay (WM_LBUTTONUP), se o canto mais próximo do ecrã
+ *     estiver a ≤ 40 px, o overlay encosta-se automaticamente a esse canto.
  *
- * A janela redimensiona-se automaticamente consoante o tamanho de fonte
- * (ovFontSize). O botão direito abre o diálogo de configuração.
- * O botão esquerdo arrasta. Duplo-clique fecha.
+ *  2. CLICK-THROUGH (WS_EX_TRANSPARENT)
+ *     Toggle no diálogo de configuração. Quando activo, cliques e movimento
+ *     do rato passam para janelas por baixo — útil em jogo.
+ *     O overlay ainda pode ser arrastado enquanto o click-through está off.
+ *
+ *  3. PERFIS HÍBRIDOS
+ *     - 3 perfis pré-definidos: Gaming (CPU+NET, fonte pequena),
+ *       Trabalho (CPU+RAM+NET+DISCO, fonte média), Completo (tudo).
+ *     - Até OV_MAX_PERFIS perfis no total; o utilizador pode criar, renomear
+ *       e eliminar. Persistidos em HKCU\Software\WinMon\Overlay\Perfis\.
+ *     - Selecção de perfil no diálogo de configuração (combobox).
+ *     - AtivarPerfil(idx) aplica imediatamente sem recriar a janela.
  */
 
-#define OV_PAD         6    /* padding interno horizontal/vertical */
-#define OV_BAR_H       5    /* altura da mini-barra de progresso */
-#define OV_MARGIN_SCR  12   /* distância ao canto do ecrã */
-#define OV_BG          RGB(14, 14, 16)
-#define OV_BORDA       RGB(60, 63, 70)
-#define OV_SEP         RGB(45, 47, 52)  /* cor do separador entre colunas */
+#define OV_PAD        6
+#define OV_BAR_H      5
+#define OV_MARGIN_SCR 12
+#define OV_BG         RGB(14, 14, 16)
+#define OV_BORDA      RGB(60, 63, 70)
+#define OV_SEP        RGB(45, 47, 52)
 
 static BOOL  ovArrastar   = FALSE;
 static POINT ovPtArrastar = {0, 0};
 
-/* ---- Persistência no Registry ------------------------------------------ */
+/* ---- Perfis pré-definidos ----------------------------------------------- */
 
-static void GravarConfigOverlay(void) {
-    HKEY hk;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER,
-            "Software\\WinMon\\Overlay", 0, NULL,
-            REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hk, NULL) != ERROR_SUCCESS)
-        return;
+static void InicializarPerfisOverlay(void) {
+    /* Gaming: minimalista, só CPU e NET, fonte pequena, quase opaco */
+    strncpy_s(ovPerfis[0].nome,      OV_NOME_MAX, "Gaming",   _TRUNCATE);
+    ovPerfis[0].fontePt     = 10;
+    strncpy_s(ovPerfis[0].fonteNome, sizeof(ovPerfis[0].fonteNome), "Consolas", _TRUNCATE);
+    ovPerfis[0].opacidade   = 200;
+    ovPerfis[0].mostrarTemp  = 0;
+    ovPerfis[0].mostrarDisco = 0;
+    ovPerfis[0].mostrarNet   = 1;
+    ovPerfis[0].clickThrough = 1;   /* gaming: click-through por omissão */
 
-    DWORD v;
-    v = (DWORD)ovFontSize;
-    RegSetValueExA(hk, "FontSize", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
-    RegSetValueExA(hk, "FontName", 0, REG_SZ,
-                   (BYTE*)ovFontName, (DWORD)(strlen(ovFontName)+1));
-    v = (DWORD)ovOpacity;
-    RegSetValueExA(hk, "Opacity", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
-    v = (DWORD)ovMostrarTemp;
-    RegSetValueExA(hk, "ShowTemp", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
-    v = (DWORD)ovMostrarDisco;
-    RegSetValueExA(hk, "ShowDisk", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
-    RegCloseKey(hk);
+    /* Trabalho: CPU + RAM + NET + DISCO, sem temperatura */
+    strncpy_s(ovPerfis[1].nome,      OV_NOME_MAX, "Trabalho", _TRUNCATE);
+    ovPerfis[1].fontePt     = 13;
+    strncpy_s(ovPerfis[1].fonteNome, sizeof(ovPerfis[1].fonteNome), "Consolas", _TRUNCATE);
+    ovPerfis[1].opacidade   = 220;
+    ovPerfis[1].mostrarTemp  = 0;
+    ovPerfis[1].mostrarDisco = 1;
+    ovPerfis[1].mostrarNet   = 1;
+    ovPerfis[1].clickThrough = 0;
+
+    /* Completo: tudo visível */
+    strncpy_s(ovPerfis[2].nome,      OV_NOME_MAX, "Completo", _TRUNCATE);
+    ovPerfis[2].fontePt     = 13;
+    strncpy_s(ovPerfis[2].fonteNome, sizeof(ovPerfis[2].fonteNome), "Consolas", _TRUNCATE);
+    ovPerfis[2].opacidade   = 210;
+    ovPerfis[2].mostrarTemp  = 1;
+    ovPerfis[2].mostrarDisco = 1;
+    ovPerfis[2].mostrarNet   = 1;
+    ovPerfis[2].clickThrough = 0;
+
+    ovNumPerfis    = 3;
+    ovPerfilActivo = 2;  /* inicia no perfil Completo */
 }
 
-static void CarregarConfigOverlay(void) {
-    HKEY hk;
+/* ---- Persistência no Registry ------------------------------------------ */
+
+static void GravarPerfisOverlay(void) {
+    HKEY hkBase;
+    int i;
+
+    /* Gravar índice activo */
+    if (RegCreateKeyExA(HKEY_CURRENT_USER,
+            "Software\\WinMon\\Overlay", 0, NULL,
+            REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hkBase, NULL) == ERROR_SUCCESS) {
+        DWORD v = (DWORD)ovPerfilActivo;
+        RegSetValueExA(hkBase, "PerfilActivo", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        v = (DWORD)ovNumPerfis;
+        RegSetValueExA(hkBase, "NumPerfis", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        RegCloseKey(hkBase);
+    }
+
+    for (i = 0; i < ovNumPerfis; i++) {
+        char subchave[64];
+        HKEY hk;
+        snprintf(subchave, sizeof(subchave),
+                 "Software\\WinMon\\Overlay\\Perfis\\%d", i);
+
+        if (RegCreateKeyExA(HKEY_CURRENT_USER, subchave, 0, NULL,
+                REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hk, NULL) != ERROR_SUCCESS)
+            continue;
+
+        DWORD v;
+        RegSetValueExA(hk, "Nome", 0, REG_SZ,
+            (BYTE*)ovPerfis[i].nome, (DWORD)(strlen(ovPerfis[i].nome)+1));
+        v = (DWORD)ovPerfis[i].fontePt;
+        RegSetValueExA(hk, "FontePt",     0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        RegSetValueExA(hk, "FonteNome",   0, REG_SZ,
+            (BYTE*)ovPerfis[i].fonteNome, (DWORD)(strlen(ovPerfis[i].fonteNome)+1));
+        v = (DWORD)ovPerfis[i].opacidade;
+        RegSetValueExA(hk, "Opacidade",   0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarTemp;
+        RegSetValueExA(hk, "MostrarTemp", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarDisco;
+        RegSetValueExA(hk, "MostrarDisco",0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarNet;
+        RegSetValueExA(hk, "MostrarNet",  0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].clickThrough;
+        RegSetValueExA(hk, "ClickThrough",0, REG_DWORD, (BYTE*)&v, sizeof(v));
+
+        RegCloseKey(hk);
+    }
+}
+
+static void CarregarPerfisOverlay(void) {
+    HKEY hkBase;
+    DWORD v, sz;
+    int i, numGuardados;
+
+    /* Inicializar sempre os pré-definidos primeiro */
+    InicializarPerfisOverlay();
+
     if (RegOpenKeyExA(HKEY_CURRENT_USER,
-            "Software\\WinMon\\Overlay", 0, KEY_QUERY_VALUE, &hk) != ERROR_SUCCESS)
+            "Software\\WinMon\\Overlay", 0, KEY_QUERY_VALUE, &hkBase) != ERROR_SUCCESS)
         return;
 
-    DWORD v, sz = sizeof(DWORD);
-    if (RegQueryValueExA(hk, "FontSize", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
-        ovFontSize = (int)v;
-    sz = sizeof(ovFontName);
-    RegQueryValueExA(hk, "FontName", NULL, NULL, (BYTE*)ovFontName, &sz);
     sz = sizeof(DWORD);
-    if (RegQueryValueExA(hk, "Opacity", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
-        ovOpacity = (BYTE)v;
-    if (RegQueryValueExA(hk, "ShowTemp", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
-        ovMostrarTemp = (int)v;
-    if (RegQueryValueExA(hk, "ShowDisk", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
-        ovMostrarDisco = (int)v;
-    RegCloseKey(hk);
+    numGuardados = 3;
+    if (RegQueryValueExA(hkBase, "NumPerfis", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+        numGuardados = (int)v;
+    if (numGuardados < 3)  numGuardados = 3;   /* mínimo: os 3 pré-definidos */
+    if (numGuardados > OV_MAX_PERFIS) numGuardados = OV_MAX_PERFIS;
 
-    /* Limites de segurança */
-    if (ovFontSize < OV_FONT_MIN) ovFontSize = OV_FONT_MIN;
-    if (ovFontSize > OV_FONT_MAX) ovFontSize = OV_FONT_MAX;
-    if (ovFontName[0] == '\0') strncpy_s(ovFontName, sizeof(ovFontName), "Consolas", _TRUNCATE);
-    if (ovOpacity < 30)  ovOpacity = 30;
-    if (ovOpacity > 255) ovOpacity = 255;
+    sz = sizeof(DWORD);
+    if (RegQueryValueExA(hkBase, "PerfilActivo", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+        ovPerfilActivo = (int)v;
+    RegCloseKey(hkBase);
+
+    /* Carregar cada perfil (inclui os pré-definidos — o utilizador pode tê-los editado) */
+    for (i = 0; i < numGuardados; i++) {
+        char subchave[64];
+        HKEY hk;
+        snprintf(subchave, sizeof(subchave),
+                 "Software\\WinMon\\Overlay\\Perfis\\%d", i);
+
+        if (RegOpenKeyExA(HKEY_CURRENT_USER, subchave, 0, KEY_QUERY_VALUE, &hk) != ERROR_SUCCESS)
+            continue;
+
+        sz = sizeof(ovPerfis[i].nome);
+        RegQueryValueExA(hk, "Nome",       NULL, NULL, (BYTE*)ovPerfis[i].nome,     &sz);
+        sz = sizeof(ovPerfis[i].fonteNome);
+        RegQueryValueExA(hk, "FonteNome",  NULL, NULL, (BYTE*)ovPerfis[i].fonteNome,&sz);
+        sz = sizeof(DWORD);
+        if (RegQueryValueExA(hk, "FontePt",     NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].fontePt = (int)v;
+        if (RegQueryValueExA(hk, "Opacidade",   NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].opacidade = (BYTE)v;
+        if (RegQueryValueExA(hk, "MostrarTemp", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarTemp = (int)v;
+        if (RegQueryValueExA(hk, "MostrarDisco",NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarDisco = (int)v;
+        if (RegQueryValueExA(hk, "MostrarNet",  NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarNet = (int)v;
+        if (RegQueryValueExA(hk, "ClickThrough",NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].clickThrough = (int)v;
+
+        /* Sanidade */
+        if (ovPerfis[i].fontePt < OV_FONT_MIN) ovPerfis[i].fontePt = OV_FONT_MIN;
+        if (ovPerfis[i].fontePt > OV_FONT_MAX) ovPerfis[i].fontePt = OV_FONT_MAX;
+        if (ovPerfis[i].opacidade < 30)  ovPerfis[i].opacidade = 30;
+        if (ovPerfis[i].fonteNome[0] == '\0')
+            strncpy_s(ovPerfis[i].fonteNome, sizeof(ovPerfis[i].fonteNome), "Consolas", _TRUNCATE);
+
+        RegCloseKey(hk);
+    }
+
+    ovNumPerfis = numGuardados;
+    if (ovPerfilActivo < 0 || ovPerfilActivo >= ovNumPerfis) ovPerfilActivo = 0;
+}
+
+/* ---- Activar perfil ----------------------------------------------------- */
+
+static void AtivarPerfil(int idx) {
+    if (idx < 0 || idx >= ovNumPerfis) return;
+    ovPerfilActivo = idx;
+
+    if (hOverlay && overlayAtivo) {
+        SetLayeredWindowAttributes(hOverlay, 0, OV_OPACIDADE, LWA_ALPHA);
+        AplicarClickThrough();
+        RecalcOverlaySize();
+        InvalidateRect(hOverlay, NULL, FALSE);
+    }
+}
+
+/* ---- Click-through ------------------------------------------------------ */
+
+static void AplicarClickThrough(void) {
+    if (!hOverlay) return;
+
+    LONG_PTR ex = GetWindowLongPtr(hOverlay, GWL_EXSTYLE);
+
+    if (OV_CLICKTHRU) {
+        /* WS_EX_TRANSPARENT: cliques passam para janelas por baixo.
+         * Combinado com WS_EX_LAYERED já existente. */
+        ex |= WS_EX_TRANSPARENT;
+    } else {
+        ex &= ~WS_EX_TRANSPARENT;
+    }
+
+    SetWindowLongPtr(hOverlay, GWL_EXSTYLE, ex);
+    /* Forçar re-aplicação do layered (necessário após alterar exstyle) */
+    SetLayeredWindowAttributes(hOverlay, 0, OV_OPACIDADE, LWA_ALPHA);
+}
+
+/* ---- Snap magnético ----------------------------------------------------- */
+
+/*
+ * Verifica se qualquer canto da janela do overlay está a ≤ OV_SNAP_DIST px
+ * de qualquer canto da área de trabalho. Se sim, move o overlay para encaixar
+ * exactamente nesse canto.
+ *
+ * Cantos verificados: TL, TR, BL, BR.
+ * Chamado em WM_LBUTTONUP depois de ReleaseCapture.
+ */
+static void SnapOverlayAoCanto(void) {
+    RECT wa = {0}, wr = {0};
+    int wx, wy;           /* posição actual do overlay */
+    int snapX = -1, snapY = -1;
+    int distMin;
+
+    if (!hOverlay) return;
+
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    GetWindowRect(hOverlay, &wr);
+
+    wx = wr.left;
+    wy = wr.top;
+
+    /* Candidatos a snap: 4 cantos da área de trabalho */
+    /* Para cada canto calculamos qual seria a posição TL do overlay */
+    struct { int x; int y; } cantos[4] = {
+        { wa.left,                     wa.top                      }, /* TL */
+        { wa.right  - ovTotalW,        wa.top                      }, /* TR */
+        { wa.left,                     wa.bottom - ovTotalH        }, /* BL */
+        { wa.right  - ovTotalW,        wa.bottom - ovTotalH        }  /* BR */
+    };
+
+    distMin = OV_SNAP_DIST + 1;   /* limiar: se >OV_SNAP_DIST, não faz snap */
+
+    {
+        int i;
+        for (i = 0; i < 4; i++) {
+            int dx = wx - cantos[i].x;
+            int dy = wy - cantos[i].y;
+            int dist = (int)sqrt((double)(dx*dx + dy*dy));
+            if (dist < distMin) {
+                distMin = dist;
+                snapX = cantos[i].x;
+                snapY = cantos[i].y;
+            }
+        }
+    }
+
+    if (snapX >= 0) {
+        SetWindowPos(hOverlay, HWND_TOPMOST,
+            snapX, snapY, 0, 0,
+            SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 }
 
 /* ---- Cálculo dinâmico do tamanho da janela ----------------------------- */
 
-/*
- * Recalcula ovColW, ovRowH, ovTotalW, ovTotalH com base em ovFontSize.
- * Deve ser chamada sempre que ovFontSize ou as colunas visíveis mudam.
- * Se o overlay já existe, aplica o novo tamanho imediatamente.
- */
 static void RecalcOverlaySize(void) {
-    /* Estimativa proporcional: Consolas 13pt ≈ largura de char 8px, alt. linha 20px */
-    int charW   = (ovFontSize * 8)  / 13;
-    if (charW < 5) charW = 5;
-    int lineH   = (ovFontSize * 20) / 13;
+    int charW = (OV_FONTE_PT * 8)  / 13;
+    int lineH = (OV_FONTE_PT * 20) / 13;
+    int ncols, nlinhas;
+
+    if (charW < 5)  charW = 5;
     if (lineH < 12) lineH = 12;
 
-    ovRowH  = lineH;
-
-    /* Largura da coluna: suficiente para ~11 chars + padding */
-    ovColW  = charW * 11 + OV_PAD * 2;
+    ovRowH = lineH;
+    ovColW = charW * 11 + OV_PAD * 2;
     if (ovColW < 80) ovColW = 80;
 
-    /* Número de colunas visíveis: CPU + RAM + NET + (TEMP?) + (DISCO?) */
-    int ncols = 3;
-    if (ovMostrarTemp)  ncols++;
-    if (ovMostrarDisco) ncols++;
+    ncols = 1;   /* CPU sempre presente */
+    ncols++;     /* RAM sempre presente */
+    if (OV_NET)   ncols++;
+    if (OV_TEMP)  ncols++;
+    if (OV_DISCO) ncols++;
 
-    /* Cada coluna: 1 linha label + 1 linha valor grande + barra + 1 linha sub-valor */
-    int nlinhas = 3;   /* label | valor | sub */
+    nlinhas = 3;  /* label | valor | sub */
 
     ovTotalW = OV_PAD + ncols * ovColW + OV_PAD;
     ovTotalH = OV_PAD + nlinhas * ovRowH + OV_BAR_H + OV_PAD * 2;
 
     if (hOverlay && overlayAtivo) {
-        /* Preservar posição, só alterar tamanho */
         RECT wr;
         GetWindowRect(hOverlay, &wr);
         SetWindowPos(hOverlay, HWND_TOPMOST,
@@ -2108,7 +2326,7 @@ static void RecalcOverlaySize(void) {
     }
 }
 
-/* ---- Desenho de uma mini-barra de progresso ----------------------------- */
+/* ---- Desenho de mini-barra --------------------------------------------- */
 
 static void DrawMiniBar(HDC hdc, int x, int y, int w, double pct,
                         COLORREF corFill, COLORREF corBg) {
@@ -2129,14 +2347,14 @@ static void DrawMiniBar(HDC hdc, int x, int y, int w, double pct,
     }
 }
 
-/* ---- Desenha uma coluna de métrica -------------------------------------- */
+/* ---- Estrutura e desenho de coluna ------------------------------------- */
 
 typedef struct {
     const char *label;
     COLORREF    corLabel;
-    const char *valorStr;    /* linha principal */
-    const char *subStr;      /* linha secundária (pode ser NULL) */
-    double      barPct;      /* -1 = sem barra */
+    const char *valorStr;
+    const char *subStr;
+    double      barPct;
     COLORREF    corBar;
 } OvColuna;
 
@@ -2147,28 +2365,23 @@ static void DrawOvColuna(HDC hdc, int x, int y,
     int cw = ovColW;
     RECT tr;
 
-    /* Label */
     SelectObject(hdc, fLabel);
     SetTextColor(hdc, c->corLabel);
     tr = (RECT){ x + OV_PAD, y, x + cw - OV_PAD, y + lh };
     DrawTextA(hdc, c->label, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     y += lh;
 
-    /* Valor principal */
     SelectObject(hdc, fValor);
     SetTextColor(hdc, RGB(230, 232, 235));
     tr = (RECT){ x + OV_PAD, y, x + cw - OV_PAD, y + lh };
     DrawTextA(hdc, c->valorStr, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     y += lh;
 
-    /* Mini-barra */
-    if (c->barPct >= 0.0) {
+    if (c->barPct >= 0.0)
         DrawMiniBar(hdc, x + OV_PAD, y, cw - OV_PAD * 2,
                     c->barPct, c->corBar, RGB(40, 42, 46));
-    }
     y += OV_BAR_H + 2;
 
-    /* Sub-valor */
     if (c->subStr && c->subStr[0]) {
         SelectObject(hdc, fSub);
         SetTextColor(hdc, RGB(150, 153, 158));
@@ -2190,12 +2403,10 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         RECT rc;
         GetClientRect(hwnd, &rc);
 
-        /* Fundo */
         HBRUSH bgBrush = CreateSolidBrush(OV_BG);
         FillRect(hdc, &rc, bgBrush);
         DeleteObject(bgBrush);
 
-        /* Borda */
         HPEN penBorda = CreatePen(PS_SOLID, 1, OV_BORDA);
         HPEN penVelho = (HPEN)SelectObject(hdc, penBorda);
         MoveToEx(hdc, 0, 0, NULL);
@@ -2206,40 +2417,48 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         SelectObject(hdc, penVelho);
         DeleteObject(penBorda);
 
+        /* Indicador de click-through activo: borda colorida subtil */
+        if (OV_CLICKTHRU) {
+            HPEN penCT = CreatePen(PS_SOLID, 2, RGB(80, 160, 80));
+            HPEN pv = (HPEN)SelectObject(hdc, penCT);
+            MoveToEx(hdc, 1, 1, NULL);
+            LineTo(hdc, rc.right-2, 1);
+            LineTo(hdc, rc.right-2, rc.bottom-2);
+            LineTo(hdc, 1, rc.bottom-2);
+            LineTo(hdc, 1, 1);
+            SelectObject(hdc, pv);
+            DeleteObject(penCT);
+        }
+
         SetBkMode(hdc, TRANSPARENT);
 
-        /* Fontes */
         HFONT fLabel = CreateFontA(
-            ovFontSize - 1, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            OV_FONTE_PT - 1, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, ovFontName);
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, OV_FONTE_NOME);
         HFONT fValor = CreateFontA(
-            ovFontSize + 1, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            OV_FONTE_PT + 1, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, ovFontName);
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, OV_FONTE_NOME);
         HFONT fSub = CreateFontA(
-            max(ovFontSize - 3, OV_FONT_MIN), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            max(OV_FONTE_PT - 3, OV_FONT_MIN), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, ovFontName);
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, OV_FONTE_NOME);
 
         HFONT fOrig = (HFONT)SelectObject(hdc, fLabel);
 
         int cx = OV_PAD;
         int cy = OV_PAD;
         OvColuna col;
-        char vBuf[64], sBuf[64];
-        char dBuf[32], uBuf[32];
+        char vBuf[64], sBuf[64], dBuf[32], uBuf[32];
         HPEN penSep = CreatePen(PS_SOLID, 1, OV_SEP);
 
-        /* ---- CPU ---- */
+        /* CPU */
         snprintf(vBuf, sizeof(vBuf), "%.1f%%", ultimoCpuPercent);
-        /* Sub: temperatura média se disponível */
         if (numZonasTemp > 0) {
-            double t = 0.0;
-            int i;
+            double t = 0.0; int i;
             for (i = 0; i < numZonasTemp; i++) t += tempAtual[i];
-            t /= numZonasTemp;
-            snprintf(sBuf, sizeof(sBuf), "%.0f\xB0" "C", t);
+            snprintf(sBuf, sizeof(sBuf), "%.0f\xB0" "C", t / numZonasTemp);
         } else {
             snprintf(sBuf, sizeof(sBuf), "%d cores", numNucleosMonitorizados);
         }
@@ -2248,50 +2467,47 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
         cx += ovColW;
 
+        /* Separador + RAM */
         SelectObject(hdc, penSep);
-        MoveToEx(hdc, cx, cy, NULL);
-        LineTo(hdc, cx, rc.bottom - OV_PAD);
+        MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, rc.bottom - OV_PAD);
 
-        /* ---- RAM ---- */
         {
             MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms);
             DWORDLONG usedMB = 0, totalMB = 0;
             if (GlobalMemoryStatusEx(&ms)) {
-                totalMB = ms.ullTotalPhys  / (1024*1024);
+                totalMB = ms.ullTotalPhys / (1024*1024);
                 usedMB  = totalMB - ms.ullAvailPhys / (1024*1024);
             }
             snprintf(vBuf, sizeof(vBuf), "%.1f%%", ultimoRamPercent);
             snprintf(sBuf, sizeof(sBuf), "%llu/%llu MB",
-                     (unsigned long long)usedMB,
-                     (unsigned long long)totalMB);
+                     (unsigned long long)usedMB, (unsigned long long)totalMB);
         }
         col = (OvColuna){ "RAM", RGB(110, 220, 140), vBuf, sBuf,
                           ultimoRamPercent, RGB(110, 220, 140) };
         DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
         cx += ovColW;
 
-        SelectObject(hdc, penSep);
-        MoveToEx(hdc, cx, cy, NULL);
-        LineTo(hdc, cx, rc.bottom - OV_PAD);
-
-        /* ---- NET ---- */
-        FormatarBytes(ultimoNetDown, dBuf, sizeof(dBuf));
-        FormatarBytes(ultimoNetUp,   uBuf, sizeof(uBuf));
-        snprintf(vBuf, sizeof(vBuf), "\x19%s/s", dBuf);
-        snprintf(sBuf, sizeof(sBuf), "\x18%s/s", uBuf);
-        col = (OvColuna){ "NET", RGB(255, 195, 80), vBuf, sBuf, -1.0, 0 };
-        DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
-        cx += ovColW;
-
-        /* ---- TEMP (opcional) ---- */
-        if (ovMostrarTemp) {
+        /* NET (opcional) */
+        if (OV_NET) {
             SelectObject(hdc, penSep);
-            MoveToEx(hdc, cx, cy, NULL);
-            LineTo(hdc, cx, rc.bottom - OV_PAD);
+            MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, rc.bottom - OV_PAD);
+
+            FormatarBytes(ultimoNetDown, dBuf, sizeof(dBuf));
+            FormatarBytes(ultimoNetUp,   uBuf, sizeof(uBuf));
+            snprintf(vBuf, sizeof(vBuf), "\x19%s/s", dBuf);
+            snprintf(sBuf, sizeof(sBuf), "\x18%s/s", uBuf);
+            col = (OvColuna){ "NET", RGB(255, 195, 80), vBuf, sBuf, -1.0, 0 };
+            DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+            cx += ovColW;
+        }
+
+        /* TEMP (opcional) */
+        if (OV_TEMP) {
+            SelectObject(hdc, penSep);
+            MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, rc.bottom - OV_PAD);
 
             if (numZonasTemp > 0) {
-                double tMax = 0.0, tMedia = 0.0;
-                int i;
+                double tMax = 0.0, tMedia = 0.0; int i;
                 for (i = 0; i < numZonasTemp; i++) {
                     tMedia += tempAtual[i];
                     if (tempAtual[i] > tMax) tMax = tempAtual[i];
@@ -2299,12 +2515,11 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
                 tMedia /= numZonasTemp;
                 snprintf(vBuf, sizeof(vBuf), "%.0f\xB0" "C", tMedia);
                 snprintf(sBuf, sizeof(sBuf), "max %.0f\xB0" "C", tMax);
-                double barPct = (tMax > 0.0) ? (tMedia / 110.0) * 100.0 : 0.0;
-                COLORREF cTemp = (tMedia > 85.0) ? RGB(255,80,80)
-                               : (tMedia > 65.0) ? RGB(255,180,50)
-                               :                   RGB(80, 200,160);
-                col = (OvColuna){ "TEMP", RGB(255, 140, 140), vBuf, sBuf,
-                                  barPct, cTemp };
+                double bPct = (tMax > 0.0) ? (tMedia / 110.0) * 100.0 : 0.0;
+                COLORREF cT = (tMedia > 85.0) ? RGB(255,80,80)
+                            : (tMedia > 65.0) ? RGB(255,180,50)
+                            :                   RGB(80,200,160);
+                col = (OvColuna){ "TEMP", RGB(255, 140, 140), vBuf, sBuf, bPct, cT };
             } else {
                 col = (OvColuna){ "TEMP", RGB(255, 140, 140), "N/A", "WMI off", -1.0, 0 };
             }
@@ -2312,11 +2527,10 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
             cx += ovColW;
         }
 
-        /* ---- DISCO (opcional) ---- */
-        if (ovMostrarDisco) {
+        /* DISCO (opcional) */
+        if (OV_DISCO) {
             SelectObject(hdc, penSep);
-            MoveToEx(hdc, cx, cy, NULL);
-            LineTo(hdc, cx, rc.bottom - OV_PAD);
+            MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, rc.bottom - OV_PAD);
 
             FormatarBytes(ultimoDiskRead,  dBuf, sizeof(dBuf));
             FormatarBytes(ultimoDiskWrite, uBuf, sizeof(uBuf));
@@ -2332,23 +2546,23 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         DeleteObject(fLabel);
         DeleteObject(fValor);
         DeleteObject(fSub);
-
         EndPaint(hwnd, &ps);
         return 0;
     }
 
-    /* Arrastar com botão esquerdo */
+    /* Arrastar — só se click-through estiver desligado */
     case WM_LBUTTONDOWN:
-        ovArrastar = TRUE;
-        ovPtArrastar.x = LOWORD(lParam);
-        ovPtArrastar.y = HIWORD(lParam);
-        SetCapture(hwnd);
+        if (!OV_CLICKTHRU) {
+            ovArrastar = TRUE;
+            ovPtArrastar.x = LOWORD(lParam);
+            ovPtArrastar.y = HIWORD(lParam);
+            SetCapture(hwnd);
+        }
         return 0;
 
     case WM_MOUSEMOVE:
         if (ovArrastar) {
-            POINT pt;
-            RECT  wr;
+            POINT pt; RECT wr;
             GetCursorPos(&pt);
             GetWindowRect(hwnd, &wr);
             SetWindowPos(hwnd, NULL,
@@ -2359,8 +2573,11 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         return 0;
 
     case WM_LBUTTONUP:
-        ovArrastar = FALSE;
-        ReleaseCapture();
+        if (ovArrastar) {
+            ovArrastar = FALSE;
+            ReleaseCapture();
+            SnapOverlayAoCanto();   /* snap magnético ao largar */
+        }
         return 0;
 
     /* Botão direito → diálogo de configuração */
@@ -2373,15 +2590,15 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         ToggleOverlay();
         return 0;
 
-    /* Scroll do rato → ajustar tamanho de fonte */
+    /* Scroll → ajustar tamanho de fonte do perfil activo */
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        ovFontSize += (delta > 0) ? 1 : -1;
-        if (ovFontSize < OV_FONT_MIN) ovFontSize = OV_FONT_MIN;
-        if (ovFontSize > OV_FONT_MAX) ovFontSize = OV_FONT_MAX;
+        OV_FONTE_PT += (delta > 0) ? 1 : -1;
+        if (OV_FONTE_PT < OV_FONT_MIN) OV_FONTE_PT = OV_FONT_MIN;
+        if (OV_FONTE_PT > OV_FONT_MAX) OV_FONTE_PT = OV_FONT_MAX;
         RecalcOverlaySize();
         InvalidateRect(hwnd, NULL, FALSE);
-        GravarConfigOverlay();
+        GravarPerfisOverlay();
         return 0;
     }
 
@@ -2395,64 +2612,181 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 
 /* ---- Diálogo de configuração do overlay --------------------------------- */
 
-#define IDC_OV_FONTSIZE  3001
-#define IDC_OV_FONTNAME  3002
-#define IDC_OV_OPACITY   3003
-#define IDC_OV_TEMP      3004
-#define IDC_OV_DISCO     3005
+/*
+ * IDs dos controlos do diálogo de configuração do overlay.
+ * Nota: IDC_OV_* em 4000+ para não colidir com IDC_EDIT_* (3001-3003)
+ * do diálogo de alertas.
+ */
+#define IDC_OV_PERFIL_CB    4001   /* combobox: seleccionar perfil */
+#define IDC_OV_NOME         4002   /* nome do perfil (editável) */
+#define IDC_OV_FONTSIZE     4003
+#define IDC_OV_FONTNAME     4004
+#define IDC_OV_OPACITY      4005
+#define IDC_OV_TEMP         4006
+#define IDC_OV_DISCO        4007
+#define IDC_OV_NET          4008
+#define IDC_OV_CLICKTHRU    4009
+#define IDC_OV_BTN_NOVO     4010
+#define IDC_OV_BTN_APAGAR   4011
 
 static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
                                                   WPARAM wParam, LPARAM lParam)
 {
     (void)lParam;
     switch (uMsg) {
+
     case WM_INITDIALOG: {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d", ovFontSize);
+        char buf[32];
+        int i;
+        HWND hCb = GetDlgItem(hDlg, IDC_OV_PERFIL_CB);
+
+        /* Popular combobox com os perfis */
+        SendMessageA(hCb, CB_RESETCONTENT, 0, 0);
+        for (i = 0; i < ovNumPerfis; i++)
+            SendMessageA(hCb, CB_ADDSTRING, 0, (LPARAM)ovPerfis[i].nome);
+        SendMessageA(hCb, CB_SETCURSEL, (WPARAM)ovPerfilActivo, 0);
+
+        /* Preencher campos com o perfil activo */
+        SetDlgItemTextA(hDlg, IDC_OV_NOME, OV_FONTE_NOME[0] ? ovPerfis[ovPerfilActivo].nome : "");
+        snprintf(buf, sizeof(buf), "%d", OV_FONTE_PT);
         SetDlgItemTextA(hDlg, IDC_OV_FONTSIZE, buf);
-        SetDlgItemTextA(hDlg, IDC_OV_FONTNAME, ovFontName);
-        snprintf(buf, sizeof(buf), "%d", (int)ovOpacity);
+        SetDlgItemTextA(hDlg, IDC_OV_FONTNAME, OV_FONTE_NOME);
+        snprintf(buf, sizeof(buf), "%d", (int)OV_OPACIDADE);
         SetDlgItemTextA(hDlg, IDC_OV_OPACITY, buf);
-        CheckDlgButton(hDlg, IDC_OV_TEMP,  ovMostrarTemp  ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_OV_DISCO, ovMostrarDisco ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_TEMP,     OV_TEMP     ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_DISCO,    OV_DISCO    ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_NET,      OV_NET      ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_CLICKTHRU,OV_CLICKTHRU? BST_CHECKED : BST_UNCHECKED);
+
+        /* Impedir apagar os 3 pré-definidos */
+        EnableWindow(GetDlgItem(hDlg, IDC_OV_BTN_APAGAR),
+                     ovPerfilActivo >= 3 ? TRUE : FALSE);
+
         return TRUE;
     }
-    case WM_COMMAND:
-        if (LOWORD(wParam) == IDOK) {
+
+    case WM_COMMAND: {
+        WORD id = LOWORD(wParam);
+        WORD notif = HIWORD(wParam);
+
+        /* Mudar de perfil na combobox → actualizar campos */
+        if (id == IDC_OV_PERFIL_CB && notif == CBN_SELCHANGE) {
+            int sel = (int)SendDlgItemMessageA(hDlg, IDC_OV_PERFIL_CB,
+                                               CB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < ovNumPerfis) {
+                char buf[32];
+                ovPerfilActivo = sel;
+                SetDlgItemTextA(hDlg, IDC_OV_NOME, ovPerfis[sel].nome);
+                snprintf(buf, sizeof(buf), "%d", ovPerfis[sel].fontePt);
+                SetDlgItemTextA(hDlg, IDC_OV_FONTSIZE, buf);
+                SetDlgItemTextA(hDlg, IDC_OV_FONTNAME, ovPerfis[sel].fonteNome);
+                snprintf(buf, sizeof(buf), "%d", (int)ovPerfis[sel].opacidade);
+                SetDlgItemTextA(hDlg, IDC_OV_OPACITY, buf);
+                CheckDlgButton(hDlg, IDC_OV_TEMP,      ovPerfis[sel].mostrarTemp  ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_DISCO,     ovPerfis[sel].mostrarDisco ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_NET,       ovPerfis[sel].mostrarNet   ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, ovPerfis[sel].clickThrough ? BST_CHECKED : BST_UNCHECKED);
+                EnableWindow(GetDlgItem(hDlg, IDC_OV_BTN_APAGAR), sel >= 3 ? TRUE : FALSE);
+            }
+            return TRUE;
+        }
+
+        /* Novo perfil */
+        if (id == IDC_OV_BTN_NOVO) {
+            if (ovNumPerfis >= OV_MAX_PERFIS) {
+                MessageBoxA(hDlg, "Limite de perfis atingido.", "WinMon", MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+            /* Clonar o perfil activo */
+            ovPerfis[ovNumPerfis] = ovPerfis[ovPerfilActivo];
+            snprintf(ovPerfis[ovNumPerfis].nome, OV_NOME_MAX,
+                     "Perfil %d", ovNumPerfis + 1);
+            ovNumPerfis++;
+            ovPerfilActivo = ovNumPerfis - 1;
+
+            /* Actualizar combobox */
+            SendDlgItemMessageA(hDlg, IDC_OV_PERFIL_CB, CB_ADDSTRING, 0,
+                                (LPARAM)ovPerfis[ovPerfilActivo].nome);
+            SendDlgItemMessageA(hDlg, IDC_OV_PERFIL_CB, CB_SETCURSEL,
+                                (WPARAM)ovPerfilActivo, 0);
+            SetDlgItemTextA(hDlg, IDC_OV_NOME, ovPerfis[ovPerfilActivo].nome);
+            EnableWindow(GetDlgItem(hDlg, IDC_OV_BTN_APAGAR), TRUE);
+            return TRUE;
+        }
+
+        /* Apagar perfil (só personalizados, idx >= 3) */
+        if (id == IDC_OV_BTN_APAGAR && ovPerfilActivo >= 3) {
+            int i, idx = ovPerfilActivo;
+            /* Remover deslocando os seguintes */
+            for (i = idx; i < ovNumPerfis - 1; i++)
+                ovPerfis[i] = ovPerfis[i + 1];
+            ovNumPerfis--;
+            if (ovPerfilActivo >= ovNumPerfis) ovPerfilActivo = ovNumPerfis - 1;
+
+            /* Reconstruir combobox */
+            SendDlgItemMessageA(hDlg, IDC_OV_PERFIL_CB, CB_RESETCONTENT, 0, 0);
+            for (i = 0; i < ovNumPerfis; i++)
+                SendDlgItemMessageA(hDlg, IDC_OV_PERFIL_CB, CB_ADDSTRING, 0,
+                                    (LPARAM)ovPerfis[i].nome);
+            SendDlgItemMessageA(hDlg, IDC_OV_PERFIL_CB, CB_SETCURSEL,
+                                (WPARAM)ovPerfilActivo, 0);
+            EnableWindow(GetDlgItem(hDlg, IDC_OV_BTN_APAGAR),
+                         ovPerfilActivo >= 3 ? TRUE : FALSE);
+            return TRUE;
+        }
+
+        if (id == IDOK) {
             char buf[64];
-            /* Tamanho de fonte */
+            int sel = ovPerfilActivo;
+
+            /* Nome */
+            GetDlgItemTextA(hDlg, IDC_OV_NOME,
+                            ovPerfis[sel].nome, OV_NOME_MAX);
+            if (ovPerfis[sel].nome[0] == '\0')
+                snprintf(ovPerfis[sel].nome, OV_NOME_MAX, "Perfil %d", sel + 1);
+
+            /* Actualizar combobox com novo nome */
+            SendDlgItemMessageA(hDlg, IDC_OV_PERFIL_CB, CB_DELETESTRING,
+                                (WPARAM)sel, 0);
+            SendDlgItemMessageA(hDlg, IDC_OV_PERFIL_CB, CB_INSERTSTRING,
+                                (WPARAM)sel, (LPARAM)ovPerfis[sel].nome);
+
+            /* Fonte */
             GetDlgItemTextA(hDlg, IDC_OV_FONTSIZE, buf, sizeof(buf));
-            int fs = atoi(buf);
-            if (fs >= OV_FONT_MIN && fs <= OV_FONT_MAX) ovFontSize = fs;
-            /* Nome da fonte */
-            GetDlgItemTextA(hDlg, IDC_OV_FONTNAME, ovFontName, sizeof(ovFontName));
-            if (ovFontName[0] == '\0')
-                strncpy_s(ovFontName, sizeof(ovFontName), "Consolas", _TRUNCATE);
+            { int fs = atoi(buf);
+              if (fs >= OV_FONT_MIN && fs <= OV_FONT_MAX)
+                  ovPerfis[sel].fontePt = fs; }
+
+            GetDlgItemTextA(hDlg, IDC_OV_FONTNAME,
+                            ovPerfis[sel].fonteNome, sizeof(ovPerfis[sel].fonteNome));
+            if (ovPerfis[sel].fonteNome[0] == '\0')
+                strncpy_s(ovPerfis[sel].fonteNome, sizeof(ovPerfis[sel].fonteNome),
+                           "Consolas", _TRUNCATE);
+
             /* Opacidade */
             GetDlgItemTextA(hDlg, IDC_OV_OPACITY, buf, sizeof(buf));
-            int op = atoi(buf);
-            if (op < 30)  op = 30;
-            if (op > 255) op = 255;
-            ovOpacity = (BYTE)op;
-            /* Colunas */
-            ovMostrarTemp  = (IsDlgButtonChecked(hDlg, IDC_OV_TEMP)  == BST_CHECKED) ? 1 : 0;
-            ovMostrarDisco = (IsDlgButtonChecked(hDlg, IDC_OV_DISCO) == BST_CHECKED) ? 1 : 0;
+            { int op = atoi(buf);
+              if (op < 30)  op = 30;
+              if (op > 255) op = 255;
+              ovPerfis[sel].opacidade = (BYTE)op; }
+
+            /* Checkboxes */
+            ovPerfis[sel].mostrarTemp  = (IsDlgButtonChecked(hDlg, IDC_OV_TEMP)     == BST_CHECKED) ? 1 : 0;
+            ovPerfis[sel].mostrarDisco = (IsDlgButtonChecked(hDlg, IDC_OV_DISCO)    == BST_CHECKED) ? 1 : 0;
+            ovPerfis[sel].mostrarNet   = (IsDlgButtonChecked(hDlg, IDC_OV_NET)      == BST_CHECKED) ? 1 : 0;
+            ovPerfis[sel].clickThrough = (IsDlgButtonChecked(hDlg, IDC_OV_CLICKTHRU)== BST_CHECKED) ? 1 : 0;
 
             /* Aplicar imediatamente */
-            if (hOverlay && overlayAtivo) {
-                SetLayeredWindowAttributes(hOverlay, 0, ovOpacity, LWA_ALPHA);
-                RecalcOverlaySize();
-                InvalidateRect(hOverlay, NULL, FALSE);
-            }
-            GravarConfigOverlay();
+            AtivarPerfil(sel);
+            GravarPerfisOverlay();
             EndDialog(hDlg, IDOK);
             return TRUE;
         }
-        if (LOWORD(wParam) == IDCANCEL) {
-            EndDialog(hDlg, IDCANCEL);
-            return TRUE;
-        }
+
+        if (id == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return TRUE; }
         break;
+    }
+
     case WM_CLOSE:
         EndDialog(hDlg, IDCANCEL);
         return TRUE;
@@ -2460,15 +2794,28 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
     return FALSE;
 }
 
+/*
+ * Constrói o diálogo de configuração do overlay em memória.
+ * Layout (220x210 DLUs):
+ *
+ *   [ Perfil: ][___combobox___________][Novo][Apagar]
+ *   [ Nome:   ][_______________________]
+ *   [ Fonte pt][___] [ Nome fonte ][_________]
+ *   [ Opac.   ][___]
+ *   [x] NET   [x] TEMP   [x] DISCO
+ *   [x] Click-through (passa cliques para janelas por baixo)
+ *   [   Dica: scroll ajusta fonte   ]
+ *   [      OK      ][   Cancelar    ]
+ */
 static void MostrarDialogoConfigOverlay(HWND hwndPai) {
-    static WORD dlgBuf[640];
+    static WORD dlgBuf[1024];
     WORD *p = dlgBuf;
 
     #define WRITE_STR_W(s) \
         do { const wchar_t *_ws=(s); while(*_ws) *p++=(WORD)*_ws++; *p++=0; } while(0)
-    #define ALIGN_DWORD() if(((ULONG_PTR)p)&2) p++
-    #define ADD_ITEM(sty,ex,xx,yy,ww,hh,iid,cls,txt) \
-        do { ALIGN_DWORD(); \
+    #define ALIGN_DW() if(((ULONG_PTR)p)&2) p++
+    #define ADD_CTRL(sty,ex,xx,yy,ww,hh,iid,cls,txt) \
+        do { ALIGN_DW(); \
              { DLGITEMTEMPLATE *_it=(DLGITEMTEMPLATE*)p; \
                _it->style=(sty); _it->dwExtendedStyle=(ex); \
                _it->x=(xx); _it->y=(yy); _it->cx=(ww); _it->cy=(hh); \
@@ -2478,48 +2825,70 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai) {
              WRITE_STR_W(txt); \
              *p++=0; } while(0)
 
-    /* DLGTEMPLATE */
+    /* DLGTEMPLATE — 19 itens (contagem exacta dos ADD_CTRL abaixo) */
     DLGTEMPLATE *dt = (DLGTEMPLATE*)p;
     dt->style = WS_POPUP|WS_CAPTION|WS_SYSMENU|DS_MODALFRAME|DS_CENTER|DS_SETFONT;
     dt->dwExtendedStyle = 0;
-    dt->cdit  = 12;   /* labels + edits + checks + botoes */
-    dt->x=0; dt->y=0; dt->cx=220; dt->cy=155;
+    dt->cdit = 19;
+    dt->x=0; dt->y=0; dt->cx=240; dt->cy=155;
     p += sizeof(DLGTEMPLATE)/sizeof(WORD);
     *p++=0; *p++=0;
     WRITE_STR_W(L"Configurar Overlay");
     *p++=9; WRITE_STR_W(L"Segoe UI");
 
-    /* Linha 1: Tamanho de fonte */
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT,0,  7, 12, 90,10, -1,         0x0082,L"Tamanho fonte (pt):");
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER,0, 100,10, 35,12, IDC_OV_FONTSIZE, 0x0081,L"");
+    /* Linha 0: Perfil */
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|SS_LEFT, 0,  7,  8, 40,10, -1, 0x0082, L"Perfil:");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|WS_BORDER|CBS_DROPDOWNLIST|WS_VSCROLL, 0,
+             48, 6, 120, 80, IDC_OV_PERFIL_CB, 0x0085, L"");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 172, 6, 30, 13, IDC_OV_BTN_NOVO,    0x0080, L"Novo");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 205, 6, 30, 13, IDC_OV_BTN_APAGAR,  0x0080, L"Apagar");
 
-    /* Linha 2: Nome da fonte */
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT,0,  7, 30, 90,10, -1,         0x0082,L"Fonte:");
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER,  0, 100,28,110,12, IDC_OV_FONTNAME, 0x0081,L"");
+    /* Linha 1: Nome do perfil */
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|SS_LEFT, 0,  7, 25, 40,10, -1,            0x0082, L"Nome:");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|WS_BORDER, 0, 48, 23,187,12, IDC_OV_NOME, 0x0081, L"");
+
+    /* Linha 2: Fonte pt + nome */
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|SS_LEFT, 0,  7, 43, 40,10, -1,                 0x0082, L"Fonte pt:");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 0, 48,41, 28,12, IDC_OV_FONTSIZE, 0x0081, L"");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|SS_LEFT, 0, 82, 43, 40,10, -1,                 0x0082, L"Nome:");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|WS_BORDER, 0, 120,41,115,12, IDC_OV_FONTNAME,  0x0081, L"");
 
     /* Linha 3: Opacidade */
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT,0,  7, 48, 90,10, -1,         0x0082,L"Opacidade (30-255):");
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER,0,100,46, 35,12, IDC_OV_OPACITY,  0x0081,L"");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|SS_LEFT, 0,  7, 61, 40,10, -1,                 0x0082, L"Opac. (30-255):");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 0, 90,59, 35,12, IDC_OV_OPACITY, 0x0081, L"");
 
-    /* Checkboxes */
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0, 7,66,100,12, IDC_OV_TEMP,  0x0080,L"Mostrar Temperatura");
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0, 7,82,100,12, IDC_OV_DISCO, 0x0080,L"Mostrar Disco I/O");
+    /* Linha 4: Checkboxes das colunas */
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 0,  7,78, 55,12, IDC_OV_NET,   0x0080, L"Rede");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 0, 65,78, 65,12, IDC_OV_TEMP,  0x0080, L"Temperatura");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 0,133,78, 55,12, IDC_OV_DISCO, 0x0080, L"Disco I/O");
 
-    /* Dica scroll */
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|SS_LEFT,0, 7,100,206,10, -1, 0x0082,
+    /* Linha 5: Click-through */
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 0,  7,95,226,12, IDC_OV_CLICKTHRU, 0x0080,
+             L"Click-through (cliques passam para janelas por baixo)");
+
+    /* Dica */
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|SS_LEFT, 0, 7,112,226,10, -1, 0x0082,
              L"Dica: scroll do rato sobre o overlay ajusta a fonte.");
 
     /* Botoes */
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,0,  40,128, 60,14, IDOK,     0x0080,L"OK");
-    ADD_ITEM(WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,   0, 114,128, 60,14, IDCANCEL, 0x0080,L"Cancelar");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 0,  50,130, 60,14, IDOK,     0x0080, L"OK");
+    ADD_CTRL(WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,    0, 128,130, 60,14, IDCANCEL, 0x0080, L"Cancelar");
 
-    DialogBoxIndirectA(GetModuleHandle(NULL),
-                       (LPDLGTEMPLATE)dlgBuf, hwndPai,
-                       DialogoConfigOverlayProc);
+    {
+        INT_PTR res = DialogBoxIndirectA(GetModuleHandle(NULL),
+                           (LPDLGTEMPLATE)dlgBuf, hwndPai,
+                           DialogoConfigOverlayProc);
+        if (res == -1) {
+            char errMsg[64];
+            snprintf(errMsg, sizeof(errMsg),
+                     "DialogBoxIndirect falhou (erro %lu)", GetLastError());
+            MessageBoxA(hwndPai, errMsg, "WinMon — Overlay CFG", MB_OK | MB_ICONERROR);
+        }
+    }
 
     #undef WRITE_STR_W
-    #undef ALIGN_DWORD
-    #undef ADD_ITEM
+    #undef ALIGN_DW
+    #undef ADD_CTRL
 }
 
 /* ---- Ciclo de vida do overlay ------------------------------------------- */
@@ -2527,10 +2896,9 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai) {
 static void CriarOverlay(void) {
     HINSTANCE hInst = GetModuleHandle(NULL);
 
-    CarregarConfigOverlay();
-    RecalcOverlaySize();   /* calcula ovTotalW / ovTotalH */
+    CarregarPerfisOverlay();
+    RecalcOverlaySize();
 
-    /* Registar classe (ignora erro se já registada) */
     {
         WNDCLASSA wc;
         ZeroMemory(&wc, sizeof(wc));
@@ -2543,7 +2911,6 @@ static void CriarOverlay(void) {
         RegisterClassA(&wc);
     }
 
-    /* Posição inicial: canto superior-direito da área de trabalho */
     RECT wa = {0};
     SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
     int x = wa.right  - ovTotalW - OV_MARGIN_SCR;
@@ -2558,17 +2925,15 @@ static void CriarOverlay(void) {
 
     if (!hOverlay) return;
 
-    SetLayeredWindowAttributes(hOverlay, 0, ovOpacity, LWA_ALPHA);
+    SetLayeredWindowAttributes(hOverlay, 0, OV_OPACIDADE, LWA_ALPHA);
+    AplicarClickThrough();
     ShowWindow(hOverlay, SW_SHOWNOACTIVATE);
     UpdateWindow(hOverlay);
     overlayAtivo = 1;
 }
 
 static void FecharOverlay(void) {
-    if (hOverlay) {
-        DestroyWindow(hOverlay);
-        hOverlay     = NULL;
-    }
+    if (hOverlay) { DestroyWindow(hOverlay); hOverlay = NULL; }
     overlayAtivo = 0;
 }
 
@@ -2581,7 +2946,6 @@ static void AtualizarOverlay(void) {
     if (hOverlay && overlayAtivo)
         InvalidateRect(hOverlay, NULL, FALSE);
 }
-
 /* ========================================================================= */
 
 void AtualizarMonitor() {
