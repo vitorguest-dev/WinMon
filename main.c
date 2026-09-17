@@ -93,6 +93,7 @@ static const IID   LOCAL_IID_IWbemLocator  =
 /* ---- Overlay alargado (estilo RTSS) ---- */
 #define ID_TOGGLE_OVERLAY   1004
 #define ID_CONFIG_OVERLAY   1005
+#define ID_CYCLE_INTERVAL   1006
 #define OVERLAY_CLASS_NAME  "WinMonOverlayClass"
 
 /* Limites do tamanho de fonte do overlay */
@@ -176,6 +177,7 @@ HWND hMainWindow  = NULL;
 HWND hEdit        = NULL;
 HWND hTab         = NULL;
 HWND hBtnOverlay  = NULL;
+HWND hBtnInterval = NULL;
 HWND hGraphCPU    = NULL;
 HWND hGraphRAM = NULL;
 HWND hGraphDisk = NULL;
@@ -253,6 +255,9 @@ static ProcessoInfo listaProcessos[MAX_PROCESSES];
 static HistoricoMonitor historico;
 
 static int abaAtual = 0;
+
+static const UINT intervalosAtualizacao[] = { 500, 1000, 2000, 5000 };
+static UINT intervaloAtualizacaoMs = 1000;
 
 /* Dados do processo principal para o grafico de processos. */
 static double processoCpuAtual = 0.0;
@@ -1371,10 +1376,13 @@ static void RedimensionarConteudo(HWND hwnd) {
     GetClientRect(hwnd, &rc);
 
     /* Botoes overlay: canto superior-direito, sobrepostos ao tab.
-     *   [⚙][  Overlay [Ctrl+O]  ]
+     *   [Atualizacao][⚙][  Overlay [Ctrl+O]  ]
      */
     if (hBtnOverlay)
         MoveWindow(hBtnOverlay, rc.right - 122, 3, 118, 22, TRUE);
+
+    if (hBtnInterval)
+        MoveWindow(hBtnInterval, rc.right - 270, 3, 116, 22, TRUE);
 
     /* Botão de configuração — à esquerda do toggle */
     {
@@ -1473,6 +1481,13 @@ static void CriarAbas(HWND hwnd) {
         hwnd, (HMENU)(UINT_PTR)ID_TOGGLE_OVERLAY,
         GetModuleHandle(NULL), NULL);
 
+    hBtnInterval = CreateWindowExA(
+        0, "BUTTON", "Atualizacao: 1 s",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 116, 22,
+        hwnd, (HMENU)(UINT_PTR)ID_CYCLE_INTERVAL,
+        GetModuleHandle(NULL), NULL);
+
     /* Botao de configuracao do overlay (engrenagem) */
     CreateWindowExA(
         0, "BUTTON", "\xE2\x9A\x99",   /* UTF-8 ⚙ (fallback: usa "CFG") */
@@ -1483,6 +1498,7 @@ static void CriarAbas(HWND hwnd) {
 
     if (hFontUI) {
         SendMessage(hBtnOverlay, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+        SendMessage(hBtnInterval, WM_SETFONT, (WPARAM)hFontUI, TRUE);
         /* O botao de config usa a fonte do sistema — sem forçar */
     }
 
@@ -1580,6 +1596,40 @@ static void EscreverLinhaLog(void) {
 
 #define INI_FICHEIRO "winmon.ini"
 #define INI_SECAO    "Alertas"
+#define INI_SECAO_GERAL "Geral"
+
+static void AtualizarTextoIntervalo(void) {
+    char texto[32];
+
+    if (!hBtnInterval) return;
+
+    if (intervaloAtualizacaoMs < 1000)
+        snprintf(texto, sizeof(texto), "Atualizacao: %u ms", intervaloAtualizacaoMs);
+    else
+        snprintf(texto, sizeof(texto), "Atualizacao: %u s", intervaloAtualizacaoMs / 1000);
+
+    SetWindowTextA(hBtnInterval, texto);
+}
+
+static void CiclarIntervaloAtualizacao(void) {
+    size_t i;
+
+    for (i = 0; i < sizeof(intervalosAtualizacao) / sizeof(intervalosAtualizacao[0]); i++) {
+        if (intervaloAtualizacaoMs == intervalosAtualizacao[i]) {
+            i = (i + 1) % (sizeof(intervalosAtualizacao) / sizeof(intervalosAtualizacao[0]));
+            intervaloAtualizacaoMs = intervalosAtualizacao[i];
+            SetTimer(hMainWindow, TIMER_ID, intervaloAtualizacaoMs, NULL);
+            {
+                char valor[16];
+                snprintf(valor, sizeof(valor), "%u", intervaloAtualizacaoMs);
+                WritePrivateProfileStringA(INI_SECAO_GERAL, "IntervaloMs",
+                                           valor, INI_FICHEIRO);
+            }
+            AtualizarTextoIntervalo();
+            return;
+        }
+    }
+}
 
 static void CarregarConfigIni(void) {
     char val[32];
@@ -1596,10 +1646,17 @@ static void CarregarConfigIni(void) {
                              val, sizeof(val), INI_FICHEIRO);
     limiteDiscoPercent = atof(val);
 
+    GetPrivateProfileStringA(INI_SECAO_GERAL, "IntervaloMs", "1000",
+                             val, sizeof(val), INI_FICHEIRO);
+    intervaloAtualizacaoMs = (UINT)atoi(val);
+
     /* Validacao basica */
     if (limiteCpuPercent   < 1.0 || limiteCpuPercent   > 100.0) limiteCpuPercent   = LIMITE_CPU_PERCENT_DEFAULT;
     if (limiteRamPercent   < 1.0 || limiteRamPercent   > 100.0) limiteRamPercent   = LIMITE_RAM_PERCENT_DEFAULT;
     if (limiteDiscoPercent < 1.0 || limiteDiscoPercent > 100.0) limiteDiscoPercent = LIMITE_DISCO_PERCENT_DEFAULT;
+    if (intervaloAtualizacaoMs != 500 && intervaloAtualizacaoMs != 1000 &&
+        intervaloAtualizacaoMs != 2000 && intervaloAtualizacaoMs != 5000)
+        intervaloAtualizacaoMs = 1000;
 }
 
 static void GravarConfigIni(void) {
@@ -3076,6 +3133,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
 
             /* Carregar configuracao de alertas do .ini (se existir). */
             CarregarConfigIni();
+            AtualizarTextoIntervalo();
 
             ZeroMemory(&nid, sizeof(nid));
             nid.cbSize = sizeof(NOTIFYICONDATAA);
@@ -3087,7 +3145,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             strncpy_s(nid.szTip, sizeof(nid.szTip),
                       "Monitor de Hardware", _TRUNCATE);
 
-            SetTimer(hwnd, TIMER_ID, 1000, NULL);
+            SetTimer(hwnd, TIMER_ID, intervaloAtualizacaoMs, NULL);
             return 0;
         }
 
@@ -3162,6 +3220,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             }
             if (LOWORD(wParam) == ID_CONFIG_ALERTAS) {
                 MostrarDialogoAlertas(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == ID_CYCLE_INTERVAL) {
+                CiclarIntervaloAtualizacao();
                 return 0;
             }
             if (LOWORD(wParam) == ID_TOGGLE_OVERLAY) {
