@@ -993,6 +993,7 @@ static void RedimensionarPainelProcessos(HWND hwndPai);
 static void FiltrarListaProcessos(void);
 static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
                                       WPARAM wParam, LPARAM lParam);
+static void DesenharBotaoNavegacao(const DRAWITEMSTRUCT *dis);
 
 /* ------------------------------------------------------------------------- */
 /* Graficos GDI                                                              */
@@ -1792,6 +1793,62 @@ static void MostrarAba(int indice)
     InvalidateRect(hMainWindow, NULL, TRUE);
 }
 
+static void DesenharBotaoNavegacao(const DRAWITEMSTRUCT *dis)
+{
+    RECT rc;
+    HBRUSH fundo;
+    COLORREF corTexto;
+    COLORREF corFaixa;
+    HFONT fonte;
+    HFONT fonteAnterior;
+    char texto[64];
+    int ativo;
+
+    if (!dis || !dis->hwndItem)
+        return;
+
+    rc = dis->rcItem;
+    ativo = GetDlgCtrlID(dis->hwndItem) == TAB_RESUMO + abaAtual;
+    corTexto = (ativo || (dis->itemState & ODS_SELECTED))
+                   ? RGB(255, 255, 255)
+                   : RGB(205, 211, 218);
+    corFaixa = (ativo || (dis->itemState & ODS_SELECTED))
+                   ? RGB(55, 145, 215)
+                   : RGB(80, 88, 98);
+
+    fundo = CreateSolidBrush((ativo || (dis->itemState & ODS_SELECTED))
+                                 ? RGB(42, 53, 66)
+                                 : RGB(31, 39, 49));
+    FillRect(dis->hDC, &rc, fundo);
+    DeleteObject(fundo);
+
+    if (dis->itemState & ODS_FOCUS)
+    {
+        HPEN foco = CreatePen(PS_SOLID, 1, RGB(130, 190, 235));
+        HPEN anterior = (HPEN)SelectObject(dis->hDC, foco);
+        Rectangle(dis->hDC, rc.left, rc.top, rc.right, rc.bottom);
+        SelectObject(dis->hDC, anterior);
+        DeleteObject(foco);
+    }
+
+    {
+        RECT faixa = {rc.left, rc.top, rc.left + 4, rc.bottom};
+        HBRUSH pincelFaixa = CreateSolidBrush(corFaixa);
+        FillRect(dis->hDC, &faixa, pincelFaixa);
+        DeleteObject(pincelFaixa);
+    }
+
+    GetWindowTextA(dis->hwndItem, texto, sizeof(texto));
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, corTexto);
+    fonte = hFontUI ? hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    fonteAnterior = (HFONT)SelectObject(dis->hDC, fonte);
+    rc.left += 16;
+    DrawTextA(dis->hDC, texto, -1, &rc,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dis->hDC, fonteAnterior);
+}
+
 static void RedimensionarConteudo(HWND hwnd)
 {
     RECT rc;
@@ -2188,7 +2245,7 @@ static void CriarAbas(HWND hwnd)
         {
             hNav[i] = CreateWindowExA(
                 0, "BUTTON", navNomes[i],
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
                 12, 42 + i * 38, NAV_LARGURA - 24, 30,
                 hwnd, (HMENU)(UINT_PTR)(TAB_RESUMO + i),
                 GetModuleHandle(NULL), NULL);
@@ -4343,6 +4400,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         mmi->ptMinTrackSize.x = 620;
         mmi->ptMinTrackSize.y = 420;
         return 0;
+    }
+
+    case WM_DRAWITEM:
+    {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lParam;
+
+        if (dis && dis->CtlType == ODT_BUTTON &&
+            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_PROCESSOS)
+        {
+            DesenharBotaoNavegacao(dis);
+            return TRUE;
+        }
+        break;
     }
 
     case WM_NOTIFY:
