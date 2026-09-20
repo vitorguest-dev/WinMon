@@ -210,6 +210,27 @@ HWND hGraphDisk = NULL;
 HWND hGraphNet = NULL;
 HWND hGraphProcesses = NULL;
 
+/* --- Painel de processos full (aba Processos) --- */
+HWND hPainelProcessos  = NULL;   /* container panel */
+HWND hListViewProc     = NULL;   /* ListView com todos os processos */
+HWND hEditPesquisaProc = NULL;   /* caixa de pesquisa */
+HWND hLabelProcCount   = NULL;   /* "N processos" */
+
+#define IDC_EDIT_PESQUISA_PROC 6001
+#define IDC_LISTVIEW_PROC      6002
+#define IDC_LABEL_PROC_COUNT   6003
+
+/* estado de ordenação do ListView */
+static int  g_lvSortCol  = 1;    /* coluna activa (0=Nome,1=PID,2=CPU,3=RAM) */
+static int  g_lvSortDesc = 1;    /* 1=descendente, 0=ascendente */
+
+/* snapshot filtrado para o ListView */
+static ProcessoInfo g_lvProcessos[MAX_PROCESSES];
+static int          g_lvTotal = 0;
+
+/* total bruto antes de filtrar (para o label) */
+static int g_totalProcessosBruto = 0;
+
 PDH_HQUERY hQuery = NULL;
 PDH_HCOUNTER hCounterCPU = NULL;
 PDH_HCOUNTER hCounterCoresCPU[MAX_CORES];
@@ -907,6 +928,10 @@ static void CarregarPerfisOverlay(void);
 static void AtivarPerfil(int idx);
 static void MostrarDialogoConfigOverlay(HWND hwndPai);
 static void AplicarEstiloJanelaPrincipal(void);
+static void CriarPainelProcessos(HWND hwndPai);
+static void AtualizarListViewProcessos(void);
+static void RedimensionarPainelProcessos(HWND hwndPai);
+static void FiltrarListaProcessos(void);
 
 /* ------------------------------------------------------------------------- */
 /* Graficos GDI                                                              */
@@ -1495,18 +1520,32 @@ void ExportarSnapshot()
 static void MostrarAba(int indice)
 {
     int i;
+    /* índices 1-4 mapeiam para gráficos; índice 5 é o painel de processos */
     HWND graficos[] = {
-        hGraphCPU, hGraphRAM, hGraphDisk, hGraphNet, hGraphProcesses};
+        hGraphCPU, hGraphRAM, hGraphDisk, hGraphNet};
 
     abaAtual = indice;
 
     if (hEdit)
         ShowWindow(hEdit, indice == 0 ? SW_SHOW : SW_HIDE);
 
-    for (i = 0; i < 5; i++)
+    for (i = 0; i < 4; i++)
     {
         if (graficos[i])
             ShowWindow(graficos[i], indice == i + 1 ? SW_SHOW : SW_HIDE);
+    }
+
+    /* hGraphProcesses não tem aba própria — mantém-se sempre oculto */
+    if (hGraphProcesses)
+        ShowWindow(hGraphProcesses, SW_HIDE);
+
+    /* painel de lista de processos: mostrar/esconder cada controlo */
+    {
+        int visProc = (indice == 5) ? SW_SHOW : SW_HIDE;
+        if (hPainelProcessos)  ShowWindow(hPainelProcessos,  visProc);
+        if (hEditPesquisaProc) ShowWindow(hEditPesquisaProc, visProc);
+        if (hLabelProcCount)   ShowWindow(hLabelProcCount,   visProc);
+        if (hListViewProc)     ShowWindow(hListViewProc,     visProc);
     }
 
     InvalidateRect(hMainWindow, NULL, TRUE);
@@ -1569,7 +1608,299 @@ static void RedimensionarConteudo(HWND hwnd)
         if (hGraphProcesses)
             MoveWindow(hGraphProcesses, rc.left, rc.top,
                        rc.right - rc.left, rc.bottom - rc.top, TRUE);
+
+        /* Barra de pesquisa + ListView de processos */
+        {
+            int cx   = rc.left;
+            int cy   = rc.top;
+            int cw   = rc.right  - rc.left;
+            int ch   = rc.bottom - rc.top;
+            int barH = 28;          /* altura da barra de pesquisa */
+            int lblW = 74;          /* "Pesquisar:" */
+            int editW = 240;        /* caixa de texto */
+            if (editW > cw - lblW - 8) editW = cw - lblW - 8;
+            if (editW < 60) editW = 60;
+
+            if (hPainelProcessos)   /* label "Pesquisar:" */
+                MoveWindow(hPainelProcessos,
+                           cx + 4, cy + 4, lblW, 22, TRUE);
+
+            if (hEditPesquisaProc)
+                MoveWindow(hEditPesquisaProc,
+                           cx + 4 + lblW + 4, cy + 3, editW, 22, TRUE);
+
+            if (hLabelProcCount)
+                MoveWindow(hLabelProcCount,
+                           cx + 4 + lblW + 4 + editW + 8, cy + 4,
+                           cw - (4 + lblW + 4 + editW + 8) - 4, 22, TRUE);
+
+            if (hListViewProc && ch > barH)
+                MoveWindow(hListViewProc,
+                           cx, cy + barH,
+                           cw, ch - barH, TRUE);
+        }
     }
+}
+
+/* =========================================================================
+ * Painel de processos full-list  (aba "Processos")
+ * ========================================================================= */
+
+/* Comparadores para qsort — usam g_lvSortCol / g_lvSortDesc */
+static int CompararLvProc(const void *a, const void *b)
+{
+    const ProcessoInfo *p1 = (const ProcessoInfo *)a;
+    const ProcessoInfo *p2 = (const ProcessoInfo *)b;
+    int r = 0;
+
+    switch (g_lvSortCol)
+    {
+    case 0: /* Nome */
+        r = _stricmp(p1->exeFile, p2->exeFile);
+        break;
+    case 1: /* PID */
+        r = (p1->pid > p2->pid) ? 1 : (p1->pid < p2->pid) ? -1 : 0;
+        break;
+    case 2: /* CPU */
+        r = (p1->cpuPercent > p2->cpuPercent) ? 1 :
+            (p1->cpuPercent < p2->cpuPercent) ? -1 : 0;
+        break;
+    case 3: /* RAM */
+        r = (p1->memUsageMB > p2->memUsageMB) ? 1 :
+            (p1->memUsageMB < p2->memUsageMB) ? -1 : 0;
+        break;
+    }
+    return g_lvSortDesc ? -r : r;
+}
+
+/* Preenche g_lvProcessos com base no filtro de texto actual */
+static void FiltrarListaProcessos(void)
+{
+    char filtro[MAX_PATH];
+    char filtroLow[MAX_PATH];
+    int  i, n;
+
+    filtro[0] = '\0';
+    if (hEditPesquisaProc)
+        GetWindowTextA(hEditPesquisaProc, filtro, (int)sizeof(filtro));
+
+    /* converte filtro para minúsculas para comparação case-insensitive */
+    strncpy_s(filtroLow, sizeof(filtroLow), filtro, _TRUNCATE);
+    {
+        char *p;
+        for (p = filtroLow; *p; p++)
+            *p = (char)tolower((unsigned char)*p);
+    }
+
+    n = 0;
+    for (i = 0; i < g_totalProcessosBruto && n < MAX_PROCESSES; i++)
+    {
+        if (filtroLow[0] == '\0')
+        {
+            /* sem filtro — copia tudo */
+            g_lvProcessos[n++] = listaProcessos[i];
+        }
+        else
+        {
+            /* testa match no nome */
+            char nomeLow[MAX_PATH];
+            strncpy_s(nomeLow, sizeof(nomeLow),
+                      listaProcessos[i].exeFile, _TRUNCATE);
+            {
+                char *p;
+                for (p = nomeLow; *p; p++)
+                    *p = (char)tolower((unsigned char)*p);
+            }
+
+            if (strstr(nomeLow, filtroLow) != NULL)
+            {
+                g_lvProcessos[n++] = listaProcessos[i];
+                continue;
+            }
+
+            /* testa match no PID */
+            {
+                char pidStr[16];
+                snprintf(pidStr, sizeof(pidStr), "%u",
+                         listaProcessos[i].pid);
+                if (strstr(pidStr, filtroLow) != NULL)
+                    g_lvProcessos[n++] = listaProcessos[i];
+            }
+        }
+    }
+    g_lvTotal = n;
+
+    /* ordena conforme coluna activa */
+    if (g_lvTotal > 1)
+        qsort(g_lvProcessos, (size_t)g_lvTotal,
+              sizeof(ProcessoInfo), CompararLvProc);
+}
+
+/* Actualiza o conteúdo do ListView com os dados mais recentes */
+static void AtualizarListViewProcessos(void)
+{
+    char buf[64];
+    int  i;
+
+    if (!hListViewProc)
+        return;
+
+    /* guarda o total bruto antes de filtrar */
+    /* (MonitorarProcessos() já preencheu listaProcessos[],
+       mas não temos acesso directo ao total; usamos totalHistorico
+       como proxy — é o mesmo número de entradas processadas) */
+    g_totalProcessosBruto = totalHistorico; /* mesmo ciclo */
+
+    FiltrarListaProcessos();
+
+    /* Suspende redesenho para evitar flicker */
+    SendMessage(hListViewProc, WM_SETREDRAW, FALSE, 0);
+    ListView_SetItemCountEx(hListViewProc, g_lvTotal,
+                            LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    SendMessage(hListViewProc, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hListViewProc, NULL, FALSE);
+
+    /* Actualiza label de contagem */
+    if (hLabelProcCount)
+    {
+        snprintf(buf, sizeof(buf), "%d processos  (%d visíveis)",
+                 g_totalProcessosBruto, g_lvTotal);
+        SetWindowTextA(hLabelProcCount, buf);
+    }
+
+    (void)i;
+}
+
+/* Callback de notificação do ListView (LVN_GETDISPINFO para virtual list) */
+static void LvProcGetDispInfo(NMLVDISPINFOA *pdi)
+{
+    int idx;
+
+    if (!(pdi->item.mask & LVIF_TEXT))
+        return;
+
+    idx = pdi->item.iItem;
+    if (idx < 0 || idx >= g_lvTotal)
+        return;
+
+    switch (pdi->item.iSubItem)
+    {
+    case 0: /* Nome */
+        strncpy_s(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
+                  g_lvProcessos[idx].exeFile, _TRUNCATE);
+        break;
+    case 1: /* PID */
+        snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
+                 "%u", g_lvProcessos[idx].pid);
+        break;
+    case 2: /* CPU */
+        snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
+                 "%.1f%%", g_lvProcessos[idx].cpuPercent);
+        break;
+    case 3: /* RAM */
+        snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
+                 "%lu MB",
+                 (unsigned long)g_lvProcessos[idx].memUsageMB);
+        break;
+    }
+}
+
+/* Trata cliques nos cabeçalhos do ListView para ordenação */
+static void LvProcColumnClick(int col)
+{
+    if (g_lvSortCol == col)
+        g_lvSortDesc = !g_lvSortDesc;
+    else
+    {
+        g_lvSortCol  = col;
+        g_lvSortDesc = (col == 2 || col == 3); /* CPU/RAM desc por omissão */
+    }
+    AtualizarListViewProcessos();
+}
+
+/* Cria o painel de processos.
+ * Todos os controlos são filhos DIRECTOS de hwndPai (a janela principal),
+ * para que o WM_NOTIFY com LVN_GETDISPINFO chegue ao WindowProc sem
+ * ser intercepado por um container intermédio. O "painel" é apenas
+ * o próprio hListViewProc + controlos de barra de pesquisa; usamos
+ * hPainelProcessos como sentinela NULL/não-NULL para saber se foi criado.
+ */
+static void CriarPainelProcessos(HWND hwndPai)
+{
+    LVCOLUMNA lvc;
+    HINSTANCE hInst = GetModuleHandle(NULL);
+
+    /* Label "Pesquisar:" — filho directo da janela principal */
+    hPainelProcessos = CreateWindowExA(         /* reutilizamos como label */
+        0, "STATIC", "Pesquisar:",
+        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
+        0, 0, 74, 22,
+        hwndPai, NULL, hInst, NULL);
+
+    /* Edit de pesquisa */
+    hEditPesquisaProc = CreateWindowExA(
+        WS_EX_CLIENTEDGE, "EDIT", "",
+        WS_CHILD | ES_AUTOHSCROLL,
+        0, 0, 220, 22,
+        hwndPai,
+        (HMENU)(UINT_PTR)IDC_EDIT_PESQUISA_PROC,
+        hInst, NULL);
+
+    /* Label de contagem */
+    hLabelProcCount = CreateWindowExA(
+        0, "STATIC", "0 processos",
+        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
+        0, 0, 260, 22,
+        hwndPai,
+        (HMENU)(UINT_PTR)IDC_LABEL_PROC_COUNT,
+        hInst, NULL);
+
+    /* ListView virtual — filho directo da janela principal */
+    {
+        INITCOMMONCONTROLSEX icc2;
+        icc2.dwSize = sizeof(icc2);
+        icc2.dwICC  = ICC_LISTVIEW_CLASSES;
+        InitCommonControlsEx(&icc2);
+    }
+
+    hListViewProc = CreateWindowExA(
+        WS_EX_CLIENTEDGE,
+        WC_LISTVIEWA, "",
+        WS_CHILD | WS_VSCROLL |
+            LVS_REPORT | LVS_SINGLESEL | LVS_OWNERDATA |
+            LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+        0, 0, 100, 100,
+        hwndPai,
+        (HMENU)(UINT_PTR)IDC_LISTVIEW_PROC,
+        hInst, NULL);
+
+    if (!hListViewProc)
+        return;
+
+    ListView_SetExtendedListViewStyle(hListViewProc,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+    /* Colunas */
+    ZeroMemory(&lvc, sizeof(lvc));
+    lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+
+    lvc.pszText = "Nome";     lvc.cx = 220; lvc.fmt = LVCFMT_LEFT;
+    ListView_InsertColumn(hListViewProc, 0, &lvc);
+
+    lvc.pszText = "PID";      lvc.cx = 70;  lvc.fmt = LVCFMT_RIGHT;
+    ListView_InsertColumn(hListViewProc, 1, &lvc);
+
+    lvc.pszText = "CPU (%)";  lvc.cx = 90;  lvc.fmt = LVCFMT_RIGHT;
+    ListView_InsertColumn(hListViewProc, 2, &lvc);
+
+    lvc.pszText = "RAM (MB)"; lvc.cx = 90;  lvc.fmt = LVCFMT_RIGHT;
+    ListView_InsertColumn(hListViewProc, 3, &lvc);
+}
+
+/* Stub mantido para compatibilidade — posicionamento é feito em RedimensionarConteudo */
+static void RedimensionarPainelProcessos(HWND hwndPai)
+{
+    (void)hwndPai;
 }
 
 static void CriarAbas(HWND hwnd)
@@ -1610,6 +1941,8 @@ static void CriarAbas(HWND hwnd)
     hGraphDisk = CriarGrafico(hwnd, GRAPH_DISK);
     hGraphNet = CriarGrafico(hwnd, GRAPH_NET);
     hGraphProcesses = CriarGrafico(hwnd, GRAPH_PROCESS);
+
+    CriarPainelProcessos(hwnd);
 
     hBtnOverlay = CreateWindowExA(
         0, "BUTTON", "Overlay [Ctrl+O]",
@@ -3432,6 +3765,25 @@ void AtualizarMonitor()
     InvalidateRect(hGraphNet, NULL, FALSE);
     InvalidateRect(hGraphProcesses, NULL, FALSE);
 
+    /* Actualiza a lista completa de processos (aba Processos) */
+    g_totalProcessosBruto = totalHistorico;
+    if (abaAtual == 5)
+        AtualizarListViewProcessos();
+    else
+    {
+        /* mesmo fora da aba, mantemos o filtro actualizado
+           para que ao mudar de aba a lista já esteja pronta */
+        FiltrarListaProcessos();
+        if (hLabelProcCount)
+        {
+            char _cntbuf[64];
+            snprintf(_cntbuf, sizeof(_cntbuf),
+                     "%d processos  (%d visíveis)",
+                     g_totalProcessosBruto, g_lvTotal);
+            SetWindowTextA(hLabelProcCount, _cntbuf);
+        }
+    }
+
     AtualizarOverlay();
 }
 
@@ -3539,12 +3891,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
     {
         NMHDR *hdr = (NMHDR *)lParam;
 
-        if (hdr && hdr->hwndFrom == hTab &&
-            hdr->code == TCN_SELCHANGE)
+        if (!hdr)
+            break;
+
+        if (hdr->hwndFrom == hTab && hdr->code == TCN_SELCHANGE)
         {
             int indice = TabCtrl_GetCurSel(hTab);
             MostrarAba(indice);
             return 0;
+        }
+
+        /* Notificações do ListView de processos */
+        if (hListViewProc && hdr->hwndFrom == hListViewProc)
+        {
+            if (hdr->code == LVN_GETDISPINFOA)
+            {
+                LvProcGetDispInfo((NMLVDISPINFOA *)lParam);
+                return 0;
+            }
+            if (hdr->code == LVN_COLUMNCLICK)
+            {
+                NMLISTVIEW *pnm = (NMLISTVIEW *)lParam;
+                LvProcColumnClick(pnm->iSubItem);
+                return 0;
+            }
         }
 
         break;
@@ -3620,6 +3990,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         return 0;
 
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_EDIT_PESQUISA_PROC &&
+            HIWORD(wParam) == EN_CHANGE)
+        {
+            AtualizarListViewProcessos();
+            return 0;
+        }
         if (LOWORD(wParam) == ID_EXPORT_SNAPSHOT)
         {
             ExportarSnapshot();
