@@ -94,6 +94,7 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_DISCO 2004
 #define TAB_REDE 2005
 #define TAB_PROCESSOS 2006
+#define NAV_LARGURA 148
 
 #define MAX_TEMP_ZONAS 16
 #define BALLOON_COOLDOWN_SEGUNDOS 30
@@ -252,6 +253,8 @@ static ULONGLONG lastSystemTime = 0;
 HWND hMainWindow = NULL;
 HWND hEdit = NULL;
 HWND hTab = NULL;
+HWND hDashboard = NULL;
+HWND hNav[6] = {NULL};
 HWND hBtnOverlay = NULL;
 HWND hBtnInterval = NULL;
 HWND hBtnEstiloMain = NULL;
@@ -988,6 +991,8 @@ static void CriarPainelProcessos(HWND hwndPai);
 static void AtualizarListViewProcessos(void);
 static void RedimensionarPainelProcessos(HWND hwndPai);
 static void FiltrarListaProcessos(void);
+static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
+                                      WPARAM wParam, LPARAM lParam);
 
 /* ------------------------------------------------------------------------- */
 /* Graficos GDI                                                              */
@@ -1178,6 +1183,165 @@ static void DrawTimeLabels(HDC hdc, RECT rc, int count)
             DrawTextA(hdc, text, -1, &tr, DT_CENTER | DT_SINGLELINE);
         }
     }
+}
+
+static void DrawDashboardCard(HDC hdc, RECT rc, const char *label,
+                              const char *value, COLORREF accent)
+{
+    HBRUSH panel = CreateSolidBrush(RGB(255, 255, 255));
+    HBRUSH marker = CreateSolidBrush(accent);
+    RECT markerRect = {rc.left, rc.top, rc.left + 5, rc.bottom};
+    RECT labelRect = {rc.left + 16, rc.top + 12, rc.right - 10, rc.top + 31};
+    RECT valueRect = {rc.left + 16, rc.top + 31, rc.right - 10, rc.bottom - 10};
+    HFONT oldFont;
+    HFONT valueFont;
+
+    FillRect(hdc, &rc, panel);
+    FillRect(hdc, &markerRect, marker);
+    DeleteObject(panel);
+    DeleteObject(marker);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(102, 108, 116));
+    oldFont = (HFONT)SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    DrawTextA(hdc, label, -1, &labelRect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    valueFont = CreateFontA(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                            ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    if (valueFont)
+        SelectObject(hdc, valueFont);
+    SetTextColor(hdc, RGB(32, 38, 45));
+    DrawTextA(hdc, value, -1, &valueRect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    SelectObject(hdc, oldFont);
+    if (valueFont)
+        DeleteObject(valueFont);
+}
+
+static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
+                                      WPARAM wParam, LPARAM lParam)
+{
+    (void)wParam;
+    (void)lParam;
+
+    switch (msg)
+    {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC paintDc = BeginPaint(hwnd, &ps);
+        RECT client;
+        HDC bufferDc;
+        HBITMAP bufferBitmap;
+        HBITMAP oldBitmap;
+        HBRUSH background;
+        RECT card;
+        char value[64];
+        int gap = 10;
+        int cardWidth;
+        int i;
+
+        GetClientRect(hwnd, &client);
+        bufferDc = CreateCompatibleDC(paintDc);
+        bufferBitmap = CreateCompatibleBitmap(paintDc,
+                                              client.right, client.bottom);
+
+        if (!bufferDc || !bufferBitmap)
+        {
+            if (bufferDc) DeleteDC(bufferDc);
+            if (bufferBitmap) DeleteObject(bufferBitmap);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        oldBitmap = (HBITMAP)SelectObject(bufferDc, bufferBitmap);
+        background = CreateSolidBrush(RGB(241, 244, 247));
+        FillRect(bufferDc, &client, background);
+        DeleteObject(background);
+
+        SetBkMode(bufferDc, TRANSPARENT);
+        SetTextColor(bufferDc, RGB(33, 39, 46));
+        {
+            RECT title = {16, 10, client.right - 16, 34};
+            DrawTextA(bufferDc, "Visao geral do sistema", -1, &title,
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        }
+
+        cardWidth = (client.right - 32 - gap * 3) / 4;
+        if (cardWidth < 100)
+            cardWidth = 100;
+
+        for (i = 0; i < 4; i++)
+        {
+            card.left = 16 + i * (cardWidth + gap);
+            card.top = 42;
+            card.right = card.left + cardWidth;
+            card.bottom = 112;
+
+            if (i == 0)
+            {
+                snprintf(value, sizeof(value), "%.1f%%", ultimoCpuPercent);
+                DrawDashboardCard(bufferDc, card, "CPU", value,
+                                  g_mainConfig.corGraficoCpu);
+            }
+            else if (i == 1)
+            {
+                snprintf(value, sizeof(value), "%.0f%%", ultimoRamPercent);
+                DrawDashboardCard(bufferDc, card, "Memoria", value,
+                                  g_mainConfig.corGraficoRam);
+            }
+            else if (i == 2)
+            {
+                snprintf(value, sizeof(value), "%.1f MB/s",
+                         (ultimoDiskRead + ultimoDiskWrite) / 1048576.0);
+                DrawDashboardCard(bufferDc, card, "Disco I/O", value,
+                                  g_mainConfig.corGraficoDiscoRead);
+            }
+            else
+            {
+                snprintf(value, sizeof(value), "%.1f MB/s",
+                         (ultimoNetDown + ultimoNetUp) / 1048576.0);
+                DrawDashboardCard(bufferDc, card, "Rede", value,
+                                  g_mainConfig.corGraficoNetDown);
+            }
+        }
+
+        {
+            RECT status = {16, 124, client.right - 16, 158};
+            char statusText[160];
+            snprintf(statusText, sizeof(statusText),
+                     "%s   |   Processo lider: %.1f%% CPU   |   Historico: %d pontos",
+                     alertaGlobalAtivo ? "Estado: ALERTA" : "Estado: normal",
+                     processoCpuAtual, historico.count);
+            SetTextColor(bufferDc, alertaGlobalAtivo
+                                      ? RGB(190, 55, 45)
+                                      : RGB(82, 91, 101));
+            DrawTextA(bufferDc, statusText, -1, &status,
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        }
+
+        BitBlt(paintDc, 0, 0, client.right, client.bottom,
+               bufferDc, 0, 0, SRCCOPY);
+        SelectObject(bufferDc, oldBitmap);
+        DeleteObject(bufferBitmap);
+        DeleteDC(bufferDc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_SIZE:
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
@@ -1509,6 +1673,7 @@ static void AplicarEstiloJanelaPrincipal(void)
     InvalidateRect(hGraphDisk, NULL, FALSE);
     InvalidateRect(hGraphNet, NULL, FALSE);
     InvalidateRect(hGraphProcesses, NULL, FALSE);
+    InvalidateRect(hDashboard, NULL, FALSE);
 }
 
 void AtualizarTituloJanela()
@@ -1593,8 +1758,17 @@ static void MostrarAba(int indice)
 
     abaAtual = indice;
 
+    for (i = 0; i < 6; i++)
+    {
+        if (hNav[i])
+            SendMessage(hNav[i], BM_SETSTATE, i == indice, 0);
+    }
+
     if (hEdit)
         ShowWindow(hEdit, indice == 0 ? SW_SHOW : SW_HIDE);
+
+    if (hDashboard)
+        ShowWindow(hDashboard, indice == 0 ? SW_SHOW : SW_HIDE);
 
     for (i = 0; i < 4; i++)
     {
@@ -1648,13 +1822,27 @@ static void RedimensionarConteudo(HWND hwnd)
 
     if (hTab)
     {
-        MoveWindow(hTab, 0, 0, rc.right, rc.bottom, TRUE);
+        MoveWindow(hTab, NAV_LARGURA, 0,
+                   rc.right - NAV_LARGURA, rc.bottom, TRUE);
 
         TabCtrl_AdjustRect(hTab, FALSE, &rc);
+        rc.left += NAV_LARGURA;
+
+        for (int i = 0; i < 6; i++)
+        {
+            if (hNav[i])
+                MoveWindow(hNav[i], 12, 42 + i * 38,
+                           NAV_LARGURA - 24, 30, TRUE);
+        }
 
         if (hEdit)
-            MoveWindow(hEdit, rc.left, rc.top,
-                       rc.right - rc.left, rc.bottom - rc.top, TRUE);
+            MoveWindow(hEdit, rc.left, rc.top + 172,
+                       rc.right - rc.left,
+                       rc.bottom - rc.top - 172, TRUE);
+
+        if (hDashboard)
+            MoveWindow(hDashboard, rc.left, rc.top,
+                       rc.right - rc.left, 172, TRUE);
 
         if (hGraphCPU)
             MoveWindow(hGraphCPU, rc.left, rc.top,
@@ -1992,12 +2180,38 @@ static void CriarAbas(HWND hwnd)
         TabCtrl_InsertItem(hTab, i, &item);
     }
 
+    {
+        const char *navNomes[] = {
+            "Visao geral", "CPU", "Memoria", "Disco", "Rede", "Processos"};
+
+        for (i = 0; i < 6; i++)
+        {
+            hNav[i] = CreateWindowExA(
+                0, "BUTTON", navNomes[i],
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                12, 42 + i * 38, NAV_LARGURA - 24, 30,
+                hwnd, (HMENU)(UINT_PTR)(TAB_RESUMO + i),
+                GetModuleHandle(NULL), NULL);
+
+            if (hNav[i] && hFontUI)
+                SendMessage(hNav[i], WM_SETFONT, (WPARAM)hFontUI, TRUE);
+        }
+    }
+
+    ShowWindow(hTab, SW_HIDE);
+
     hEdit = CreateWindowExA(
         0, "RICHEDIT50W", "A recolher dados do sistema...",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL |
             ES_MULTILINE | ES_READONLY,
         0, 0, 100, 100,
         hwnd, NULL, NULL, NULL);
+
+    hDashboard = CreateWindowExA(
+        0, "HardwareMonitorDashboard", "",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+        0, 0, 100, 172,
+        hwnd, NULL, GetModuleHandle(NULL), NULL);
 
     AplicarEstiloJanelaPrincipal();
 
@@ -4005,6 +4219,7 @@ void AtualizarMonitor()
     InvalidateRect(hGraphDisk, NULL, FALSE);
     InvalidateRect(hGraphNet, NULL, FALSE);
     InvalidateRect(hGraphProcesses, NULL, FALSE);
+    InvalidateRect(hDashboard, NULL, FALSE);
 
     /* Actualiza a lista completa de processos (aba Processos) */
     g_totalProcessosBruto = totalHistorico;
@@ -4234,6 +4449,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         return 0;
 
     case WM_COMMAND:
+        if (LOWORD(wParam) >= TAB_RESUMO &&
+            LOWORD(wParam) <= TAB_PROCESSOS &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            int indice = LOWORD(wParam) - TAB_RESUMO;
+            TabCtrl_SetCurSel(hTab, indice);
+            MostrarAba(indice);
+            return 0;
+        }
         if (LOWORD(wParam) == IDC_EDIT_PESQUISA_PROC &&
             HIWORD(wParam) == EN_CHANGE)
         {
@@ -4428,6 +4652,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         graphClass.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
 
         RegisterClassA(&graphClass);
+    }
+
+    {
+        WNDCLASSA dashboardClass;
+        ZeroMemory(&dashboardClass, sizeof(dashboardClass));
+
+        dashboardClass.lpfnWndProc = DashboardProc;
+        dashboardClass.hInstance = hInstance;
+        dashboardClass.lpszClassName = "HardwareMonitorDashboard";
+        dashboardClass.hCursor = LoadCursor(NULL, IDC_ARROW);
+        dashboardClass.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+        RegisterClassA(&dashboardClass);
     }
 
     ZeroMemory(&wc, sizeof(wc));

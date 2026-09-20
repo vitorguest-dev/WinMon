@@ -9,7 +9,19 @@
                 "-g",
                 "${file}",
                 "-o",
-                "${fileDirname}\\${fileBasenameNoExtension}.exe"
+                "${fileDirname}\\${fileBasenameNoExtension}.exe",
+                "-lcomdlg32",
+                "-lpdh",
+                "-liphlpapi",
+                "-lpsapi",
+                "-lgdi32",
+                "-lshell32",
+                "-lcomctl32",
+                "-lole32",
+                "-loleaut32",
+                "-lwbemuuid",
+                "-ladvapi32",
+                "-luser32"
             ],
             "options": {
                 "cwd": "${fileDirname}"
