@@ -87,6 +87,11 @@ static const IID LOCAL_IID_IWbemLocator =
 
 #define OVERLAY_CLASS_NAME "WinMonOverlayClass"
 
+/* Hotkey global: Ctrl+Shift+O para toggle do overlay */
+#define HOTKEY_ID_OVERLAY  1
+#define HOTKEY_MOD_OVERLAY (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT)
+#define HOTKEY_VK_OVERLAY  'O'
+
 #define OV_FONT_MIN 8
 #define OV_FONT_MAX 32
 #define OV_SNAP_DIST 40
@@ -224,8 +229,7 @@ static MainUiConfig g_mainConfig = {
         .lfClipPrecision = CLIP_DEFAULT_PRECIS,
         .lfQuality = DEFAULT_QUALITY,
         .lfPitchAndFamily = FIXED_PITCH | FF_MODERN,
-        .lfFaceName = "Consolas"
-    },
+        .lfFaceName = "Consolas"},
     .corFundoEdit = RGB(255, 255, 255),
     .corTextoEdit = RGB(0, 0, 0),
     .corFundoGrafico = RGB(250, 251, 252),
@@ -242,12 +246,10 @@ static MainUiConfig g_mainConfig = {
     .corGraficoCore = RGB(85, 145, 95),
     .espessuraLinhas = 2,
     .mostrarGrelha = 1,
-    .mostrarEixos = 1
-};
+    .mostrarEixos = 1};
 
 static TrayConfig g_trayConfig = {
-    1, 1, 0, 0, 0, 0, 1, 0
-};
+    1, 1, 0, 0, 0, 0, 1, 0};
 
 static double limiteCpuPercent = LIMITE_CPU_PERCENT_DEFAULT;
 static double limiteRamPercent = LIMITE_RAM_PERCENT_DEFAULT;
@@ -283,29 +285,29 @@ HWND hGraphNet = NULL;
 HWND hGraphProcesses = NULL;
 
 /* --- Painel de processos full (aba Processos) --- */
-HWND hPainelProcessos  = NULL;   /* container panel */
-HWND hListViewProc     = NULL;   /* ListView com todos os processos */
-HWND hEditPesquisaProc = NULL;   /* caixa de pesquisa */
-HWND hLabelProcCount   = NULL;   /* "N processos" */
+HWND hPainelProcessos = NULL;  /* container panel */
+HWND hListViewProc = NULL;     /* ListView com todos os processos */
+HWND hEditPesquisaProc = NULL; /* caixa de pesquisa */
+HWND hLabelProcCount = NULL;   /* "N processos" */
 
-#define SETTINGS_SECTIONS       5
+#define SETTINGS_SECTIONS 5
 #define IDC_EDIT_PESQUISA_PROC 6001
-#define IDC_LISTVIEW_PROC      6002
-#define IDC_LABEL_PROC_COUNT   6003
-#define IDC_SETTINGS_TITLE      8000
-#define IDC_SETTINGS_HDR_ALERT  8001
-#define IDC_SETTINGS_HDR_APAR   8002
-#define IDC_SETTINGS_HDR_OVER   8003
-#define IDC_SETTINGS_HDR_TRAY   8004
-#define IDC_SETTINGS_HDR_DADOS  8005
-#define IDC_SETTINGS_ALERT      8011
-#define IDC_SETTINGS_APAR       8012
-#define IDC_SETTINGS_OV_CFG     8013
-#define IDC_SETTINGS_OV_TOGGLE  8014
-#define IDC_SETTINGS_TRAY       8015
-#define IDC_SETTINGS_INTERVAL   8016
-#define IDC_SETTINGS_LOG        8017
-#define IDC_SETTINGS_SNAPSHOT   8018
+#define IDC_LISTVIEW_PROC 6002
+#define IDC_LABEL_PROC_COUNT 6003
+#define IDC_SETTINGS_TITLE 8000
+#define IDC_SETTINGS_HDR_ALERT 8001
+#define IDC_SETTINGS_HDR_APAR 8002
+#define IDC_SETTINGS_HDR_OVER 8003
+#define IDC_SETTINGS_HDR_TRAY 8004
+#define IDC_SETTINGS_HDR_DADOS 8005
+#define IDC_SETTINGS_ALERT 8011
+#define IDC_SETTINGS_APAR 8012
+#define IDC_SETTINGS_OV_CFG 8013
+#define IDC_SETTINGS_OV_TOGGLE 8014
+#define IDC_SETTINGS_TRAY 8015
+#define IDC_SETTINGS_INTERVAL 8016
+#define IDC_SETTINGS_LOG 8017
+#define IDC_SETTINGS_SNAPSHOT 8018
 
 static HWND hSettingsTitle = NULL;
 static HWND hSettingsHeaders[SETTINGS_SECTIONS] = {NULL};
@@ -313,12 +315,12 @@ static HWND hSettingsActions[SETTINGS_SECTIONS][3] = {{NULL}};
 static int g_settingsOpen[SETTINGS_SECTIONS] = {1, 1, 1, 1, 1};
 
 /* estado de ordenação do ListView */
-static int  g_lvSortCol  = 1;    /* coluna activa (0=Nome,1=PID,2=CPU,3=RAM) */
-static int  g_lvSortDesc = 1;    /* 1=descendente, 0=ascendente */
+static int g_lvSortCol = 1;  /* coluna activa (0=Nome,1=PID,2=CPU,3=RAM) */
+static int g_lvSortDesc = 1; /* 1=descendente, 0=ascendente */
 
 /* snapshot filtrado para o ListView */
 static ProcessoInfo g_lvProcessos[MAX_PROCESSES];
-static int          g_lvTotal = 0;
+static int g_lvTotal = 0;
 
 /* total bruto antes de filtrar (para o label) */
 static int g_totalProcessosBruto = 0;
@@ -1080,36 +1082,36 @@ static void DrawGraphGrid(HDC hdc, RECT rc, double maxY)
     oldPen = (HPEN)SelectObject(hdc, penGrid);
 
     if (g_mainConfig.mostrarGrelha)
-    for (i = 0; i <= 4; i++)
-    {
-        int y = rc.top + ((rc.bottom - rc.top) * i) / 4;
-        MoveToEx(hdc, rc.left, y, NULL);
-        LineTo(hdc, rc.right, y);
-
-        labelRect.left = 2;
-        labelRect.right = rc.left - 6;
-        labelRect.top = y - 8;
-        labelRect.bottom = y + 8;
-
+        for (i = 0; i <= 4; i++)
         {
-            char label[32];
-            double value = maxY * (1.0 - (double)i / 4.0);
+            int y = rc.top + ((rc.bottom - rc.top) * i) / 4;
+            MoveToEx(hdc, rc.left, y, NULL);
+            LineTo(hdc, rc.right, y);
 
-            if (maxY <= 100.0)
-                snprintf(label, sizeof(label), "%.0f", value);
-            else if (maxY >= 1048576.0)
-                snprintf(label, sizeof(label), "%.0f MB", value / 1048576.0);
-            else
-                snprintf(label, sizeof(label), "%.0f", value);
+            labelRect.left = 2;
+            labelRect.right = rc.left - 6;
+            labelRect.top = y - 8;
+            labelRect.bottom = y + 8;
 
-            oldFont = (HFONT)SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
-            SetTextColor(hdc, RGB(105, 110, 116));
-            SetBkMode(hdc, TRANSPARENT);
-            DrawTextA(hdc, label, -1, &labelRect,
-                      DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(hdc, oldFont);
+            {
+                char label[32];
+                double value = maxY * (1.0 - (double)i / 4.0);
+
+                if (maxY <= 100.0)
+                    snprintf(label, sizeof(label), "%.0f", value);
+                else if (maxY >= 1048576.0)
+                    snprintf(label, sizeof(label), "%.0f MB", value / 1048576.0);
+                else
+                    snprintf(label, sizeof(label), "%.0f", value);
+
+                oldFont = (HFONT)SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+                SetTextColor(hdc, RGB(105, 110, 116));
+                SetBkMode(hdc, TRANSPARENT);
+                DrawTextA(hdc, label, -1, &labelRect,
+                          DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(hdc, oldFont);
+            }
         }
-    }
 
     if (g_mainConfig.mostrarEixos)
     {
@@ -1324,8 +1326,10 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
 
         if (!bufferDc || !bufferBitmap)
         {
-            if (bufferDc) DeleteDC(bufferDc);
-            if (bufferBitmap) DeleteObject(bufferBitmap);
+            if (bufferDc)
+                DeleteDC(bufferDc);
+            if (bufferBitmap)
+                DeleteObject(bufferBitmap);
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -1390,8 +1394,8 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
                      alertaGlobalAtivo ? "Estado: ALERTA" : "Estado: normal",
                      processoCpuAtual, historico.count);
             SetTextColor(bufferDc, alertaGlobalAtivo
-                                      ? RGB(190, 55, 45)
-                                      : RGB(82, 91, 101));
+                                       ? RGB(190, 55, 45)
+                                       : RGB(82, 91, 101));
             DrawTextA(bufferDc, statusText, -1, &status,
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         }
@@ -1414,7 +1418,7 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
 }
 
 static void DrawAlertRegions(HDC hdc, RECT rc, const double *data,
-                              int count, double maxY, double threshold)
+                             int count, double maxY, double threshold)
 {
     HBRUSH brush;
     int i;
@@ -1443,8 +1447,7 @@ static void DrawAlertRegions(HDC hdc, RECT rc, const double *data,
         if (isnan(value) || value <= threshold)
             continue;
 
-        x1 = rc.left + (count == 1 ? 0 :
-             (int)(((double)i / (double)(count - 1)) * (rc.right - rc.left)));
+        x1 = rc.left + (count == 1 ? 0 : (int)(((double)i / (double)(count - 1)) * (rc.right - rc.left)));
         x2 = (i == count - 1)
                  ? rc.right
                  : rc.left + (int)(((double)(i + 1) / (double)(count - 1)) *
@@ -1811,12 +1814,12 @@ static void AtualizarHistoricoProcessos(void)
 }
 
 static void DesenharGraficoProcessoDetalhe(HDC hdc, RECT rc,
-                                            const char *titulo,
-                                            const double *data, int count,
-                                            double maxY, COLORREF cor)
+                                           const char *titulo,
+                                           const double *data, int count,
+                                           double maxY, COLORREF cor)
 {
-    const char *names[1] = { "Processo" };
-    COLORREF colors[1] = { cor };
+    const char *names[1] = {"Processo"};
+    COLORREF colors[1] = {cor};
     DrawGraphLegend(hdc, &rc, titulo, names, colors, 1, NULL);
     DrawGraphGrid(hdc, rc, maxY);
     DrawSeries(hdc, rc, data, count, maxY, cor, 2);
@@ -1850,8 +1853,10 @@ static LRESULT CALLBACK ProcessDetailProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         bmp = CreateCompatibleBitmap(paint, client.right, client.bottom);
         if (!dc || !bmp)
         {
-            if (dc) DeleteDC(dc);
-            if (bmp) DeleteObject(bmp);
+            if (dc)
+                DeleteDC(dc);
+            if (bmp)
+                DeleteObject(bmp);
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -1881,13 +1886,14 @@ static LRESULT CALLBACK ProcessDetailProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         {
             RECT tr = {16, 8, client.right - 16, 34};
             HFONT oldFont = (HFONT)SelectObject(dc,
-                                  GetStockObject(DEFAULT_GUI_FONT));
+                                                GetStockObject(DEFAULT_GUI_FONT));
             DrawTextA(dc, titulo, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             SelectObject(dc, oldFont);
         }
 
         mid = (client.bottom - 70) / 2 + 42;
-        if (mid < 180) mid = 180;
+        if (mid < 180)
+            mid = 180;
         {
             RECT rCpu = {58, 45, client.right - 20, mid - 12};
             RECT rRam = {58, mid + 12, client.right - 20, client.bottom - 42};
@@ -1899,10 +1905,12 @@ static LRESULT CALLBACK ProcessDetailProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 double r = serie->ram[historico.pos];
                 snprintf(cpuCur, sizeof(cpuCur), "Atual: %s",
                          isnan(c) ? "N/A" : "-");
-                if (!isnan(c)) snprintf(cpuCur, sizeof(cpuCur), "Atual: %.1f%%", c);
+                if (!isnan(c))
+                    snprintf(cpuCur, sizeof(cpuCur), "Atual: %.1f%%", c);
                 snprintf(ramCur, sizeof(ramCur), "Atual: %s",
                          isnan(r) ? "N/A" : "-");
-                if (!isnan(r)) snprintf(ramCur, sizeof(ramCur), "Atual: %.0f MB", r);
+                if (!isnan(r))
+                    snprintf(ramCur, sizeof(ramCur), "Atual: %.0f MB", r);
             }
             else
             {
@@ -1913,11 +1921,11 @@ static LRESULT CALLBACK ProcessDetailProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             if (serie)
             {
                 DesenharGraficoProcessoDetalhe(dc, rCpu, "CPU do processo",
-                                                serie->cpu, historico.count,
-                                                maxCpu, g_mainConfig.corGraficoProcesso);
+                                               serie->cpu, historico.count,
+                                               maxCpu, g_mainConfig.corGraficoProcesso);
                 DesenharGraficoProcessoDetalhe(dc, rRam, "RAM do processo",
-                                                serie->ram, historico.count,
-                                                maxRam, g_mainConfig.corGraficoRam);
+                                               serie->ram, historico.count,
+                                               maxRam, g_mainConfig.corGraficoRam);
             }
             else
             {
@@ -2092,21 +2100,55 @@ void AtualizarTituloJanela()
 
 void AtualizarTooltipTray()
 {
-    if (!trayIconAtivo)
-        return;
+    /* Atualizar sempre o szTip (mesmo sem tray visível) para que fique
+       pronto no momento em que o ícone for adicionado. */
 
     char linha[128];
     linha[0] = '\0';
-    if (g_trayConfig.mostrarCpu) snprintf(linha + strlen(linha), sizeof(linha) - strlen(linha), "CPU: %.1f%%", ultimoCpuPercent);
-    if (g_trayConfig.mostrarRam) { if(linha[0]) strncat_s(linha,sizeof(linha)," | ",_TRUNCATE); snprintf(linha + strlen(linha), sizeof(linha)-strlen(linha), "RAM: %.0f%%", ultimoRamPercent); }
-    if (g_trayConfig.mostrarTemperatura && numZonasTemp>0) { double t=0; int i; for(i=0;i<numZonasTemp;i++) t+=tempAtual[i]; if(linha[0]) strncat_s(linha,sizeof(linha)," | ",_TRUNCATE); snprintf(linha + strlen(linha), sizeof(linha)-strlen(linha), "TEMP: %.0fC", t/numZonasTemp); }
-    if (g_trayConfig.mostrarRede) { if(linha[0]) strncat_s(linha,sizeof(linha)," | ",_TRUNCATE); snprintf(linha + strlen(linha), sizeof(linha)-strlen(linha), "NET: D %.1f/U %.1f MB/s", ultimoNetDown/1048576.0, ultimoNetUp/1048576.0); }
-    if (g_trayConfig.mostrarDisco) { if(linha[0]) strncat_s(linha,sizeof(linha)," | ",_TRUNCATE); snprintf(linha + strlen(linha), sizeof(linha)-strlen(linha), "DISCO: R %.1f/W %.1f MB/s", ultimoDiskRead/1048576.0, ultimoDiskWrite/1048576.0); }
-    if (g_trayConfig.mostrarUptime) { ULONGLONG u=GetTickCount64()/1000ULL; if(linha[0]) strncat_s(linha,sizeof(linha)," | ",_TRUNCATE); snprintf(linha + strlen(linha), sizeof(linha)-strlen(linha), "UP: %lluh", (unsigned long long)(u/3600ULL)); }
-    if (!linha[0]) strcpy_s(linha,sizeof(linha),"Sem metricas selecionadas");
-    snprintf(nid.szTip, sizeof(nid.szTip), "Monitor de Hardware\r\n%s", linha);
+    if (g_trayConfig.mostrarCpu)
+        snprintf(linha + strlen(linha), sizeof(linha) - strlen(linha), "CPU: %.1f%%", ultimoCpuPercent);
+    if (g_trayConfig.mostrarRam)
+    {
+        if (linha[0])
+            strncat_s(linha, sizeof(linha), " | ", _TRUNCATE);
+        snprintf(linha + strlen(linha), sizeof(linha) - strlen(linha), "RAM: %.0f%%", ultimoRamPercent);
+    }
+    if (g_trayConfig.mostrarTemperatura && numZonasTemp > 0)
+    {
+        double t = 0;
+        int i;
+        for (i = 0; i < numZonasTemp; i++)
+            t += tempAtual[i];
+        if (linha[0])
+            strncat_s(linha, sizeof(linha), " | ", _TRUNCATE);
+        snprintf(linha + strlen(linha), sizeof(linha) - strlen(linha), "TEMP: %.0fC", t / numZonasTemp);
+    }
+    if (g_trayConfig.mostrarRede)
+    {
+        if (linha[0])
+            strncat_s(linha, sizeof(linha), " | ", _TRUNCATE);
+        snprintf(linha + strlen(linha), sizeof(linha) - strlen(linha), "NET: D %.1f/U %.1f MB/s", ultimoNetDown / 1048576.0, ultimoNetUp / 1048576.0);
+    }
+    if (g_trayConfig.mostrarDisco)
+    {
+        if (linha[0])
+            strncat_s(linha, sizeof(linha), " | ", _TRUNCATE);
+        snprintf(linha + strlen(linha), sizeof(linha) - strlen(linha), "DISCO: R %.1f/W %.1f MB/s", ultimoDiskRead / 1048576.0, ultimoDiskWrite / 1048576.0);
+    }
+    if (g_trayConfig.mostrarUptime)
+    {
+        ULONGLONG u = GetTickCount64() / 1000ULL;
+        if (linha[0])
+            strncat_s(linha, sizeof(linha), " | ", _TRUNCATE);
+        snprintf(linha + strlen(linha), sizeof(linha) - strlen(linha), "UP: %lluh", (unsigned long long)(u / 3600ULL));
+    }
+    if (!linha[0])
+        strcpy_s(linha, sizeof(linha), "Sem metricas selecionadas");
+    snprintf(nid.szTip, sizeof(nid.szTip), "WinMon\r\n%s", linha);
 
-    Shell_NotifyIconA(NIM_MODIFY, &nid);
+    /* Só notifica o Shell se o ícone estiver visível */
+    if (trayIconAtivo)
+        Shell_NotifyIconA(NIM_MODIFY, &nid);
 }
 
 void ExportarSnapshot()
@@ -2183,10 +2225,14 @@ static void MostrarAba(int indice)
     /* painel de lista de processos: mostrar/esconder cada controlo */
     {
         int visProc = (indice == 5) ? SW_SHOW : SW_HIDE;
-        if (hPainelProcessos)  ShowWindow(hPainelProcessos,  visProc);
-        if (hEditPesquisaProc) ShowWindow(hEditPesquisaProc, visProc);
-        if (hLabelProcCount)   ShowWindow(hLabelProcCount,   visProc);
-        if (hListViewProc)     ShowWindow(hListViewProc,     visProc);
+        if (hPainelProcessos)
+            ShowWindow(hPainelProcessos, visProc);
+        if (hEditPesquisaProc)
+            ShowWindow(hEditPesquisaProc, visProc);
+        if (hLabelProcCount)
+            ShowWindow(hLabelProcCount, visProc);
+        if (hListViewProc)
+            ShowWindow(hListViewProc, visProc);
     }
 
     AtualizarDefinicoesVisibilidade();
@@ -2254,7 +2300,7 @@ static void RedimensionarConteudo(HWND hwnd)
     RECT rc;
     GetClientRect(hwnd, &rc);
 
-    /* 
+    /*
      * Posições calculadas da direita para a esquerda (com margem de 4px):
      * 1. Overlay [Ctrl+O]     : Largura 118 -> X = rc.right - 122
      * 2. Engrenagem (CFG)     : Largura 26  -> X = rc.right - 152
@@ -2325,17 +2371,19 @@ static void RedimensionarConteudo(HWND hwnd)
         RedimensionarDefinicoes(&rc);
 
         {
-            int cx   = rc.left;
-            int cy   = rc.top;
-            int cw   = rc.right  - rc.left;
-            int ch   = rc.bottom - rc.top;
-            int barH = 28;          /* altura da barra de pesquisa */
-            int lblW = 74;          /* "Pesquisar:" */
-            int editW = 240;        /* caixa de texto */
-            if (editW > cw - lblW - 8) editW = cw - lblW - 8;
-            if (editW < 60) editW = 60;
+            int cx = rc.left;
+            int cy = rc.top;
+            int cw = rc.right - rc.left;
+            int ch = rc.bottom - rc.top;
+            int barH = 28;   /* altura da barra de pesquisa */
+            int lblW = 74;   /* "Pesquisar:" */
+            int editW = 240; /* caixa de texto */
+            if (editW > cw - lblW - 8)
+                editW = cw - lblW - 8;
+            if (editW < 60)
+                editW = 60;
 
-            if (hPainelProcessos)   /* label "Pesquisar:" */
+            if (hPainelProcessos) /* label "Pesquisar:" */
                 MoveWindow(hPainelProcessos,
                            cx + 4, cy + 4, lblW, 22, TRUE);
 
@@ -2373,15 +2421,16 @@ static int CompararLvProc(const void *a, const void *b)
         r = _stricmp(p1->exeFile, p2->exeFile);
         break;
     case 1: /* PID */
-        r = (p1->pid > p2->pid) ? 1 : (p1->pid < p2->pid) ? -1 : 0;
+        r = (p1->pid > p2->pid) ? 1 : (p1->pid < p2->pid) ? -1
+                                                          : 0;
         break;
     case 2: /* CPU */
-        r = (p1->cpuPercent > p2->cpuPercent) ? 1 :
-            (p1->cpuPercent < p2->cpuPercent) ? -1 : 0;
+        r = (p1->cpuPercent > p2->cpuPercent) ? 1 : (p1->cpuPercent < p2->cpuPercent) ? -1
+                                                                                      : 0;
         break;
     case 3: /* RAM */
-        r = (p1->memUsageMB > p2->memUsageMB) ? 1 :
-            (p1->memUsageMB < p2->memUsageMB) ? -1 : 0;
+        r = (p1->memUsageMB > p2->memUsageMB) ? 1 : (p1->memUsageMB < p2->memUsageMB) ? -1
+                                                                                      : 0;
         break;
     }
     return g_lvSortDesc ? -r : r;
@@ -2392,7 +2441,7 @@ static void FiltrarListaProcessos(void)
 {
     char filtro[MAX_PATH];
     char filtroLow[MAX_PATH];
-    int  i, n;
+    int i, n;
 
     filtro[0] = '\0';
     if (hEditPesquisaProc)
@@ -2454,7 +2503,7 @@ static void FiltrarListaProcessos(void)
 static void AtualizarListViewProcessos(void)
 {
     char buf[64];
-    int  i;
+    int i;
 
     if (!hListViewProc)
         return;
@@ -2525,7 +2574,7 @@ static void LvProcColumnClick(int col)
         g_lvSortDesc = !g_lvSortDesc;
     else
     {
-        g_lvSortCol  = col;
+        g_lvSortCol = col;
         g_lvSortDesc = (col == 2 || col == 3); /* CPU/RAM desc por omissão */
     }
     AtualizarListViewProcessos();
@@ -2544,11 +2593,11 @@ static void CriarPainelProcessos(HWND hwndPai)
     HINSTANCE hInst = GetModuleHandle(NULL);
 
     /* Label "Pesquisar:" — filho directo da janela principal */
-    hPainelProcessos = CreateWindowExA(         /* reutilizamos como label */
-        0, "STATIC", "Pesquisar:",
-        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 74, 22,
-        hwndPai, NULL, hInst, NULL);
+    hPainelProcessos = CreateWindowExA(/* reutilizamos como label */
+                                       0, "STATIC", "Pesquisar:",
+                                       WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
+                                       0, 0, 74, 22,
+                                       hwndPai, NULL, hInst, NULL);
 
     /* Edit de pesquisa */
     hEditPesquisaProc = CreateWindowExA(
@@ -2572,7 +2621,7 @@ static void CriarPainelProcessos(HWND hwndPai)
     {
         INITCOMMONCONTROLSEX icc2;
         icc2.dwSize = sizeof(icc2);
-        icc2.dwICC  = ICC_LISTVIEW_CLASSES;
+        icc2.dwICC = ICC_LISTVIEW_CLASSES;
         InitCommonControlsEx(&icc2);
     }
 
@@ -2591,22 +2640,30 @@ static void CriarPainelProcessos(HWND hwndPai)
         return;
 
     ListView_SetExtendedListViewStyle(hListViewProc,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+                                      LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
 
     /* Colunas */
     ZeroMemory(&lvc, sizeof(lvc));
     lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
 
-    lvc.pszText = "Nome";     lvc.cx = 220; lvc.fmt = LVCFMT_LEFT;
+    lvc.pszText = "Nome";
+    lvc.cx = 220;
+    lvc.fmt = LVCFMT_LEFT;
     ListView_InsertColumn(hListViewProc, 0, &lvc);
 
-    lvc.pszText = "PID";      lvc.cx = 70;  lvc.fmt = LVCFMT_RIGHT;
+    lvc.pszText = "PID";
+    lvc.cx = 70;
+    lvc.fmt = LVCFMT_RIGHT;
     ListView_InsertColumn(hListViewProc, 1, &lvc);
 
-    lvc.pszText = "CPU (%)";  lvc.cx = 90;  lvc.fmt = LVCFMT_RIGHT;
+    lvc.pszText = "CPU (%)";
+    lvc.cx = 90;
+    lvc.fmt = LVCFMT_RIGHT;
     ListView_InsertColumn(hListViewProc, 2, &lvc);
 
-    lvc.pszText = "RAM (MB)"; lvc.cx = 90;  lvc.fmt = LVCFMT_RIGHT;
+    lvc.pszText = "RAM (MB)";
+    lvc.cx = 90;
+    lvc.fmt = LVCFMT_RIGHT;
     ListView_InsertColumn(hListViewProc, 3, &lvc);
 }
 
@@ -2631,11 +2688,21 @@ static void AtualizarDefinicoesVisibilidade(void)
             const char *nome;
             switch (i)
             {
-            case 0: nome = "Alertas e limites"; break;
-            case 1: nome = "Aparencia"; break;
-            case 2: nome = "Overlay"; break;
-            case 3: nome = "Tray"; break;
-            default: nome = "Atualizacao e dados"; break;
+            case 0:
+                nome = "Alertas e limites";
+                break;
+            case 1:
+                nome = "Aparencia";
+                break;
+            case 2:
+                nome = "Overlay";
+                break;
+            case 3:
+                nome = "Tray";
+                break;
+            default:
+                nome = "Atualizacao e dados";
+                break;
             }
             snprintf(texto, sizeof(texto), "%s %s",
                      g_settingsOpen[i] ? "[-]" : "[+]", nome);
@@ -2648,7 +2715,8 @@ static void AtualizarDefinicoesVisibilidade(void)
             if (hSettingsActions[i][j])
                 ShowWindow(hSettingsActions[i][j],
                            (abaAtual == 6 && g_settingsOpen[i] && j < (i == 2 ? 2 : (i == 4 ? 3 : 1)))
-                               ? SW_SHOW : SW_HIDE);
+                               ? SW_SHOW
+                               : SW_HIDE);
         }
     }
 
@@ -2704,8 +2772,7 @@ static void CriarPainelDefinicoes(HWND hwndPai)
         {"Estilo e cores da janela principal", NULL, NULL},
         {"Configurar overlay", "Ativar overlay", NULL},
         {"Personalizar Tray", NULL, NULL},
-        {"Mudar intervalo de atualizacao", "Iniciar/parar log CSV", "Exportar snapshot"}
-    };
+        {"Mudar intervalo de atualizacao", "Iniciar/parar log CSV", "Exportar snapshot"}};
     const int headerIds[SETTINGS_SECTIONS] = {
         IDC_SETTINGS_HDR_ALERT, IDC_SETTINGS_HDR_APAR, IDC_SETTINGS_HDR_OVER,
         IDC_SETTINGS_HDR_TRAY, IDC_SETTINGS_HDR_DADOS};
@@ -2714,8 +2781,7 @@ static void CriarPainelDefinicoes(HWND hwndPai)
         {IDC_SETTINGS_APAR, 0, 0},
         {IDC_SETTINGS_OV_CFG, IDC_SETTINGS_OV_TOGGLE, 0},
         {IDC_SETTINGS_TRAY, 0, 0},
-        {IDC_SETTINGS_INTERVAL, IDC_SETTINGS_LOG, IDC_SETTINGS_SNAPSHOT}
-    };
+        {IDC_SETTINGS_INTERVAL, IDC_SETTINGS_LOG, IDC_SETTINGS_SNAPSHOT}};
     int i, j;
 
     hSettingsTitle = CreateWindowExA(
@@ -2992,51 +3058,107 @@ static void CiclarIntervaloAtualizacao(void)
 static void CarregarConfigVisual(void)
 {
     char val[32];
-    GetPrivateProfileStringA("Aparencia", "FundoGrafico", "16579578", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corFundoGrafico=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "Grelha", "15262945", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGrelhaGrafico=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "Eixo", "12499380", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corEixoGrafico=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "TextoGrafico", "3157032", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corTextoGrafico=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "Cpu", "13792035", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGraficoCpu=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "Ram", "12143505", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGraficoRam=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "DiscoRead", "13137960", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGraficoDiscoRead=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "DiscoWrite", "2980055", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGraficoDiscoWrite=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "NetDown", "6262307", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGraficoNetDown=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "NetUp", "5263565", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGraficoNetUp=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "Processo", "4605645", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGraficoProcesso=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "Core", "6263125", val, sizeof(val), INI_FICHEIRO); g_mainConfig.corGraficoCore=(COLORREF)strtoul(val,NULL,10);
-    GetPrivateProfileStringA("Aparencia", "Espessura", "2", val, sizeof(val), INI_FICHEIRO); g_mainConfig.espessuraLinhas=atoi(val);
-    GetPrivateProfileStringA("Aparencia", "MostrarGrelha", "1", val, sizeof(val), INI_FICHEIRO); g_mainConfig.mostrarGrelha=atoi(val)!=0;
-    GetPrivateProfileStringA("Aparencia", "MostrarEixos", "1", val, sizeof(val), INI_FICHEIRO); g_mainConfig.mostrarEixos=atoi(val)!=0;
-    if(g_mainConfig.espessuraLinhas<1||g_mainConfig.espessuraLinhas>5) g_mainConfig.espessuraLinhas=2;
+    GetPrivateProfileStringA("Aparencia", "FundoGrafico", "16579578", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corFundoGrafico = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "Grelha", "15262945", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGrelhaGrafico = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "Eixo", "12499380", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corEixoGrafico = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "TextoGrafico", "3157032", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corTextoGrafico = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "Cpu", "13792035", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoCpu = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "Ram", "12143505", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoRam = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "DiscoRead", "13137960", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoDiscoRead = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "DiscoWrite", "2980055", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoDiscoWrite = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "NetDown", "6262307", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoNetDown = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "NetUp", "5263565", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoNetUp = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "Processo", "4605645", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoProcesso = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "Core", "6263125", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoCore = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "Espessura", "2", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.espessuraLinhas = atoi(val);
+    GetPrivateProfileStringA("Aparencia", "MostrarGrelha", "1", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.mostrarGrelha = atoi(val) != 0;
+    GetPrivateProfileStringA("Aparencia", "MostrarEixos", "1", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.mostrarEixos = atoi(val) != 0;
+    if (g_mainConfig.espessuraLinhas < 1 || g_mainConfig.espessuraLinhas > 5)
+        g_mainConfig.espessuraLinhas = 2;
 }
 
 static void GravarConfigVisual(void)
 {
     char val[32];
-#define WV(k,v) do { snprintf(val,sizeof(val),"%lu",(unsigned long)(v)); WritePrivateProfileStringA("Aparencia",k,val,INI_FICHEIRO); } while(0)
-    WV("FundoGrafico",g_mainConfig.corFundoGrafico); WV("Grelha",g_mainConfig.corGrelhaGrafico); WV("Eixo",g_mainConfig.corEixoGrafico); WV("TextoGrafico",g_mainConfig.corTextoGrafico);
-    WV("Cpu",g_mainConfig.corGraficoCpu); WV("Ram",g_mainConfig.corGraficoRam); WV("DiscoRead",g_mainConfig.corGraficoDiscoRead); WV("DiscoWrite",g_mainConfig.corGraficoDiscoWrite);
-    WV("NetDown",g_mainConfig.corGraficoNetDown); WV("NetUp",g_mainConfig.corGraficoNetUp); WV("Processo",g_mainConfig.corGraficoProcesso); WV("Core",g_mainConfig.corGraficoCore);
-    WV("Espessura",g_mainConfig.espessuraLinhas); WV("MostrarGrelha",g_mainConfig.mostrarGrelha); WV("MostrarEixos",g_mainConfig.mostrarEixos);
+#define WV(k, v)                                                       \
+    do                                                                 \
+    {                                                                  \
+        snprintf(val, sizeof(val), "%lu", (unsigned long)(v));         \
+        WritePrivateProfileStringA("Aparencia", k, val, INI_FICHEIRO); \
+    } while (0)
+    WV("FundoGrafico", g_mainConfig.corFundoGrafico);
+    WV("Grelha", g_mainConfig.corGrelhaGrafico);
+    WV("Eixo", g_mainConfig.corEixoGrafico);
+    WV("TextoGrafico", g_mainConfig.corTextoGrafico);
+    WV("Cpu", g_mainConfig.corGraficoCpu);
+    WV("Ram", g_mainConfig.corGraficoRam);
+    WV("DiscoRead", g_mainConfig.corGraficoDiscoRead);
+    WV("DiscoWrite", g_mainConfig.corGraficoDiscoWrite);
+    WV("NetDown", g_mainConfig.corGraficoNetDown);
+    WV("NetUp", g_mainConfig.corGraficoNetUp);
+    WV("Processo", g_mainConfig.corGraficoProcesso);
+    WV("Core", g_mainConfig.corGraficoCore);
+    WV("Espessura", g_mainConfig.espessuraLinhas);
+    WV("MostrarGrelha", g_mainConfig.mostrarGrelha);
+    WV("MostrarEixos", g_mainConfig.mostrarEixos);
 #undef WV
 }
 
 static void CarregarConfigTray(void)
 {
     char val[16];
-#define RV(k,d) GetPrivateProfileStringA("Tray",k,d,val,sizeof(val),INI_FICHEIRO)
-    RV("MostrarCPU","1"); g_trayConfig.mostrarCpu=atoi(val); RV("MostrarRAM","1"); g_trayConfig.mostrarRam=atoi(val); RV("MostrarTemp","0"); g_trayConfig.mostrarTemperatura=atoi(val);
-    RV("MostrarRede","0"); g_trayConfig.mostrarRede=atoi(val); RV("MostrarDisco","0"); g_trayConfig.mostrarDisco=atoi(val); RV("MostrarUptime","0"); g_trayConfig.mostrarUptime=atoi(val);
-    RV("Clique","1"); g_trayConfig.restaurarComClique=atoi(val); RV("DuploClique","0"); g_trayConfig.restaurarComDuploClique=atoi(val);
+#define RV(k, d) GetPrivateProfileStringA("Tray", k, d, val, sizeof(val), INI_FICHEIRO)
+    RV("MostrarCPU", "1");
+    g_trayConfig.mostrarCpu = atoi(val);
+    RV("MostrarRAM", "1");
+    g_trayConfig.mostrarRam = atoi(val);
+    RV("MostrarTemp", "0");
+    g_trayConfig.mostrarTemperatura = atoi(val);
+    RV("MostrarRede", "0");
+    g_trayConfig.mostrarRede = atoi(val);
+    RV("MostrarDisco", "0");
+    g_trayConfig.mostrarDisco = atoi(val);
+    RV("MostrarUptime", "0");
+    g_trayConfig.mostrarUptime = atoi(val);
+    RV("Clique", "1");
+    g_trayConfig.restaurarComClique = atoi(val);
+    RV("DuploClique", "0");
+    g_trayConfig.restaurarComDuploClique = atoi(val);
 #undef RV
 }
 
 static void GravarConfigTray(void)
 {
     char val[16];
-#define WVTR(k,v) do { snprintf(val,sizeof(val),"%d",(v)); WritePrivateProfileStringA("Tray",k,val,INI_FICHEIRO); } while(0)
-    WVTR("MostrarCPU",g_trayConfig.mostrarCpu); WVTR("MostrarRAM",g_trayConfig.mostrarRam); WVTR("MostrarTemp",g_trayConfig.mostrarTemperatura); WVTR("MostrarRede",g_trayConfig.mostrarRede);
-    WVTR("MostrarDisco",g_trayConfig.mostrarDisco); WVTR("MostrarUptime",g_trayConfig.mostrarUptime); WVTR("Clique",g_trayConfig.restaurarComClique); WVTR("DuploClique",g_trayConfig.restaurarComDuploClique);
+#define WVTR(k, v)                                                \
+    do                                                            \
+    {                                                             \
+        snprintf(val, sizeof(val), "%d", (v));                    \
+        WritePrivateProfileStringA("Tray", k, val, INI_FICHEIRO); \
+    } while (0)
+    WVTR("MostrarCPU", g_trayConfig.mostrarCpu);
+    WVTR("MostrarRAM", g_trayConfig.mostrarRam);
+    WVTR("MostrarTemp", g_trayConfig.mostrarTemperatura);
+    WVTR("MostrarRede", g_trayConfig.mostrarRede);
+    WVTR("MostrarDisco", g_trayConfig.mostrarDisco);
+    WVTR("MostrarUptime", g_trayConfig.mostrarUptime);
+    WVTR("Clique", g_trayConfig.restaurarComClique);
+    WVTR("DuploClique", g_trayConfig.restaurarComDuploClique);
 #undef WVTR
 }
 
@@ -3256,46 +3378,151 @@ static INT_PTR CALLBACK DialogoEstiloMainProc(HWND hDlg, UINT msg,
     switch (msg)
     {
     case WM_INITDIALOG:
-        { char tb[16]; snprintf(tb,sizeof(tb),"%d",g_mainConfig.espessuraLinhas); SetDlgItemTextA(hDlg,IDC_MAIN_SPIN_THICK,tb); CheckDlgButton(hDlg,IDC_MAIN_CHK_GRID,g_mainConfig.mostrarGrelha?BST_CHECKED:BST_UNCHECKED); CheckDlgButton(hDlg,IDC_MAIN_CHK_AXIS,g_mainConfig.mostrarEixos?BST_CHECKED:BST_UNCHECKED); }
+    {
+        char tb[16];
+        snprintf(tb, sizeof(tb), "%d", g_mainConfig.espessuraLinhas);
+        SetDlgItemTextA(hDlg, IDC_MAIN_SPIN_THICK, tb);
+        CheckDlgButton(hDlg, IDC_MAIN_CHK_GRID, g_mainConfig.mostrarGrelha ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_MAIN_CHK_AXIS, g_mainConfig.mostrarEixos ? BST_CHECKED : BST_UNCHECKED);
+    }
         return TRUE;
 
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
         case IDC_MAIN_BTN_FONTE:
-            if (SelecionarFonte(hDlg, &g_mainConfig.fonteEdit)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); }
+            if (SelecionarFonte(hDlg, &g_mainConfig.fonteEdit))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
             return TRUE;
 
         case IDC_MAIN_BTN_BG:
-            if (SelecionarCor(hDlg, &g_mainConfig.corFundoEdit)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); }
+            if (SelecionarCor(hDlg, &g_mainConfig.corFundoEdit))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
             return TRUE;
 
         case IDC_MAIN_BTN_TEXT:
-            if (SelecionarCor(hDlg, &g_mainConfig.corTextoEdit)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); }
+            if (SelecionarCor(hDlg, &g_mainConfig.corTextoEdit))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
             return TRUE;
 
         case IDC_MAIN_BTN_GCPU:
-            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoCpu)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); }
+            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoCpu))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
             return TRUE;
 
         case IDC_MAIN_BTN_GRAM:
-            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoRam)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); }
+            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoRam))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
             return TRUE;
 
-        case IDC_MAIN_BTN_GDISKR: if (SelecionarCor(hDlg,&g_mainConfig.corGraficoDiscoRead)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GDISKW: if (SelecionarCor(hDlg,&g_mainConfig.corGraficoDiscoWrite)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GNETD: if (SelecionarCor(hDlg,&g_mainConfig.corGraficoNetDown)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GNETU: if (SelecionarCor(hDlg,&g_mainConfig.corGraficoNetUp)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GPROC: if (SelecionarCor(hDlg,&g_mainConfig.corGraficoProcesso)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GCORE: if (SelecionarCor(hDlg,&g_mainConfig.corGraficoCore)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GBG: if (SelecionarCor(hDlg,&g_mainConfig.corFundoGrafico)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GGRID: if (SelecionarCor(hDlg,&g_mainConfig.corGrelhaGrafico)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GAXIS: if (SelecionarCor(hDlg,&g_mainConfig.corEixoGrafico)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_BTN_GTEXT: if (SelecionarCor(hDlg,&g_mainConfig.corTextoGrafico)) { AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); } return TRUE;
-        case IDC_MAIN_CHK_GRID: g_mainConfig.mostrarGrelha=(IsDlgButtonChecked(hDlg,IDC_MAIN_CHK_GRID)==BST_CHECKED); AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); return TRUE;
-        case IDC_MAIN_CHK_AXIS: g_mainConfig.mostrarEixos=(IsDlgButtonChecked(hDlg,IDC_MAIN_CHK_AXIS)==BST_CHECKED); AplicarEstiloJanelaPrincipal(); GravarConfigVisual(); return TRUE;
+        case IDC_MAIN_BTN_GDISKR:
+            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoDiscoRead))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GDISKW:
+            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoDiscoWrite))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GNETD:
+            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoNetDown))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GNETU:
+            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoNetUp))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GPROC:
+            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoProcesso))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GCORE:
+            if (SelecionarCor(hDlg, &g_mainConfig.corGraficoCore))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GBG:
+            if (SelecionarCor(hDlg, &g_mainConfig.corFundoGrafico))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GGRID:
+            if (SelecionarCor(hDlg, &g_mainConfig.corGrelhaGrafico))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GAXIS:
+            if (SelecionarCor(hDlg, &g_mainConfig.corEixoGrafico))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_BTN_GTEXT:
+            if (SelecionarCor(hDlg, &g_mainConfig.corTextoGrafico))
+            {
+                AplicarEstiloJanelaPrincipal();
+                GravarConfigVisual();
+            }
+            return TRUE;
+        case IDC_MAIN_CHK_GRID:
+            g_mainConfig.mostrarGrelha = (IsDlgButtonChecked(hDlg, IDC_MAIN_CHK_GRID) == BST_CHECKED);
+            AplicarEstiloJanelaPrincipal();
+            GravarConfigVisual();
+            return TRUE;
+        case IDC_MAIN_CHK_AXIS:
+            g_mainConfig.mostrarEixos = (IsDlgButtonChecked(hDlg, IDC_MAIN_CHK_AXIS) == BST_CHECKED);
+            AplicarEstiloJanelaPrincipal();
+            GravarConfigVisual();
+            return TRUE;
         case IDOK:
-            { char tb[16]; GetDlgItemTextA(hDlg,IDC_MAIN_SPIN_THICK,tb,sizeof(tb)); { int t=atoi(tb); if(t>=1&&t<=5) g_mainConfig.espessuraLinhas=t; } GravarConfigVisual(); AplicarEstiloJanelaPrincipal(); EndDialog(hDlg,IDOK); }
+        {
+            char tb[16];
+            GetDlgItemTextA(hDlg, IDC_MAIN_SPIN_THICK, tb, sizeof(tb));
+            {
+                int t = atoi(tb);
+                if (t >= 1 && t <= 5)
+                    g_mainConfig.espessuraLinhas = t;
+            }
+            GravarConfigVisual();
+            AplicarEstiloJanelaPrincipal();
+            EndDialog(hDlg, IDOK);
+        }
             return TRUE;
         case IDCANCEL:
             EndDialog(hDlg, IDCANCEL);
@@ -3408,40 +3635,107 @@ static void MostrarDialogoEstiloPrincipal(HWND hwndPai)
 static INT_PTR CALLBACK DialogoConfigTrayProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     (void)lParam;
-    if(msg==WM_INITDIALOG){
-        CheckDlgButton(hDlg,IDC_TRAY_CPU,g_trayConfig.mostrarCpu?BST_CHECKED:BST_UNCHECKED); CheckDlgButton(hDlg,IDC_TRAY_RAM,g_trayConfig.mostrarRam?BST_CHECKED:BST_UNCHECKED);
-        CheckDlgButton(hDlg,IDC_TRAY_TEMP,g_trayConfig.mostrarTemperatura?BST_CHECKED:BST_UNCHECKED); CheckDlgButton(hDlg,IDC_TRAY_NET,g_trayConfig.mostrarRede?BST_CHECKED:BST_UNCHECKED);
-        CheckDlgButton(hDlg,IDC_TRAY_DISK,g_trayConfig.mostrarDisco?BST_CHECKED:BST_UNCHECKED); CheckDlgButton(hDlg,IDC_TRAY_UPTIME,g_trayConfig.mostrarUptime?BST_CHECKED:BST_UNCHECKED);
-        CheckDlgButton(hDlg,IDC_TRAY_CLICK,g_trayConfig.restaurarComClique?BST_CHECKED:BST_UNCHECKED); CheckDlgButton(hDlg,IDC_TRAY_DBLCLICK,g_trayConfig.restaurarComDuploClique?BST_CHECKED:BST_UNCHECKED); return TRUE;
+    if (msg == WM_INITDIALOG)
+    {
+        CheckDlgButton(hDlg, IDC_TRAY_CPU, g_trayConfig.mostrarCpu ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_TRAY_RAM, g_trayConfig.mostrarRam ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_TRAY_TEMP, g_trayConfig.mostrarTemperatura ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_TRAY_NET, g_trayConfig.mostrarRede ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_TRAY_DISK, g_trayConfig.mostrarDisco ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_TRAY_UPTIME, g_trayConfig.mostrarUptime ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_TRAY_CLICK, g_trayConfig.restaurarComClique ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_TRAY_DBLCLICK, g_trayConfig.restaurarComDuploClique ? BST_CHECKED : BST_UNCHECKED);
+        return TRUE;
     }
-    if(msg==WM_COMMAND && LOWORD(wParam)==IDOK){
-        g_trayConfig.mostrarCpu=IsDlgButtonChecked(hDlg,IDC_TRAY_CPU)==BST_CHECKED; g_trayConfig.mostrarRam=IsDlgButtonChecked(hDlg,IDC_TRAY_RAM)==BST_CHECKED;
-        g_trayConfig.mostrarTemperatura=IsDlgButtonChecked(hDlg,IDC_TRAY_TEMP)==BST_CHECKED; g_trayConfig.mostrarRede=IsDlgButtonChecked(hDlg,IDC_TRAY_NET)==BST_CHECKED;
-        g_trayConfig.mostrarDisco=IsDlgButtonChecked(hDlg,IDC_TRAY_DISK)==BST_CHECKED; g_trayConfig.mostrarUptime=IsDlgButtonChecked(hDlg,IDC_TRAY_UPTIME)==BST_CHECKED;
-        g_trayConfig.restaurarComClique=IsDlgButtonChecked(hDlg,IDC_TRAY_CLICK)==BST_CHECKED; g_trayConfig.restaurarComDuploClique=IsDlgButtonChecked(hDlg,IDC_TRAY_DBLCLICK)==BST_CHECKED;
-        GravarConfigTray(); AtualizarTooltipTray(); EndDialog(hDlg,IDOK); return TRUE;
+    if (msg == WM_COMMAND && LOWORD(wParam) == IDOK)
+    {
+        g_trayConfig.mostrarCpu = IsDlgButtonChecked(hDlg, IDC_TRAY_CPU) == BST_CHECKED;
+        g_trayConfig.mostrarRam = IsDlgButtonChecked(hDlg, IDC_TRAY_RAM) == BST_CHECKED;
+        g_trayConfig.mostrarTemperatura = IsDlgButtonChecked(hDlg, IDC_TRAY_TEMP) == BST_CHECKED;
+        g_trayConfig.mostrarRede = IsDlgButtonChecked(hDlg, IDC_TRAY_NET) == BST_CHECKED;
+        g_trayConfig.mostrarDisco = IsDlgButtonChecked(hDlg, IDC_TRAY_DISK) == BST_CHECKED;
+        g_trayConfig.mostrarUptime = IsDlgButtonChecked(hDlg, IDC_TRAY_UPTIME) == BST_CHECKED;
+        g_trayConfig.restaurarComClique = IsDlgButtonChecked(hDlg, IDC_TRAY_CLICK) == BST_CHECKED;
+        g_trayConfig.restaurarComDuploClique = IsDlgButtonChecked(hDlg, IDC_TRAY_DBLCLICK) == BST_CHECKED;
+        GravarConfigTray();
+        AtualizarTooltipTray();
+        EndDialog(hDlg, IDOK);
+        return TRUE;
     }
-    if(msg==WM_COMMAND && LOWORD(wParam)==IDCANCEL){EndDialog(hDlg,IDCANCEL);return TRUE;}
-    if(msg==WM_CLOSE){EndDialog(hDlg,IDCANCEL);return TRUE;} return FALSE;
+    if (msg == WM_COMMAND && LOWORD(wParam) == IDCANCEL)
+    {
+        EndDialog(hDlg, IDCANCEL);
+        return TRUE;
+    }
+    if (msg == WM_CLOSE)
+    {
+        EndDialog(hDlg, IDCANCEL);
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static void MostrarDialogoConfigTray(HWND hwndPai)
 {
-    static WORD b[768]; WORD *p=b;
-#define WSTR(s) do{const wchar_t *q=(s);while(*q)*p++=(WORD)*q++;*p++=0;}while(0)
-#define AL() do{if(((ULONG_PTR)p)&2)p++;}while(0)
-#define CTRL(st,ex,xx,yy,ww,hh,iid,cls,txt) do{AL(); DLGITEMTEMPLATE *it=(DLGITEMTEMPLATE*)p; it->style=(st);it->dwExtendedStyle=(ex);it->x=(xx);it->y=(yy);it->cx=(ww);it->cy=(hh);it->id=(iid);p+=sizeof(DLGITEMTEMPLATE)/sizeof(WORD);*p++=0xFFFF;*p++=(cls);WSTR(txt);*p++=0;}while(0)
-    DLGTEMPLATE *d=(DLGTEMPLATE*)p; d->style=WS_POPUP|WS_CAPTION|WS_SYSMENU|DS_MODALFRAME|DS_CENTER|DS_SETFONT;d->dwExtendedStyle=0;d->cdit=10;d->x=0;d->y=0;d->cx=230;d->cy=185;p+=sizeof(DLGTEMPLATE)/sizeof(WORD);*p++=0;*p++=0;WSTR(L"Personalizar Tray Icon");*p++=9;WSTR(L"Segoe UI");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,8,10,210,12,IDC_TRAY_CPU,0x0080,L"Mostrar CPU no tooltip");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,8,27,210,12,IDC_TRAY_RAM,0x0080,L"Mostrar RAM no tooltip");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,8,44,210,12,IDC_TRAY_TEMP,0x0080,L"Mostrar temperatura");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,8,61,210,12,IDC_TRAY_NET,0x0080,L"Mostrar rede");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,8,78,210,12,IDC_TRAY_DISK,0x0080,L"Mostrar disco I/O");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,8,95,210,12,IDC_TRAY_UPTIME,0x0080,L"Mostrar uptime (tooltip)");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,8,112,210,12,IDC_TRAY_CLICK,0x0080,L"Clique esquerdo restaura janela");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,8,129,210,12,IDC_TRAY_DBLCLICK,0x0080,L"Duplo clique restaura janela");
-    CTRL(WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,0,55,151,55,14,IDOK,0x0080,L"OK"); CTRL(WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,0,120,151,55,14,IDCANCEL,0x0080,L"Cancelar");
-    DialogBoxIndirectA(GetModuleHandle(NULL),(LPDLGTEMPLATE)b,hwndPai,DialogoConfigTrayProc);
+    static WORD b[768];
+    WORD *p = b;
+#define WSTR(s)                  \
+    do                           \
+    {                            \
+        const wchar_t *q = (s);  \
+        while (*q)               \
+            *p++ = (WORD) * q++; \
+        *p++ = 0;                \
+    } while (0)
+#define AL()                    \
+    do                          \
+    {                           \
+        if (((ULONG_PTR)p) & 2) \
+            p++;                \
+    } while (0)
+#define CTRL(st, ex, xx, yy, ww, hh, iid, cls, txt)  \
+    do                                               \
+    {                                                \
+        AL();                                        \
+        DLGITEMTEMPLATE *it = (DLGITEMTEMPLATE *)p;  \
+        it->style = (st);                            \
+        it->dwExtendedStyle = (ex);                  \
+        it->x = (xx);                                \
+        it->y = (yy);                                \
+        it->cx = (ww);                               \
+        it->cy = (hh);                               \
+        it->id = (iid);                              \
+        p += sizeof(DLGITEMTEMPLATE) / sizeof(WORD); \
+        *p++ = 0xFFFF;                               \
+        *p++ = (cls);                                \
+        WSTR(txt);                                   \
+        *p++ = 0;                                    \
+    } while (0)
+    DLGTEMPLATE *d = (DLGTEMPLATE *)p;
+    d->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT;
+    d->dwExtendedStyle = 0;
+    d->cdit = 10;
+    d->x = 0;
+    d->y = 0;
+    d->cx = 230;
+    d->cy = 185;
+    p += sizeof(DLGTEMPLATE) / sizeof(WORD);
+    *p++ = 0;
+    *p++ = 0;
+    WSTR(L"Personalizar Tray Icon");
+    *p++ = 9;
+    WSTR(L"Segoe UI");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 8, 10, 210, 12, IDC_TRAY_CPU, 0x0080, L"Mostrar CPU no tooltip");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 8, 27, 210, 12, IDC_TRAY_RAM, 0x0080, L"Mostrar RAM no tooltip");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 8, 44, 210, 12, IDC_TRAY_TEMP, 0x0080, L"Mostrar temperatura");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 8, 61, 210, 12, IDC_TRAY_NET, 0x0080, L"Mostrar rede");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 8, 78, 210, 12, IDC_TRAY_DISK, 0x0080, L"Mostrar disco I/O");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 8, 95, 210, 12, IDC_TRAY_UPTIME, 0x0080, L"Mostrar uptime (tooltip)");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 8, 112, 210, 12, IDC_TRAY_CLICK, 0x0080, L"Clique esquerdo restaura janela");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 8, 129, 210, 12, IDC_TRAY_DBLCLICK, 0x0080, L"Duplo clique restaura janela");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 55, 151, 55, 14, IDOK, 0x0080, L"OK");
+    CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 120, 151, 55, 14, IDCANCEL, 0x0080, L"Cancelar");
+    DialogBoxIndirectA(GetModuleHandle(NULL), (LPDLGTEMPLATE)b, hwndPai, DialogoConfigTrayProc);
 #undef WSTR
 #undef AL
 #undef CTRL
@@ -3740,7 +4034,13 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[0].corTextoValor = RGB(230, 232, 235);
     ovPerfis[0].corBarraCpu = RGB(100, 190, 255);
     ovPerfis[0].corBarraRam = RGB(110, 220, 140);
-    ovPerfis[0].corBarraTemp = RGB(255, 180, 50); ovPerfis[0].corBarraDisco = RGB(215,120,45); ovPerfis[0].corBarraNet = RGB(35,145,95); ovPerfis[0].corSeparador = RGB(45,47,52); ovPerfis[0].mostrarBarras=1; ovPerfis[0].mostrarSeparadores=1; ovPerfis[0].espessuraBorda=1;
+    ovPerfis[0].corBarraTemp = RGB(255, 180, 50);
+    ovPerfis[0].corBarraDisco = RGB(215, 120, 45);
+    ovPerfis[0].corBarraNet = RGB(35, 145, 95);
+    ovPerfis[0].corSeparador = RGB(45, 47, 52);
+    ovPerfis[0].mostrarBarras = 1;
+    ovPerfis[0].mostrarSeparadores = 1;
+    ovPerfis[0].espessuraBorda = 1;
 
     strncpy_s(ovPerfis[1].nome, OV_NOME_MAX, "Trabalho", _TRUNCATE);
     ovPerfis[1].fontePt = 13;
@@ -3756,7 +4056,13 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[1].corTextoValor = RGB(240, 242, 245);
     ovPerfis[1].corBarraCpu = RGB(120, 200, 255);
     ovPerfis[1].corBarraRam = RGB(130, 230, 150);
-    ovPerfis[1].corBarraTemp = RGB(255, 180, 50); ovPerfis[1].corBarraDisco = RGB(215,120,45); ovPerfis[1].corBarraNet = RGB(35,145,95); ovPerfis[1].corSeparador = RGB(45,47,52); ovPerfis[1].mostrarBarras=1; ovPerfis[1].mostrarSeparadores=1; ovPerfis[1].espessuraBorda=1;
+    ovPerfis[1].corBarraTemp = RGB(255, 180, 50);
+    ovPerfis[1].corBarraDisco = RGB(215, 120, 45);
+    ovPerfis[1].corBarraNet = RGB(35, 145, 95);
+    ovPerfis[1].corSeparador = RGB(45, 47, 52);
+    ovPerfis[1].mostrarBarras = 1;
+    ovPerfis[1].mostrarSeparadores = 1;
+    ovPerfis[1].espessuraBorda = 1;
 
     strncpy_s(ovPerfis[2].nome, OV_NOME_MAX, "Completo", _TRUNCATE);
     ovPerfis[2].fontePt = 13;
@@ -3772,7 +4078,13 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[2].corTextoValor = RGB(230, 232, 235);
     ovPerfis[2].corBarraCpu = RGB(100, 190, 255);
     ovPerfis[2].corBarraRam = RGB(110, 220, 140);
-    ovPerfis[2].corBarraTemp = RGB(255, 180, 50); ovPerfis[2].corBarraDisco = RGB(215,120,45); ovPerfis[2].corBarraNet = RGB(35,145,95); ovPerfis[2].corSeparador = RGB(45,47,52); ovPerfis[2].mostrarBarras=1; ovPerfis[2].mostrarSeparadores=1; ovPerfis[2].espessuraBorda=1;
+    ovPerfis[2].corBarraTemp = RGB(255, 180, 50);
+    ovPerfis[2].corBarraDisco = RGB(215, 120, 45);
+    ovPerfis[2].corBarraNet = RGB(35, 145, 95);
+    ovPerfis[2].corSeparador = RGB(45, 47, 52);
+    ovPerfis[2].mostrarBarras = 1;
+    ovPerfis[2].mostrarSeparadores = 1;
+    ovPerfis[2].espessuraBorda = 1;
 
     ovNumPerfis = 3;
     ovPerfilActivo = 2;
@@ -3833,14 +4145,22 @@ static void GravarPerfisOverlay(void)
         RegSetValueExA(hk, "CorTextoValor", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
         v = (DWORD)ovPerfis[i].corBarraCpu;
         RegSetValueExA(hk, "CorBarraCpu", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-        v = (DWORD)ovPerfis[i].corBarraRam; RegSetValueExA(hk, "CorBarraRam", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-        v = (DWORD)ovPerfis[i].corBarraTemp; RegSetValueExA(hk, "CorBarraTemp", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-        v = (DWORD)ovPerfis[i].corBarraDisco; RegSetValueExA(hk, "CorBarraDisco", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-        v = (DWORD)ovPerfis[i].corBarraNet; RegSetValueExA(hk, "CorBarraNet", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-        v = (DWORD)ovPerfis[i].corSeparador; RegSetValueExA(hk, "CorSeparador", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-        v = (DWORD)ovPerfis[i].mostrarBarras; RegSetValueExA(hk, "MostrarBarras", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-        v = (DWORD)ovPerfis[i].mostrarSeparadores; RegSetValueExA(hk, "MostrarSeparadores", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
-        v = (DWORD)ovPerfis[i].espessuraBorda; RegSetValueExA(hk, "EspessuraBorda", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].corBarraRam;
+        RegSetValueExA(hk, "CorBarraRam", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].corBarraTemp;
+        RegSetValueExA(hk, "CorBarraTemp", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].corBarraDisco;
+        RegSetValueExA(hk, "CorBarraDisco", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].corBarraNet;
+        RegSetValueExA(hk, "CorBarraNet", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].corSeparador;
+        RegSetValueExA(hk, "CorSeparador", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarBarras;
+        RegSetValueExA(hk, "MostrarBarras", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarSeparadores;
+        RegSetValueExA(hk, "MostrarSeparadores", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].espessuraBorda;
+        RegSetValueExA(hk, "EspessuraBorda", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
 
         RegCloseKey(hk);
     }
@@ -3912,13 +4232,20 @@ static void CarregarPerfisOverlay(void)
             ovPerfis[i].corBarraCpu = (COLORREF)v;
         if (RegQueryValueExA(hk, "CorBarraRam", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].corBarraRam = (COLORREF)v;
-        if (RegQueryValueExA(hk, "CorBarraTemp", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) ovPerfis[i].corBarraTemp=(COLORREF)v;
-        if (RegQueryValueExA(hk, "CorBarraDisco", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) ovPerfis[i].corBarraDisco=(COLORREF)v;
-        if (RegQueryValueExA(hk, "CorBarraNet", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) ovPerfis[i].corBarraNet=(COLORREF)v;
-        if (RegQueryValueExA(hk, "CorSeparador", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) ovPerfis[i].corSeparador=(COLORREF)v;
-        if (RegQueryValueExA(hk, "MostrarBarras", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) ovPerfis[i].mostrarBarras=(int)v;
-        if (RegQueryValueExA(hk, "MostrarSeparadores", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) ovPerfis[i].mostrarSeparadores=(int)v;
-        if (RegQueryValueExA(hk, "EspessuraBorda", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) ovPerfis[i].espessuraBorda=(int)v;
+        if (RegQueryValueExA(hk, "CorBarraTemp", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].corBarraTemp = (COLORREF)v;
+        if (RegQueryValueExA(hk, "CorBarraDisco", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].corBarraDisco = (COLORREF)v;
+        if (RegQueryValueExA(hk, "CorBarraNet", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].corBarraNet = (COLORREF)v;
+        if (RegQueryValueExA(hk, "CorSeparador", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].corSeparador = (COLORREF)v;
+        if (RegQueryValueExA(hk, "MostrarBarras", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarBarras = (int)v;
+        if (RegQueryValueExA(hk, "MostrarSeparadores", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarSeparadores = (int)v;
+        if (RegQueryValueExA(hk, "EspessuraBorda", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].espessuraBorda = (int)v;
 
         if (ovPerfis[i].fontePt < OV_FONT_MIN)
             ovPerfis[i].fontePt = OV_FONT_MIN;
@@ -3992,8 +4319,7 @@ static void SnapOverlayAoCanto(void)
         {wa.left, wa.top},
         {wa.right - ovTotalW, wa.top},
         {wa.left, wa.bottom - ovTotalH},
-        {wa.right - ovTotalW, wa.bottom - ovTotalH}
-    };
+        {wa.right - ovTotalW, wa.bottom - ovTotalH}};
 
     distMin = OV_SNAP_DIST + 1;
 
@@ -4143,8 +4469,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         FillRect(hdc, &rc, bgBrush);
         DeleteObject(bgBrush);
 
-        COLORREF corBordaAtual = (overlayAlertaVisivel ? RGB(220, 45, 45) :
-                                  ovPerfis[ovPerfilActivo].corBorda);
+        COLORREF corBordaAtual = (overlayAlertaVisivel ? RGB(220, 45, 45) : ovPerfis[ovPerfilActivo].corBorda);
         int espBordaAtual = overlayAlertaVisivel
                                 ? max(2, ovPerfis[ovPerfilActivo].espessuraBorda + 1)
                                 : ovPerfis[ovPerfilActivo].espessuraBorda;
@@ -4238,7 +4563,12 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 
         if (OV_NET)
         {
-            if (ovPerfis[ovPerfilActivo].mostrarSeparadores) { SelectObject(hdc, penSep); MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, rc.bottom - OV_PAD); }
+            if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
+            {
+                SelectObject(hdc, penSep);
+                MoveToEx(hdc, cx, cy, NULL);
+                LineTo(hdc, cx, rc.bottom - OV_PAD);
+            }
 
             FormatarBytes(ultimoNetDown, dBuf, sizeof(dBuf));
             FormatarBytes(ultimoNetUp, uBuf, sizeof(uBuf));
@@ -4251,7 +4581,12 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 
         if (OV_TEMP)
         {
-            if (ovPerfis[ovPerfilActivo].mostrarSeparadores) { SelectObject(hdc, penSep); MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, rc.bottom - OV_PAD); }
+            if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
+            {
+                SelectObject(hdc, penSep);
+                MoveToEx(hdc, cx, cy, NULL);
+                LineTo(hdc, cx, rc.bottom - OV_PAD);
+            }
 
             if (numZonasTemp > 0)
             {
@@ -4284,7 +4619,12 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 
         if (OV_DISCO)
         {
-            if (ovPerfis[ovPerfilActivo].mostrarSeparadores) { SelectObject(hdc, penSep); MoveToEx(hdc, cx, cy, NULL); LineTo(hdc, cx, rc.bottom - OV_PAD); }
+            if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
+            {
+                SelectObject(hdc, penSep);
+                MoveToEx(hdc, cx, cy, NULL);
+                LineTo(hdc, cx, rc.bottom - OV_PAD);
+            }
 
             FormatarBytes(ultimoDiskRead, dBuf, sizeof(dBuf));
             FormatarBytes(ultimoDiskWrite, uBuf, sizeof(uBuf));
@@ -4442,7 +4782,8 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
         CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, OV_CLICKTHRU ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[ovPerfilActivo].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[ovPerfilActivo].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
-        snprintf(buf,sizeof(buf),"%d",ovPerfis[ovPerfilActivo].espessuraBorda); SetDlgItemTextA(hDlg,IDC_OV_BORDERW,buf);
+        snprintf(buf, sizeof(buf), "%d", ovPerfis[ovPerfilActivo].espessuraBorda);
+        SetDlgItemTextA(hDlg, IDC_OV_BORDERW, buf);
 
         EnableWindow(GetDlgItem(hDlg, IDC_OV_BTN_APAGAR), ovPerfilActivo >= 3 ? TRUE : FALSE);
         return TRUE;
@@ -4470,8 +4811,10 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
                 CheckDlgButton(hDlg, IDC_OV_DISCO, ovPerfis[sel].mostrarDisco ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_NET, ovPerfis[sel].mostrarNet ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, ovPerfis[sel].clickThrough ? BST_CHECKED : BST_UNCHECKED);
-                CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[sel].mostrarBarras ? BST_CHECKED : BST_UNCHECKED); CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[sel].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
-                snprintf(buf,sizeof(buf),"%d",ovPerfis[sel].espessuraBorda); SetDlgItemTextA(hDlg,IDC_OV_BORDERW,buf);
+                CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[sel].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[sel].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
+                snprintf(buf, sizeof(buf), "%d", ovPerfis[sel].espessuraBorda);
+                SetDlgItemTextA(hDlg, IDC_OV_BORDERW, buf);
                 EnableWindow(GetDlgItem(hDlg, IDC_OV_BTN_APAGAR), sel >= 3 ? TRUE : FALSE);
             }
             return TRUE;
@@ -4514,10 +4857,30 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
             return TRUE;
         }
 
-        if (id == IDC_OV_BTN_COR_TEMP) { if (SelecionarCor(hDlg,&ovPerfis[ovPerfilActivo].corBarraTemp)) AtivarPerfil(ovPerfilActivo); return TRUE; }
-        if (id == IDC_OV_BTN_COR_DISCO) { if (SelecionarCor(hDlg,&ovPerfis[ovPerfilActivo].corBarraDisco)) AtivarPerfil(ovPerfilActivo); return TRUE; }
-        if (id == IDC_OV_BTN_COR_NET) { if (SelecionarCor(hDlg,&ovPerfis[ovPerfilActivo].corBarraNet)) AtivarPerfil(ovPerfilActivo); return TRUE; }
-        if (id == IDC_OV_BTN_COR_SEP) { if (SelecionarCor(hDlg,&ovPerfis[ovPerfilActivo].corSeparador)) AtivarPerfil(ovPerfilActivo); return TRUE; }
+        if (id == IDC_OV_BTN_COR_TEMP)
+        {
+            if (SelecionarCor(hDlg, &ovPerfis[ovPerfilActivo].corBarraTemp))
+                AtivarPerfil(ovPerfilActivo);
+            return TRUE;
+        }
+        if (id == IDC_OV_BTN_COR_DISCO)
+        {
+            if (SelecionarCor(hDlg, &ovPerfis[ovPerfilActivo].corBarraDisco))
+                AtivarPerfil(ovPerfilActivo);
+            return TRUE;
+        }
+        if (id == IDC_OV_BTN_COR_NET)
+        {
+            if (SelecionarCor(hDlg, &ovPerfis[ovPerfilActivo].corBarraNet))
+                AtivarPerfil(ovPerfilActivo);
+            return TRUE;
+        }
+        if (id == IDC_OV_BTN_COR_SEP)
+        {
+            if (SelecionarCor(hDlg, &ovPerfis[ovPerfilActivo].corSeparador))
+                AtivarPerfil(ovPerfilActivo);
+            return TRUE;
+        }
 
         if (id == IDC_OV_BTN_NOVO)
         {
@@ -4594,7 +4957,15 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
             ovPerfis[sel].clickThrough = (IsDlgButtonChecked(hDlg, IDC_OV_CLICKTHRU) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarBarras = (IsDlgButtonChecked(hDlg, IDC_OV_BARRAS) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarSeparadores = (IsDlgButtonChecked(hDlg, IDC_OV_SEPARADORES) == BST_CHECKED) ? 1 : 0;
-            GetDlgItemTextA(hDlg, IDC_OV_BORDERW, buf, sizeof(buf)); { int bw=atoi(buf); if(bw<1)bw=1;if(bw>4)bw=4;ovPerfis[sel].espessuraBorda=bw; }
+            GetDlgItemTextA(hDlg, IDC_OV_BORDERW, buf, sizeof(buf));
+            {
+                int bw = atoi(buf);
+                if (bw < 1)
+                    bw = 1;
+                if (bw > 4)
+                    bw = 4;
+                ovPerfis[sel].espessuraBorda = bw;
+            }
 
             AtivarPerfil(sel);
             GravarPerfisOverlay();
@@ -4961,6 +5332,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                   "Monitor de Hardware", _TRUNCATE);
 
         SetTimer(hwnd, TIMER_ID, intervaloAtualizacaoMs, NULL);
+
+        /* Registar hotkey global Ctrl+Shift+O para toggle overlay */
+        if (!RegisterHotKey(hwnd, HOTKEY_ID_OVERLAY,
+                            HOTKEY_MOD_OVERLAY, HOTKEY_VK_OVERLAY))
+        {
+            /* Se falhar (outra instância ou conflito), não é fatal */
+        }
+
         return 0;
     }
 
@@ -5032,6 +5411,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         break;
     }
 
+    case WM_CLOSE:
+        /* Minimiza para tray em vez de terminar */
+        ShowWindow(hwnd, SW_HIDE);
+        if (!trayIconAtivo)
+        {
+            Shell_NotifyIconA(NIM_ADD, &nid);
+            trayIconAtivo = 1;
+            /* Tooltip inicial imediato */
+            AtualizarTooltipTray();
+        }
+        return 0;
+
     case WM_SYSCOMMAND:
         if ((wParam & 0xFFF0) == SC_MINIMIZE)
         {
@@ -5041,6 +5432,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             {
                 Shell_NotifyIconA(NIM_ADD, &nid);
                 trayIconAtivo = 1;
+                AtualizarTooltipTray();
             }
 
             return 0;
@@ -5071,15 +5463,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 
                 AppendMenuA(hMenu, MF_STRING, ID_TRAY_RESTORE, "Restaurar janela");
+                AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+
                 AppendMenuA(hMenu, MF_STRING | (overlayAtivo ? MF_CHECKED : MF_UNCHECKED),
                             ID_TOGGLE_OVERLAY, "Overlay [Ctrl+O]");
+                AppendMenuA(hMenu, MF_STRING, ID_CONFIG_ESTILO_MAIN, "Estilo e cores... [Ctrl+E]");
+                AppendMenuA(hMenu, MF_STRING, ID_CONFIG_TRAY, "Configurar tray...");
                 AppendMenuA(hMenu, MF_STRING, ID_CONFIG_SETTINGS, "Definicoes... [Ctrl+D]");
                 AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 
                 AppendMenuA(hMenu, MF_STRING, ID_TOGGLE_LOG,
                             logAtivo ? "Parar log CSV" : "Iniciar log CSV");
-                AppendMenuA(hMenu, MF_STRING,
-                            ID_EXPORT_SNAPSHOT, "Exportar snapshot");
+                AppendMenuA(hMenu, MF_STRING, ID_EXPORT_SNAPSHOT, "Exportar snapshot");
                 AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 
                 AppendMenuA(hMenu, MF_STRING, ID_TRAY_EXIT, "Sair");
@@ -5093,7 +5488,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                                pt.x, pt.y, 0, hwnd, NULL);
 
                 PostMessage(hwnd, WM_NULL, 0, 0);
-
                 DestroyMenu(hMenu);
             }
         }
@@ -5263,12 +5657,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         }
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
 
+    case WM_HOTKEY:
+        if ((int)wParam == HOTKEY_ID_OVERLAY)
+        {
+            ToggleOverlay();
+            AtualizarDefinicoesVisibilidade();
+        }
+        return 0;
+
     case WM_TIMER:
         if (wParam == TIMER_ID)
             AtualizarMonitor();
         return 0;
 
     case WM_DESTROY:
+        UnregisterHotKey(hwnd, HOTKEY_ID_OVERLAY);
         KillTimer(hwnd, TIMER_ID);
 
         FecharOverlay();
