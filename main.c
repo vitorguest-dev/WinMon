@@ -98,8 +98,11 @@ static const IID LOCAL_IID_IWbemLocator =
 
 /* Hotkey global: Ctrl+Shift+O para toggle do overlay */
 #define HOTKEY_ID_OVERLAY  1
+#define HOTKEY_ID_COMPACT  2
 #define HOTKEY_MOD_OVERLAY (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT)
 #define HOTKEY_VK_OVERLAY  'O'
+#define HOTKEY_MOD_COMPACT (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT)
+#define HOTKEY_VK_COMPACT  'C'
 
 #define OV_FONT_MIN 8
 #define OV_FONT_MAX 32
@@ -110,11 +113,14 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_RESUMO 2001
 #define TAB_CPU 2002
 #define TAB_MEMORIA 2003
-#define TAB_DISCO 2004
-#define TAB_REDE 2005
-#define TAB_PROCESSOS 2006
-#define TAB_DEFINICOES 2007
+#define TAB_TEMPERATURA 2004
+#define TAB_DISCO 2005
+#define TAB_REDE 2006
+#define TAB_PROCESSOS 2007
+#define TAB_DEFINICOES 2008
 #define NAV_LARGURA 148
+#define NUM_ABAS 8
+#define ALERT_HISTORY_MAX 100
 
 #define MAX_TEMP_ZONAS 16
 #define BALLOON_COOLDOWN_SEGUNDOS 30
@@ -164,6 +170,7 @@ typedef struct
 {
     double cpu[HISTORICO_PONTOS];
     double ram[HISTORICO_PONTOS];
+    double temp[HISTORICO_PONTOS];
     double diskRead[HISTORICO_PONTOS];
     double diskWrite[HISTORICO_PONTOS];
     double netDown[HISTORICO_PONTOS];
@@ -290,12 +297,13 @@ HWND hMainWindow = NULL;
 HWND hEdit = NULL;
 HWND hTab = NULL;
 HWND hDashboard = NULL;
-HWND hNav[7] = {NULL};
+HWND hNav[NUM_ABAS] = {NULL};
 HWND hBtnOverlay = NULL;
 HWND hBtnInterval = NULL;
 HWND hBtnEstiloMain = NULL;
 HWND hGraphCPU = NULL;
 HWND hGraphRAM = NULL;
+HWND hGraphTemp = NULL;
 HWND hGraphDisk = NULL;
 HWND hGraphNet = NULL;
 HWND hGraphProcesses = NULL;
@@ -325,6 +333,8 @@ HWND hLabelProcCount = NULL;   /* "N processos" */
 #define IDC_SETTINGS_LOG 8017
 #define IDC_SETTINGS_SNAPSHOT 8018
 #define IDC_SETTINGS_COMPACT 8019
+#define IDC_SETTINGS_ALERT_HISTORY 8020
+#define IDC_ALERT_HISTORY_CLEAR 8030
 
 static HWND hSettingsTitle = NULL;
 static HWND hSettingsHeaders[SETTINGS_SECTIONS] = {NULL};
@@ -368,12 +378,28 @@ static double ultimoRamPercent = 0.0;
 static double ultimoCpuPercent = 0.0;
 static double ultimoDiskRead = 0.0;
 static double ultimoDiskWrite = 0.0;
+static double ultimoDiscoUsoPercent = 0.0;
 static double ultimoNetDown = 0.0;
 static double ultimoNetUp = 0.0;
 
 static IntervaloAlerta intervalosAlerta[MAX_ALERT_RANGES];
 static int totalIntervalosAlerta = 0;
 static int alertaGlobalAtivo = 0;
+
+typedef struct
+{
+    SYSTEMTIME timestamp;
+    char recurso[32];
+    double valor;
+    double limite;
+} AlertaHistoricoItem;
+
+static AlertaHistoricoItem g_alertHistory[ALERT_HISTORY_MAX];
+static int g_alertHistoryCount = 0;
+static int g_alertCpuAnterior = 0;
+static int g_alertRamAnterior = 0;
+static int g_alertDiscoAnterior = 0;
+static HWND hAlertHistory = NULL;
 
 static HWND hOverlay = NULL;
 static int overlayAtivo = 0;
@@ -437,7 +463,7 @@ typedef struct
     int dragStartEnd;
 } GraphViewState;
 
-static GraphViewState g_graphViews[5] = {
+static GraphViewState g_graphViews[6] = {
     {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
     {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
     {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
@@ -612,7 +638,47 @@ static int HistoricoIndex(int offset)
     return idx;
 }
 
-static void AdicionarHistorico(double cpu, double ram,
+static double ObterTemperaturaMaxima(void)
+{
+    double maxTemp = 0.0;
+    int i;
+    for (i = 0; i < numZonasTemp; i++)
+        if (tempAtual[i] > maxTemp) maxTemp = tempAtual[i];
+    return maxTemp;
+}
+
+static void RegistarEventoAlerta(const char *recurso, double valor, double limite)
+{
+    AlertaHistoricoItem *item;
+    if (g_alertHistoryCount >= ALERT_HISTORY_MAX)
+    {
+        memmove(&g_alertHistory[0], &g_alertHistory[1],
+                sizeof(g_alertHistory[0]) * (ALERT_HISTORY_MAX - 1));
+        g_alertHistoryCount = ALERT_HISTORY_MAX - 1;
+    }
+    item = &g_alertHistory[g_alertHistoryCount++];
+    GetLocalTime(&item->timestamp);
+    strncpy_s(item->recurso, sizeof(item->recurso), recurso, _TRUNCATE);
+    item->valor = valor;
+    item->limite = limite;
+}
+
+static void AtualizarHistoricoAlertas(void)
+{
+    int cpu = ultimoCpuPercent > limiteCpuPercent;
+    int ram = ultimoRamPercent > limiteRamPercent;
+    int disco = ultimoDiscoUsoPercent > limiteDiscoPercent;
+    if (cpu && !g_alertCpuAnterior) RegistarEventoAlerta("CPU", ultimoCpuPercent, limiteCpuPercent);
+    if (ram && !g_alertRamAnterior) RegistarEventoAlerta("RAM", ultimoRamPercent, limiteRamPercent);
+    if (disco && !g_alertDiscoAnterior) RegistarEventoAlerta("Disco", ultimoDiscoUsoPercent, limiteDiscoPercent);
+    g_alertCpuAnterior = cpu;
+    g_alertRamAnterior = ram;
+    g_alertDiscoAnterior = disco;
+}
+
+static void MostrarDialogoHistoricoAlertas(HWND hwndPai);
+
+static void AdicionarHistorico(double cpu, double ram, double temp,
                                double diskRead, double diskWrite,
                                double netDown, double netUp)
 {
@@ -621,6 +687,7 @@ static void AdicionarHistorico(double cpu, double ram,
     historico.pos = (historico.pos + 1) % HISTORICO_PONTOS;
     historico.cpu[historico.pos] = cpu;
     historico.ram[historico.pos] = ram;
+    historico.temp[historico.pos] = temp;
     historico.diskRead[historico.pos] = diskRead;
     historico.diskWrite[historico.pos] = diskWrite;
     historico.netDown[historico.pos] = netDown;
@@ -795,6 +862,7 @@ void MonitorarRAM(char *buffer, size_t size, size_t *offset)
 void MonitorarDiscos(char *buffer, size_t size, size_t *offset)
 {
     DWORD drives = GetLogicalDrives();
+    ultimoDiscoUsoPercent = 0.0;
     char driveLetter[] = "A:\\";
     int i;
 
@@ -1128,6 +1196,7 @@ typedef enum GraphType
 {
     GRAPH_CPU,
     GRAPH_RAM,
+    GRAPH_TEMP,
     GRAPH_DISK,
     GRAPH_NET,
     GRAPH_PROCESS
@@ -1840,6 +1909,22 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
         break;
     }
 
+    case GRAPH_TEMP:
+    {
+        names[0] = "Temperatura";
+        colors[0] = g_mainConfig.corGraficoCpu;
+        n = 1;
+        snprintf(currentText, sizeof(currentText),
+                 "Atual: %.1f C", numZonasTemp > 0 ? historico.temp[historico.pos] : 0.0);
+        DrawGraphLegend(hdc, &client, "Temperatura — historico temporal",
+                        names, colors, n, currentText);
+        DrawGraphGrid(hdc, graph, 100.0);
+        DrawSeriesView(hdc, graph, historico.temp, viewStart, viewCount,
+                       100.0, colors[0], g_mainConfig.espessuraLinhas);
+        DrawTimeLabelsView(hdc, graph, viewStart, viewCount);
+        break;
+    }
+
     case GRAPH_DISK:
     {
         double maxVal = 1024.0 * 1024.0;
@@ -2526,6 +2611,7 @@ static void AplicarEstiloJanelaPrincipal(void)
 
     InvalidateRect(hGraphCPU, NULL, FALSE);
     InvalidateRect(hGraphRAM, NULL, FALSE);
+    InvalidateRect(hGraphTemp, NULL, FALSE);
     InvalidateRect(hGraphDisk, NULL, FALSE);
     InvalidateRect(hGraphNet, NULL, FALSE);
     InvalidateRect(hGraphProcesses, NULL, FALSE);
@@ -2534,22 +2620,14 @@ static void AplicarEstiloJanelaPrincipal(void)
 
 void AtualizarTituloJanela()
 {
-    if (g_compactMode)
-    {
-        SetWindowTextA(hMainWindow, alertaGlobalAtivo ?
-                       "WinMon — Compacto  [!]" : "WinMon — Compacto");
-    }
-    else if (alertaGlobalAtivo)
-    {
-        SetWindowTextA(hMainWindow,
-                       "Monitor de Hardware & Sistema (Win32) v6  —  [!] ALERTA");
-    }
-    else
-    {
-        SetWindowTextA(hMainWindow,
-                       "Monitor de Hardware & Sistema (Win32) v6");
-    }
+    char titulo[160];
+    const char *base = g_compactMode ? "WinMon — Compacto" : "WinMon — Hardware";
+    snprintf(titulo, sizeof(titulo), "%s | CPU %.1f%% | RAM %.0f%%%s",
+             base, ultimoCpuPercent, ultimoRamPercent,
+             alertaGlobalAtivo ? " | [!] ALERTA" : "");
+    SetWindowTextA(hMainWindow, titulo);
 }
+
 
 void AtualizarTooltipTray()
 {
@@ -2797,11 +2875,11 @@ static void MostrarAba(int indice)
         return;
     /* índices 1-4 mapeiam para gráficos; índice 5 é o painel de processos */
     HWND graficos[] = {
-        hGraphCPU, hGraphRAM, hGraphDisk, hGraphNet};
+        hGraphCPU, hGraphRAM, hGraphTemp, hGraphDisk, hGraphNet};
 
     abaAtual = indice;
 
-    for (i = 0; i < 7; i++)
+    for (i = 0; i < NUM_ABAS; i++)
     {
         if (hNav[i])
             SendMessage(hNav[i], BM_SETSTATE, i == indice, 0);
@@ -2813,7 +2891,7 @@ static void MostrarAba(int indice)
     if (hDashboard)
         ShowWindow(hDashboard, indice == 0 ? SW_SHOW : SW_HIDE);
 
-    for (i = 0; i < 4; i++)
+    for (i = 0; i < 5; i++)
     {
         if (graficos[i])
             ShowWindow(graficos[i], indice == i + 1 ? SW_SHOW : SW_HIDE);
@@ -2824,11 +2902,11 @@ static void MostrarAba(int indice)
         ShowWindow(hGraphProcesses, SW_HIDE);
 
     if (hBtnGraphPNG)
-        ShowWindow(hBtnGraphPNG, (indice >= 1 && indice <= 4) ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnGraphPNG, (indice >= 1 && indice <= 5) ? SW_SHOW : SW_HIDE);
 
     /* painel de lista de processos: mostrar/esconder cada controlo */
     {
-        int visProc = (indice == 5) ? SW_SHOW : SW_HIDE;
+        int visProc = (indice == 6) ? SW_SHOW : SW_HIDE;
         if (hPainelProcessos)
             ShowWindow(hPainelProcessos, visProc);
         if (hEditPesquisaProc)
@@ -2913,7 +2991,7 @@ static void RedimensionarConteudo(HWND hwnd)
 
     /*
      * Posições calculadas da direita para a esquerda (com margem de 4px):
-     * 1. Overlay [Ctrl+O]     : Largura 118 -> X = rc.right - 122
+     * 1. Overlay [Ctrl+Shift+O]     : Largura 118 -> X = rc.right - 122
      * 2. Engrenagem (CFG)     : Largura 26  -> X = rc.right - 152
      * 3. Atualizacao: X s     : Largura 116 -> X = rc.right - 272
      * 4. Definicoes [Ctrl+D]  : Largura 116 -> X = rc.right - 392
@@ -2945,7 +3023,7 @@ static void RedimensionarConteudo(HWND hwnd)
         TabCtrl_AdjustRect(hTab, FALSE, &rc);
         rc.left += NAV_LARGURA;
 
-        for (int i = 0; i < 7; i++)
+        for (int i = 0; i < NUM_ABAS; i++)
         {
             if (hNav[i])
                 MoveWindow(hNav[i], 12, 42 + i * 38,
@@ -2967,6 +3045,10 @@ static void RedimensionarConteudo(HWND hwnd)
 
         if (hGraphRAM)
             MoveWindow(hGraphRAM, rc.left, rc.top,
+                       rc.right - rc.left, rc.bottom - rc.top, TRUE);
+
+        if (hGraphTemp)
+            MoveWindow(hGraphTemp, rc.left, rc.top,
                        rc.right - rc.left, rc.bottom - rc.top, TRUE);
 
         if (hGraphDisk)
@@ -3292,7 +3374,7 @@ static void AtualizarDefinicoesVisibilidade(void)
     int i, j;
 
     if (hSettingsTitle)
-        ShowWindow(hSettingsTitle, abaAtual == 6 ? SW_SHOW : SW_HIDE);
+        ShowWindow(hSettingsTitle, abaAtual == 7 ? SW_SHOW : SW_HIDE);
 
     for (i = 0; i < SETTINGS_SECTIONS; i++)
     {
@@ -3321,14 +3403,14 @@ static void AtualizarDefinicoesVisibilidade(void)
             snprintf(texto, sizeof(texto), "%s %s",
                      g_settingsOpen[i] ? "[-]" : "[+]", nome);
             SetWindowTextA(hSettingsHeaders[i], texto);
-            ShowWindow(hSettingsHeaders[i], abaAtual == 6 ? SW_SHOW : SW_HIDE);
+            ShowWindow(hSettingsHeaders[i], abaAtual == 7 ? SW_SHOW : SW_HIDE);
         }
 
         for (j = 0; j < 4; j++)
         {
             if (hSettingsActions[i][j])
                 ShowWindow(hSettingsActions[i][j],
-                           (abaAtual == 6 && g_settingsOpen[i] && j < (i == 2 ? 3 : (i == 4 ? 3 : 1)))
+                           (abaAtual == 7 && g_settingsOpen[i] && j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 3 : 1))))
                                ? SW_SHOW
                                : SW_HIDE);
         }
@@ -3370,7 +3452,7 @@ static void RedimensionarDefinicoes(const RECT *content)
             if (hSettingsActions[i][j])
                 MoveWindow(hSettingsActions[i][j], x + 24, y,
                            (w > 270 ? 250 : w - 24), 24, TRUE);
-            if (g_settingsOpen[i] && (j < (i == 2 ? 3 : (i == 4 ? 3 : 1))))
+            if (g_settingsOpen[i] && (j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 3 : 1)))))
                 y += 30;
         }
         y += 8;
@@ -3385,7 +3467,7 @@ static void CriarPainelDefinicoes(HWND hwndPai)
         "[-] Alertas e limites", "[-] Aparencia", "[-] Overlay",
         "[-] Tray", "[-] Atualizacao e dados"};
     const char *actions[SETTINGS_SECTIONS][4] = {
-        {"Configurar limites de alerta", NULL, NULL, NULL},
+        {"Configurar limites de alerta", "Historico de alertas", NULL, NULL},
         {"Estilo e cores da janela principal", NULL, NULL, NULL},
         {"Configurar overlay", "Ativar overlay", "Modo compacto", NULL},
         {"Personalizar Tray", NULL, NULL, NULL},
@@ -3394,7 +3476,7 @@ static void CriarPainelDefinicoes(HWND hwndPai)
         IDC_SETTINGS_HDR_ALERT, IDC_SETTINGS_HDR_APAR, IDC_SETTINGS_HDR_OVER,
         IDC_SETTINGS_HDR_TRAY, IDC_SETTINGS_HDR_DADOS};
     const int actionIds[SETTINGS_SECTIONS][4] = {
-        {IDC_SETTINGS_ALERT, 0, 0, 0},
+        {IDC_SETTINGS_ALERT, IDC_SETTINGS_ALERT_HISTORY, 0, 0},
         {IDC_SETTINGS_APAR, 0, 0, 0},
         {IDC_SETTINGS_OV_CFG, IDC_SETTINGS_OV_TOGGLE, IDC_SETTINGS_COMPACT, 0},
         {IDC_SETTINGS_TRAY, 0, 0, 0},
@@ -3432,7 +3514,7 @@ static void CriarAbas(HWND hwnd)
 {
     TCITEMA item;
     const char *nomes[] = {
-        "Resumo", "CPU", "Memoria", "Disco", "Rede", "Processos", "Definicoes"};
+        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "Processos", "Definicoes"};
     int i;
 
     hTab = CreateWindowExA(
@@ -3444,7 +3526,7 @@ static void CriarAbas(HWND hwnd)
     ZeroMemory(&item, sizeof(item));
     item.mask = TCIF_TEXT;
 
-    for (i = 0; i < 7; i++)
+    for (i = 0; i < NUM_ABAS; i++)
     {
         item.pszText = (LPSTR)nomes[i];
         TabCtrl_InsertItem(hTab, i, &item);
@@ -3452,9 +3534,9 @@ static void CriarAbas(HWND hwnd)
 
     {
         const char *navNomes[] = {
-            "Visao geral", "CPU", "Memoria", "Disco", "Rede", "Processos", "Definicoes"};
+            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "Processos", "Definicoes"};
 
-        for (i = 0; i < 7; i++)
+        for (i = 0; i < NUM_ABAS; i++)
         {
             hNav[i] = CreateWindowExA(
                 0, "BUTTON", navNomes[i],
@@ -3489,6 +3571,7 @@ static void CriarAbas(HWND hwnd)
 
     hGraphCPU = CriarGrafico(hwnd, GRAPH_CPU);
     hGraphRAM = CriarGrafico(hwnd, GRAPH_RAM);
+    hGraphTemp = CriarGrafico(hwnd, GRAPH_TEMP);
     hGraphDisk = CriarGrafico(hwnd, GRAPH_DISK);
     hGraphNet = CriarGrafico(hwnd, GRAPH_NET);
     hGraphProcesses = CriarGrafico(hwnd, GRAPH_PROCESS);
@@ -3504,7 +3587,7 @@ static void CriarAbas(HWND hwnd)
     ShowWindow(hCompact, SW_HIDE);
 
     hBtnOverlay = CreateWindowExA(
-        0, "BUTTON", "Overlay [Ctrl+O]",
+        0, "BUTTON", "Overlay [Ctrl+Shift+O]",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         0, 0, 118, 22,
         hwnd, (HMENU)(UINT_PTR)ID_TOGGLE_OVERLAY,
@@ -5937,6 +6020,7 @@ void AtualizarMonitor()
     AdicionarHistorico(
         ultimoCpuPercent,
         ultimoRamPercent,
+        ObterTemperaturaMaxima(),
         ultimoDiskRead,
         ultimoDiskWrite,
         ultimoNetDown,
@@ -5955,6 +6039,7 @@ void AtualizarMonitor()
 
     SetWindowTextA(hEdit, buffer);
     AplicarCoresDeAlerta();
+    AtualizarHistoricoAlertas();
     AtualizarTituloJanela();
     AtualizarTooltipTray();
     VerificarAlertasBalloon();
@@ -5965,6 +6050,7 @@ void AtualizarMonitor()
 
     InvalidateRect(hGraphCPU, NULL, FALSE);
     InvalidateRect(hGraphRAM, NULL, FALSE);
+    InvalidateRect(hGraphTemp, NULL, FALSE);
     InvalidateRect(hGraphDisk, NULL, FALSE);
     InvalidateRect(hGraphNet, NULL, FALSE);
     InvalidateRect(hGraphProcesses, NULL, FALSE);
@@ -6088,7 +6174,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         if (!RegisterHotKey(hwnd, HOTKEY_ID_OVERLAY,
                             HOTKEY_MOD_OVERLAY, HOTKEY_VK_OVERLAY))
         {
-            /* Se falhar (outra instância ou conflito), não é fatal */
+        }
+        if (!RegisterHotKey(hwnd, HOTKEY_ID_COMPACT,
+                            HOTKEY_MOD_COMPACT, HOTKEY_VK_COMPACT))
+        {
         }
 
         return 0;
@@ -6217,7 +6306,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 
                 AppendMenuA(hMenu, MF_STRING | (overlayAtivo ? MF_CHECKED : MF_UNCHECKED),
-                            ID_TOGGLE_OVERLAY, "Overlay [Ctrl+O]");
+                            ID_TOGGLE_OVERLAY, "Overlay [Ctrl+Shift+O]");
                 AppendMenuA(hMenu, MF_STRING, ID_CONFIG_ESTILO_MAIN, "Estilo e cores... [Ctrl+E]");
                 AppendMenuA(hMenu, MF_STRING, ID_CONFIG_TRAY, "Configurar tray...");
                 AppendMenuA(hMenu, MF_STRING, ID_CONFIG_SETTINGS, "Definicoes... [Ctrl+D]");
@@ -6279,6 +6368,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             MostrarDialogoAlertas(hwnd);
             return 0;
         }
+        if (LOWORD(wParam) == IDC_SETTINGS_ALERT_HISTORY)
+        {
+            MostrarDialogoHistoricoAlertas(hwnd);
+            return 0;
+        }
         if (LOWORD(wParam) == IDC_SETTINGS_APAR)
         {
             MostrarDialogoEstiloPrincipal(hwnd);
@@ -6338,11 +6432,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         }
         if (LOWORD(wParam) == ID_EXPORT_GRAPH_PNG)
         {
-            if (abaAtual >= 1 && abaAtual <= 4)
+            if (abaAtual >= 1 && abaAtual <= 5)
             {
                 HWND graph = (abaAtual == 1) ? hGraphCPU :
                              (abaAtual == 2) ? hGraphRAM :
-                             (abaAtual == 3) ? hGraphDisk : hGraphNet;
+                             (abaAtual == 3) ? hGraphTemp :
+                             (abaAtual == 4) ? hGraphDisk : hGraphNet;
                 ExportarGraficoPNG(graph);
             }
             return 0;
@@ -6378,8 +6473,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         }
         if (LOWORD(wParam) == ID_CONFIG_SETTINGS)
         {
-            TabCtrl_SetCurSel(hTab, 6);
-            MostrarAba(6);
+            TabCtrl_SetCurSel(hTab, 7);
+            MostrarAba(7);
             return 0;
         }
         if (LOWORD(wParam) == ID_CONFIG_ALERTAS)
@@ -6437,6 +6532,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             ToggleOverlay();
             AtualizarDefinicoesVisibilidade();
         }
+        else if ((int)wParam == HOTKEY_ID_COMPACT)
+        {
+            ToggleCompactMode();
+            AtualizarDefinicoesVisibilidade();
+        }
         return 0;
 
     case WM_TIMER:
@@ -6446,6 +6546,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
 
     case WM_DESTROY:
         UnregisterHotKey(hwnd, HOTKEY_ID_OVERLAY);
+        UnregisterHotKey(hwnd, HOTKEY_ID_COMPACT);
         KillTimer(hwnd, TIMER_ID);
 
         FecharOverlay();
@@ -6500,7 +6601,7 @@ static void AplicarVisibilidadeModoNormal(void)
     if (!hMainWindow)
         return;
 
-    for (i = 0; i < 7; i++)
+    for (i = 0; i < NUM_ABAS; i++)
         if (hNav[i])
             ShowWindow(hNav[i], SW_SHOW);
 
@@ -6521,6 +6622,7 @@ static void AplicarVisibilidadeModoNormal(void)
 
     if (hGraphCPU) ShowWindow(hGraphCPU, SW_SHOW);
     if (hGraphRAM) ShowWindow(hGraphRAM, SW_SHOW);
+    if (hGraphTemp) ShowWindow(hGraphTemp, SW_SHOW);
     if (hGraphDisk) ShowWindow(hGraphDisk, SW_SHOW);
     if (hGraphNet) ShowWindow(hGraphNet, SW_SHOW);
     if (hGraphProcesses) ShowWindow(hGraphProcesses, SW_SHOW);
@@ -6566,10 +6668,11 @@ static void ToggleCompactMode(void)
         if (hBtnInterval) ShowWindow(hBtnInterval, SW_HIDE);
         if (hBtnEstiloMain) ShowWindow(hBtnEstiloMain, SW_HIDE);
         if (hBtnGraphPNG) ShowWindow(hBtnGraphPNG, SW_HIDE);
-        for (int i = 0; i < 7; i++)
+        for (int i = 0; i < NUM_ABAS; i++)
             if (hNav[i]) ShowWindow(hNav[i], SW_HIDE);
         if (hGraphCPU) ShowWindow(hGraphCPU, SW_HIDE);
         if (hGraphRAM) ShowWindow(hGraphRAM, SW_HIDE);
+        if (hGraphTemp) ShowWindow(hGraphTemp, SW_HIDE);
         if (hGraphDisk) ShowWindow(hGraphDisk, SW_HIDE);
         if (hGraphNet) ShowWindow(hGraphNet, SW_HIDE);
         if (hGraphProcesses) ShowWindow(hGraphProcesses, SW_HIDE);
@@ -6728,6 +6831,65 @@ static LRESULT CALLBACK CompactProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 }
 
 /* ------------------------------------------------------------------------- */
+/* Historico de alertas                                                      */
+/* ------------------------------------------------------------------------- */
+static LRESULT CALLBACK AlertHistoryProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    static HWND hList = NULL;
+    (void)lParam;
+    switch (msg)
+    {
+    case WM_CREATE:
+        hList = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", "",
+                                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
+                                10, 10, 540, 300, hwnd, NULL, GetModuleHandle(NULL), NULL);
+        CreateWindowExA(0, "BUTTON", "Limpar historico", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        10, 320, 130, 28, hwnd, (HMENU)(UINT_PTR)IDC_ALERT_HISTORY_CLEAR,
+                        GetModuleHandle(NULL), NULL);
+        {
+            int i; char linha[192]; SYSTEMTIME *t;
+            for (i = 0; i < g_alertHistoryCount; i++)
+            {
+                t = &g_alertHistory[i].timestamp;
+                snprintf(linha, sizeof(linha), "%02d/%02d/%04d %02d:%02d:%02d  |  %s  %.1f (limite %.1f)",
+                         t->wDay, t->wMonth, t->wYear, t->wHour, t->wMinute, t->wSecond,
+                         g_alertHistory[i].recurso, g_alertHistory[i].valor, g_alertHistory[i].limite);
+                SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)linha);
+            }
+        }
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_ALERT_HISTORY_CLEAR && HIWORD(wParam) == BN_CLICKED)
+        {
+            g_alertHistoryCount = 0;
+            if (hList) SendMessageA(hList, LB_RESETCONTENT, 0, 0);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        hAlertHistory = NULL;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static void MostrarDialogoHistoricoAlertas(HWND hwndPai)
+{
+    if (hAlertHistory && IsWindow(hAlertHistory))
+    {
+        ShowWindow(hAlertHistory, SW_SHOW);
+        SetForegroundWindow(hAlertHistory);
+        return;
+    }
+    hAlertHistory = CreateWindowExA(WS_EX_DLGMODALFRAME, "WinMonAlertHistoryClass",
+                                    "WinMon — Historico de alertas",
+                                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                                    CW_USEDEFAULT, CW_USEDEFAULT, 575, 390,
+                                    hwndPai, NULL, GetModuleHandle(NULL), NULL);
+}
+
+/* ------------------------------------------------------------------------- */
 /* WinMain                                                                   */
 /* ------------------------------------------------------------------------- */
 
@@ -6793,6 +6955,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         compactClass.hCursor = LoadCursor(NULL, IDC_ARROW);
         compactClass.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         RegisterClassA(&compactClass);
+    }
+
+    {
+        WNDCLASSA alertClass;
+        ZeroMemory(&alertClass, sizeof(alertClass));
+        alertClass.lpfnWndProc = AlertHistoryProc;
+        alertClass.hInstance = hInstance;
+        alertClass.lpszClassName = "WinMonAlertHistoryClass";
+        alertClass.hCursor = LoadCursor(NULL, IDC_ARROW);
+        alertClass.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        RegisterClassA(&alertClass);
     }
 
     {
