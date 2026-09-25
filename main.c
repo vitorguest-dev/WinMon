@@ -24,6 +24,12 @@
  */
 
 #include <windows.h>
+
+/* MinGW-w64/ucrt64 compatibility: some PDH headers do not expose
+ * PDH_MORE_DATA even though PdhExpandWildCardPathA may return it. */
+#ifndef PDH_MORE_DATA
+#define PDH_MORE_DATA ((PDH_STATUS)0x800007D2L)
+#endif
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -75,6 +81,7 @@ static const IID LOCAL_IID_IWbemLocator =
 #define WM_TRAYICON (WM_APP + 1)
 #define ID_TRAY_ICON 1
 #define MAX_CORES 64
+#define MAX_GPU_COUNTERS 256
 
 #define LIMITE_RAM_PERCENT_DEFAULT 90.0
 #define LIMITE_DISCO_PERCENT_DEFAULT 95.0
@@ -116,10 +123,11 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_TEMPERATURA 2004
 #define TAB_DISCO 2005
 #define TAB_REDE 2006
-#define TAB_PROCESSOS 2007
-#define TAB_DEFINICOES 2008
+#define TAB_GPU 2007
+#define TAB_PROCESSOS 2008
+#define TAB_DEFINICOES 2009
 #define NAV_LARGURA 148
-#define NUM_ABAS 8
+#define NUM_ABAS 9
 #define ALERT_HISTORY_MAX 100
 
 #define MAX_TEMP_ZONAS 16
@@ -175,6 +183,7 @@ typedef struct
     double diskWrite[HISTORICO_PONTOS];
     double netDown[HISTORICO_PONTOS];
     double netUp[HISTORICO_PONTOS];
+    double gpu[HISTORICO_PONTOS];
     double core[MAX_CORES][HISTORICO_PONTOS];
     SYSTEMTIME timestamp[HISTORICO_PONTOS];
     ULONGLONG tickMs[HISTORICO_PONTOS];
@@ -192,6 +201,7 @@ typedef struct
     int mostrarTemp;
     int mostrarDisco;
     int mostrarNet;
+    int mostrarGpu;
     int clickThrough;
 
     COLORREF corBg;
@@ -226,6 +236,7 @@ typedef struct
     COLORREF corGraficoNetUp;
     COLORREF corGraficoProcesso;
     COLORREF corGraficoCore;
+    COLORREF corGraficoGpu;
     int espessuraLinhas;
     int mostrarGrelha;
     int mostrarEixos;
@@ -267,6 +278,7 @@ static MainUiConfig g_mainConfig = {
     .corGraficoNetUp = RGB(205, 80, 80),
     .corGraficoProcesso = RGB(205, 70, 70),
     .corGraficoCore = RGB(85, 145, 95),
+    .corGraficoGpu = RGB(120, 80, 190),
     .espessuraLinhas = 2,
     .mostrarGrelha = 1,
     .mostrarEixos = 1};
@@ -306,6 +318,7 @@ HWND hGraphRAM = NULL;
 HWND hGraphTemp = NULL;
 HWND hGraphDisk = NULL;
 HWND hGraphNet = NULL;
+HWND hGraphGPU = NULL;
 HWND hGraphProcesses = NULL;
 
 /* --- Painel de processos full (aba Processos) --- */
@@ -358,6 +371,8 @@ PDH_HCOUNTER hCounterCPU = NULL;
 PDH_HCOUNTER hCounterCoresCPU[MAX_CORES];
 PDH_HCOUNTER hCounterDiskRead = NULL;
 PDH_HCOUNTER hCounterDiskWrite = NULL;
+static PDH_HCOUNTER hCounterGpu[MAX_GPU_COUNTERS];
+static int numGpuCounters = 0;
 
 HFONT hFontMonitor = NULL;
 HFONT hFontUI = NULL;
@@ -381,6 +396,7 @@ static double ultimoDiskWrite = 0.0;
 static double ultimoDiscoUsoPercent = 0.0;
 static double ultimoNetDown = 0.0;
 static double ultimoNetUp = 0.0;
+static double ultimoGpuPercent = 0.0;
 
 static IntervaloAlerta intervalosAlerta[MAX_ALERT_RANGES];
 static int totalIntervalosAlerta = 0;
@@ -414,6 +430,7 @@ static OvPerfil ovPerfis[OV_MAX_PERFIS];
 #define OV_TEMP (ovPerfis[ovPerfilActivo].mostrarTemp)
 #define OV_DISCO (ovPerfis[ovPerfilActivo].mostrarDisco)
 #define OV_NET (ovPerfis[ovPerfilActivo].mostrarNet)
+#define OV_GPU (ovPerfis[ovPerfilActivo].mostrarGpu)
 #define OV_CLICKTHRU (ovPerfis[ovPerfilActivo].clickThrough)
 
 static int ovColW = 120;
@@ -463,7 +480,8 @@ typedef struct
     int dragStartEnd;
 } GraphViewState;
 
-static GraphViewState g_graphViews[6] = {
+static GraphViewState g_graphViews[7] = {
+    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
     {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
     {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
     {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
@@ -680,7 +698,7 @@ static void MostrarDialogoHistoricoAlertas(HWND hwndPai);
 
 static void AdicionarHistorico(double cpu, double ram, double temp,
                                double diskRead, double diskWrite,
-                               double netDown, double netUp)
+                               double netDown, double netUp, double gpu)
 {
     int i;
 
@@ -692,6 +710,7 @@ static void AdicionarHistorico(double cpu, double ram, double temp,
     historico.diskWrite[historico.pos] = diskWrite;
     historico.netDown[historico.pos] = netDown;
     historico.netUp[historico.pos] = netUp;
+    historico.gpu[historico.pos] = gpu;
     GetLocalTime(&historico.timestamp[historico.pos]);
     historico.tickMs[historico.pos] = GetTickCount64();
 
@@ -963,6 +982,39 @@ void MonitorarRede(char *buffer, size_t size, size_t *offset)
     free(pIfTable);
 }
 
+void MonitorarGPU(char *buffer, size_t size, size_t *offset)
+{
+    double gpuAtual = 0.0;
+    int i;
+    int algumValido = 0;
+
+    /* GPU Engine/WDDM: funciona com GPUs dedicadas e, quando o driver
+       disponibiliza o contador, tambem com iGPUs. Nao somamos engines,
+       porque isso poderia produzir valores superiores a 100%%. */
+    for (i = 0; i < numGpuCounters; i++)
+    {
+        PDH_FMT_COUNTERVALUE value;
+        if (hCounterGpu[i] &&
+            PdhGetFormattedCounterValue(hCounterGpu[i], PDH_FMT_DOUBLE,
+                                        NULL, &value) == ERROR_SUCCESS &&
+            value.CStatus == ERROR_SUCCESS &&
+            value.doubleValue >= 0.0 && value.doubleValue <= 100.0)
+        {
+            if (!algumValido || value.doubleValue > gpuAtual)
+                gpuAtual = value.doubleValue;
+            algumValido = 1;
+        }
+    }
+
+    ultimoGpuPercent = algumValido ? gpuAtual : 0.0;
+    if (algumValido)
+        AppendFormat(buffer, size, offset,
+                     "=== [ GPU ] ===\r\nUso Atual da GPU: %.1f%%\r\n\r\n", gpuAtual);
+    else
+        AppendFormat(buffer, size, offset,
+                     "=== [ GPU ] ===\r\nUso Atual da GPU: N/A (contador GPU Engine indisponivel)\r\n\r\n");
+}
+
 void MonitorarProcessos(char *buffer, size_t size, size_t *offset)
 {
     FILETIME ftIdle, ftKernelSys, ftUserSys;
@@ -976,7 +1028,15 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset)
 
     AppendFormat(buffer, size, offset, "=== [ TOP 12 PROCESSOS (MAIOR CONSUMO CPU) ] ===\r\n");
 
-    GetSystemTimes(&ftIdle, &ftKernelSys, &ftUserSys);
+    ZeroMemory(&ftIdle, sizeof(ftIdle));
+    ZeroMemory(&ftKernelSys, sizeof(ftKernelSys));
+    ZeroMemory(&ftUserSys, sizeof(ftUserSys));
+    if (!GetSystemTimes(&ftIdle, &ftKernelSys, &ftUserSys))
+    {
+        AppendFormat(buffer, size, offset,
+                     "Nao foi possivel obter os tempos do sistema.\r\n\r\n");
+        return;
+    }
     currentSystemTime = FileTimeToU64(ftKernelSys) +
                         FileTimeToU64(ftUserSys);
     deltaSystemTime = (lastSystemTime != 0)
@@ -1199,6 +1259,7 @@ typedef enum GraphType
     GRAPH_TEMP,
     GRAPH_DISK,
     GRAPH_NET,
+    GRAPH_GPU,
     GRAPH_PROCESS
 } GraphType;
 
@@ -1649,6 +1710,7 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
         int gap = 10;
         int cardWidth;
         int i;
+        const int dashboardCards = 5;
 
         GetClientRect(hwnd, &client);
         bufferDc = CreateCompatibleDC(paintDc);
@@ -1678,11 +1740,11 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         }
 
-        cardWidth = (client.right - 32 - gap * 3) / 4;
+        cardWidth = (client.right - 32 - gap * (dashboardCards - 1)) / dashboardCards;
         if (cardWidth < 100)
             cardWidth = 100;
 
-        for (i = 0; i < 4; i++)
+        for (i = 0; i < dashboardCards; i++)
         {
             card.left = 16 + i * (cardWidth + gap);
             card.top = 42;
@@ -1708,12 +1770,18 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
                 DrawDashboardCard(bufferDc, card, "Disco I/O", value,
                                   g_mainConfig.corGraficoDiscoRead);
             }
-            else
+            else if (i == 3)
             {
                 snprintf(value, sizeof(value), "%.1f MB/s",
                          (ultimoNetDown + ultimoNetUp) / 1048576.0);
                 DrawDashboardCard(bufferDc, card, "Rede", value,
                                   g_mainConfig.corGraficoNetDown);
+            }
+            else
+            {
+                snprintf(value, sizeof(value), "%.1f%%", ultimoGpuPercent);
+                DrawDashboardCard(bufferDc, card, "GPU", value,
+                                  g_mainConfig.corGraficoGpu);
             }
         }
 
@@ -1989,6 +2057,20 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
                        maxVal, colors[0], g_mainConfig.espessuraLinhas);
         DrawSeriesView(hdc, graph, historico.netUp, viewStart, viewCount,
                        maxVal, colors[1], g_mainConfig.espessuraLinhas);
+        DrawTimeLabelsView(hdc, graph, viewStart, viewCount);
+        break;
+    }
+
+    case GRAPH_GPU:
+    {
+        names[0] = "GPU";
+        colors[0] = g_mainConfig.corGraficoGpu;
+        n = 1;
+        snprintf(currentText, sizeof(currentText), "Atual: %.1f%%", ultimoGpuPercent);
+        DrawGraphLegend(hdc, &client, "GPU — utilizacao temporal", names, colors, n, currentText);
+        DrawGraphGrid(hdc, graph, 100.0);
+        DrawSeriesView(hdc, graph, historico.gpu, viewStart, viewCount,
+                       100.0, colors[0], g_mainConfig.espessuraLinhas);
         DrawTimeLabelsView(hdc, graph, viewStart, viewCount);
         break;
     }
@@ -2614,6 +2696,7 @@ static void AplicarEstiloJanelaPrincipal(void)
     InvalidateRect(hGraphTemp, NULL, FALSE);
     InvalidateRect(hGraphDisk, NULL, FALSE);
     InvalidateRect(hGraphNet, NULL, FALSE);
+    InvalidateRect(hGraphGPU, NULL, FALSE);
     InvalidateRect(hGraphProcesses, NULL, FALSE);
     InvalidateRect(hDashboard, NULL, FALSE);
 }
@@ -2873,9 +2956,9 @@ static void MostrarAba(int indice)
 
     if (g_compactMode)
         return;
-    /* índices 1-4 mapeiam para gráficos; índice 5 é o painel de processos */
+    /* índices 1-6 mapeiam para os gráficos; índice 7 é o painel de processos */
     HWND graficos[] = {
-        hGraphCPU, hGraphRAM, hGraphTemp, hGraphDisk, hGraphNet};
+        hGraphCPU, hGraphRAM, hGraphTemp, hGraphDisk, hGraphNet, hGraphGPU};
 
     abaAtual = indice;
 
@@ -2891,7 +2974,7 @@ static void MostrarAba(int indice)
     if (hDashboard)
         ShowWindow(hDashboard, indice == 0 ? SW_SHOW : SW_HIDE);
 
-    for (i = 0; i < 5; i++)
+    for (i = 0; i < 6; i++)
     {
         if (graficos[i])
             ShowWindow(graficos[i], indice == i + 1 ? SW_SHOW : SW_HIDE);
@@ -2906,7 +2989,7 @@ static void MostrarAba(int indice)
 
     /* painel de lista de processos: mostrar/esconder cada controlo */
     {
-        int visProc = (indice == 6) ? SW_SHOW : SW_HIDE;
+        int visProc = (indice == 7) ? SW_SHOW : SW_HIDE;
         if (hPainelProcessos)
             ShowWindow(hPainelProcessos, visProc);
         if (hEditPesquisaProc)
@@ -3057,6 +3140,10 @@ static void RedimensionarConteudo(HWND hwnd)
 
         if (hGraphNet)
             MoveWindow(hGraphNet, rc.left, rc.top,
+                       rc.right - rc.left, rc.bottom - rc.top, TRUE);
+
+        if (hGraphGPU)
+            MoveWindow(hGraphGPU, rc.left, rc.top,
                        rc.right - rc.left, rc.bottom - rc.top, TRUE);
 
         if (hGraphProcesses)
@@ -3374,7 +3461,7 @@ static void AtualizarDefinicoesVisibilidade(void)
     int i, j;
 
     if (hSettingsTitle)
-        ShowWindow(hSettingsTitle, abaAtual == 7 ? SW_SHOW : SW_HIDE);
+        ShowWindow(hSettingsTitle, abaAtual == 8 ? SW_SHOW : SW_HIDE);
 
     for (i = 0; i < SETTINGS_SECTIONS; i++)
     {
@@ -3403,14 +3490,14 @@ static void AtualizarDefinicoesVisibilidade(void)
             snprintf(texto, sizeof(texto), "%s %s",
                      g_settingsOpen[i] ? "[-]" : "[+]", nome);
             SetWindowTextA(hSettingsHeaders[i], texto);
-            ShowWindow(hSettingsHeaders[i], abaAtual == 7 ? SW_SHOW : SW_HIDE);
+            ShowWindow(hSettingsHeaders[i], abaAtual == 8 ? SW_SHOW : SW_HIDE);
         }
 
         for (j = 0; j < 4; j++)
         {
             if (hSettingsActions[i][j])
                 ShowWindow(hSettingsActions[i][j],
-                           (abaAtual == 7 && g_settingsOpen[i] && j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 3 : 1))))
+                           (abaAtual == 8 && g_settingsOpen[i] && j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 3 : 1))))
                                ? SW_SHOW
                                : SW_HIDE);
         }
@@ -3514,7 +3601,7 @@ static void CriarAbas(HWND hwnd)
 {
     TCITEMA item;
     const char *nomes[] = {
-        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "Processos", "Definicoes"};
+        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Definicoes"};
     int i;
 
     hTab = CreateWindowExA(
@@ -3534,7 +3621,7 @@ static void CriarAbas(HWND hwnd)
 
     {
         const char *navNomes[] = {
-            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "Processos", "Definicoes"};
+            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Definicoes"};
 
         for (i = 0; i < NUM_ABAS; i++)
         {
@@ -3574,6 +3661,7 @@ static void CriarAbas(HWND hwnd)
     hGraphTemp = CriarGrafico(hwnd, GRAPH_TEMP);
     hGraphDisk = CriarGrafico(hwnd, GRAPH_DISK);
     hGraphNet = CriarGrafico(hwnd, GRAPH_NET);
+    hGraphGPU = CriarGrafico(hwnd, GRAPH_GPU);
     hGraphProcesses = CriarGrafico(hwnd, GRAPH_PROCESS);
 
     CriarPainelProcessos(hwnd);
@@ -3663,7 +3751,7 @@ static void IniciarLogCSV(void)
 
     fprintf(hLogCSV,
             "timestamp,cpu_pct,ram_pct,disk_read_bps,disk_write_bps,"
-            "net_down_bps,net_up_bps");
+            "net_down_bps,net_up_bps,gpu_pct");
 
     {
         int i;
@@ -3712,7 +3800,7 @@ static void EscreverLinhaLog(void)
             st.wHour, st.wMinute, st.wSecond,
             ultimoCpuPercent, ultimoRamPercent,
             ultimoDiskRead, ultimoDiskWrite,
-            ultimoNetDown, ultimoNetUp);
+            ultimoNetDown, ultimoNetUp, ultimoGpuPercent);
 
     for (i = 0; i < numNucleosMonitorizados; i++)
         fprintf(hLogCSV, ",%.2f", coresCpuAtuais[i]);
@@ -3797,6 +3885,8 @@ static void CarregarConfigVisual(void)
     g_mainConfig.corGraficoProcesso = (COLORREF)strtoul(val, NULL, 10);
     GetPrivateProfileStringA("Aparencia", "Core", "6263125", val, sizeof(val), INI_FICHEIRO);
     g_mainConfig.corGraficoCore = (COLORREF)strtoul(val, NULL, 10);
+    GetPrivateProfileStringA("Aparencia", "Gpu", "12470440", val, sizeof(val), INI_FICHEIRO);
+    g_mainConfig.corGraficoGpu = (COLORREF)strtoul(val, NULL, 10);
     GetPrivateProfileStringA("Aparencia", "Espessura", "2", val, sizeof(val), INI_FICHEIRO);
     g_mainConfig.espessuraLinhas = atoi(val);
     GetPrivateProfileStringA("Aparencia", "MostrarGrelha", "1", val, sizeof(val), INI_FICHEIRO);
@@ -3828,6 +3918,7 @@ static void GravarConfigVisual(void)
     WV("NetUp", g_mainConfig.corGraficoNetUp);
     WV("Processo", g_mainConfig.corGraficoProcesso);
     WV("Core", g_mainConfig.corGraficoCore);
+    WV("Gpu", g_mainConfig.corGraficoGpu);
     WV("Espessura", g_mainConfig.espessuraLinhas);
     WV("MostrarGrelha", g_mainConfig.mostrarGrelha);
     WV("MostrarEixos", g_mainConfig.mostrarEixos);
@@ -3897,11 +3988,11 @@ static void CarregarConfigIni(void)
                              val, sizeof(val), INI_FICHEIRO);
     intervaloAtualizacaoMs = (UINT)atoi(val);
 
-    if (limiteCpuPercent < 1.0 || limiteCpuPercent > 100.0)
+    if (!_finite(limiteCpuPercent) || limiteCpuPercent < 1.0 || limiteCpuPercent > 100.0)
         limiteCpuPercent = LIMITE_CPU_PERCENT_DEFAULT;
-    if (limiteRamPercent < 1.0 || limiteRamPercent > 100.0)
+    if (!_finite(limiteRamPercent) || limiteRamPercent < 1.0 || limiteRamPercent > 100.0)
         limiteRamPercent = LIMITE_RAM_PERCENT_DEFAULT;
-    if (limiteDiscoPercent < 1.0 || limiteDiscoPercent > 100.0)
+    if (!_finite(limiteDiscoPercent) || limiteDiscoPercent < 1.0 || limiteDiscoPercent > 100.0)
         limiteDiscoPercent = LIMITE_DISCO_PERCENT_DEFAULT;
     if (intervaloAtualizacaoMs != 500 && intervaloAtualizacaoMs != 1000 &&
         intervaloAtualizacaoMs != 2000 && intervaloAtualizacaoMs != 5000)
@@ -4741,6 +4832,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[0].mostrarTemp = 0;
     ovPerfis[0].mostrarDisco = 0;
     ovPerfis[0].mostrarNet = 1;
+    ovPerfis[0].mostrarGpu = 0;
     ovPerfis[0].clickThrough = 1;
     ovPerfis[0].corBg = RGB(14, 14, 16);
     ovPerfis[0].corBorda = RGB(60, 63, 70);
@@ -4763,6 +4855,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[1].mostrarTemp = 0;
     ovPerfis[1].mostrarDisco = 1;
     ovPerfis[1].mostrarNet = 1;
+    ovPerfis[1].mostrarGpu = 0;
     ovPerfis[1].clickThrough = 0;
     ovPerfis[1].corBg = RGB(20, 22, 26);
     ovPerfis[1].corBorda = RGB(70, 75, 85);
@@ -4785,6 +4878,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[2].mostrarTemp = 1;
     ovPerfis[2].mostrarDisco = 1;
     ovPerfis[2].mostrarNet = 1;
+    ovPerfis[2].mostrarGpu = 0;
     ovPerfis[2].clickThrough = 0;
     ovPerfis[2].corBg = RGB(14, 14, 16);
     ovPerfis[2].corBorda = RGB(60, 63, 70);
@@ -4848,6 +4942,8 @@ static void GravarPerfisOverlay(void)
         RegSetValueExA(hk, "MostrarDisco", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
         v = (DWORD)ovPerfis[i].mostrarNet;
         RegSetValueExA(hk, "MostrarNet", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarGpu;
+        RegSetValueExA(hk, "MostrarGpu", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
         v = (DWORD)ovPerfis[i].clickThrough;
         RegSetValueExA(hk, "ClickThrough", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
 
@@ -4938,6 +5034,8 @@ static void CarregarPerfisOverlay(void)
             ovPerfis[i].mostrarDisco = (int)v;
         if (RegQueryValueExA(hk, "MostrarNet", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].mostrarNet = (int)v;
+        if (RegQueryValueExA(hk, "MostrarGpu", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarGpu = (int)v;
         if (RegQueryValueExA(hk, "ClickThrough", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].clickThrough = (int)v;
 
@@ -5168,10 +5266,21 @@ static void RecalcOverlaySize(void)
     ncols = 2;
     if (OV_NET)
         ncols++;
+    if (OV_GPU)
+        ncols++;
     if (OV_TEMP)
         ncols++;
     if (OV_DISCO)
         ncols++;
+
+    /*
+     * O overlay original foi dimensionado para poucas colunas.
+     * Com a GPU opcional podemos chegar a seis; reduzir ligeiramente
+     * a coluna nesse caso evita que o overlay cresça excessivamente
+     * sem alterar o layout dos perfis antigos.
+     */
+    if (ncols >= 6 && ovColW > 108)
+        ovColW = 108;
 
     nlinhas = 3;
 
@@ -5363,6 +5472,31 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
         cx += ovColW;
 
+        if (OV_GPU)
+        {
+            if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
+            {
+                SelectObject(hdc, penSep);
+                MoveToEx(hdc, cx, cy, NULL);
+                LineTo(hdc, cx, rc.bottom - OV_PAD);
+            }
+
+            if (numGpuCounters > 0)
+            {
+                snprintf(vBuf, sizeof(vBuf), "%.1f%%", ultimoGpuPercent);
+                snprintf(sBuf, sizeof(sBuf), "WDDM / GPU Engine");
+                col = (OvColuna){"GPU", ovPerfis[ovPerfilActivo].corTextoLabel, vBuf, sBuf,
+                                 ultimoGpuPercent, RGB(120, 80, 190)};
+            }
+            else
+            {
+                col = (OvColuna){"GPU", ovPerfis[ovPerfilActivo].corTextoLabel, "N/A",
+                                 "WDDM indisponivel", -1.0, 0};
+            }
+            DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+            cx += ovColW;
+        }
+
         if (OV_NET)
         {
             if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
@@ -5538,6 +5672,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 #define IDC_OV_TEMP 4006
 #define IDC_OV_DISCO 4007
 #define IDC_OV_NET 4008
+#define IDC_OV_GPU 4026
 #define IDC_OV_CLICKTHRU 4009
 #define IDC_OV_BTN_NOVO 4010
 #define IDC_OV_BTN_APAGAR 4011
@@ -5599,6 +5734,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
         CheckDlgButton(hDlg, IDC_OV_TEMP, OV_TEMP ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_DISCO, OV_DISCO ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_NET, OV_NET ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_GPU, OV_GPU ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, OV_CLICKTHRU ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[ovPerfilActivo].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[ovPerfilActivo].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
@@ -5630,6 +5766,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
                 CheckDlgButton(hDlg, IDC_OV_TEMP, ovPerfis[sel].mostrarTemp ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_DISCO, ovPerfis[sel].mostrarDisco ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_NET, ovPerfis[sel].mostrarNet ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_GPU, ovPerfis[sel].mostrarGpu ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, ovPerfis[sel].clickThrough ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[sel].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[sel].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
@@ -5774,6 +5911,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
             ovPerfis[sel].mostrarTemp = (IsDlgButtonChecked(hDlg, IDC_OV_TEMP) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarDisco = (IsDlgButtonChecked(hDlg, IDC_OV_DISCO) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarNet = (IsDlgButtonChecked(hDlg, IDC_OV_NET) == BST_CHECKED) ? 1 : 0;
+            ovPerfis[sel].mostrarGpu = (IsDlgButtonChecked(hDlg, IDC_OV_GPU) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].clickThrough = (IsDlgButtonChecked(hDlg, IDC_OV_CLICKTHRU) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarBarras = (IsDlgButtonChecked(hDlg, IDC_OV_BARRAS) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarSeparadores = (IsDlgButtonChecked(hDlg, IDC_OV_SEPARADORES) == BST_CHECKED) ? 1 : 0;
@@ -5857,7 +5995,7 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     DLGTEMPLATE *dt = (DLGTEMPLATE *)p;
     dt->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT;
     dt->dwExtendedStyle = 0;
-    dt->cdit = 34;
+    dt->cdit = 35;
     dt->x = 0;
     dt->y = 0;
     dt->cx = 280;
@@ -5891,6 +6029,7 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 96, 55, 12, IDC_OV_NET, 0x0080, L"Rede");
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 65, 96, 65, 12, IDC_OV_TEMP, 0x0080, L"Temperatura");
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 133, 96, 75, 12, IDC_OV_DISCO, 0x0080, L"Disco I/O");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 213, 96, 45, 12, IDC_OV_GPU, 0x0080, L"GPU");
 
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 113, 226, 12, IDC_OV_CLICKTHRU, 0x0080, L"Click-through (cliques passam para janelas por baixo)");
 
@@ -6015,6 +6154,7 @@ void AtualizarMonitor()
     MonitorarDiscos(buffer, BUFFER_SIZE, &offset);
     MonitorarDiscoIO(buffer, BUFFER_SIZE, &offset);
     MonitorarRede(buffer, BUFFER_SIZE, &offset);
+    MonitorarGPU(buffer, BUFFER_SIZE, &offset);
     MonitorarProcessos(buffer, BUFFER_SIZE, &offset);
 
     AdicionarHistorico(
@@ -6024,7 +6164,8 @@ void AtualizarMonitor()
         ultimoDiskRead,
         ultimoDiskWrite,
         ultimoNetDown,
-        ultimoNetUp);
+        ultimoNetUp,
+        ultimoGpuPercent);
 
     {
         int i;
@@ -6061,7 +6202,7 @@ void AtualizarMonitor()
     /* Actualiza a lista completa de processos (aba Processos) */
     g_totalProcessosBruto = totalListaProcessos;
     AtualizarHistoricoProcessos();
-    if (abaAtual == 5)
+    if (abaAtual == 7)
         AtualizarListViewProcessos();
     else
     {
@@ -6148,6 +6289,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 hQuery,
                 "\\PhysicalDisk(_Total)\\Disk Write Bytes/sec",
                 0, &hCounterDiskWrite);
+
+            /* Enumerar engines GPU expostos pelo WDDM; se nao existirem,
+               a funcionalidade original continua a funcionar e a GPU fica N/A. */
+            {
+                DWORD gpuPathChars = 0;
+                DWORD status = PdhExpandWildCardPathA(
+                    NULL, "\\GPU Engine(*)\\Utilization Percentage",
+                    NULL, &gpuPathChars, 0);
+                if ((status == ERROR_SUCCESS || status == PDH_MORE_DATA) &&
+                    gpuPathChars > 1 && gpuPathChars <= (1024UL * 1024UL))
+                {
+                    char *gpuPaths = (char *)malloc((size_t)gpuPathChars);
+                    if (gpuPaths)
+                    {
+                        DWORD chars = gpuPathChars;
+                        status = PdhExpandWildCardPathA(
+                            NULL, "\\GPU Engine(*)\\Utilization Percentage",
+                            gpuPaths, &chars, 0);
+                        if (status == ERROR_SUCCESS)
+                        {
+                            char *path = gpuPaths;
+                            while (*path && numGpuCounters < MAX_GPU_COUNTERS)
+                            {
+                                PDH_HCOUNTER counter = NULL;
+                                if (PdhAddEnglishCounterA(hQuery, path, 0, &counter) == ERROR_SUCCESS && counter)
+                                    hCounterGpu[numGpuCounters++] = counter;
+                                path += strlen(path) + 1;
+                            }
+                        }
+                        free(gpuPaths);
+                    }
+                }
+            }
 
             PdhCollectQueryData(hQuery);
         }
@@ -6432,12 +6606,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         }
         if (LOWORD(wParam) == ID_EXPORT_GRAPH_PNG)
         {
-            if (abaAtual >= 1 && abaAtual <= 5)
+            if (abaAtual >= 1 && abaAtual <= 6)
             {
                 HWND graph = (abaAtual == 1) ? hGraphCPU :
                              (abaAtual == 2) ? hGraphRAM :
                              (abaAtual == 3) ? hGraphTemp :
-                             (abaAtual == 4) ? hGraphDisk : hGraphNet;
+                             (abaAtual == 4) ? hGraphDisk :
+                             (abaAtual == 5) ? hGraphNet : hGraphGPU;
                 ExportarGraficoPNG(graph);
             }
             return 0;
@@ -6625,6 +6800,7 @@ static void AplicarVisibilidadeModoNormal(void)
     if (hGraphTemp) ShowWindow(hGraphTemp, SW_SHOW);
     if (hGraphDisk) ShowWindow(hGraphDisk, SW_SHOW);
     if (hGraphNet) ShowWindow(hGraphNet, SW_SHOW);
+    if (hGraphGPU) ShowWindow(hGraphGPU, SW_SHOW);
     if (hGraphProcesses) ShowWindow(hGraphProcesses, SW_SHOW);
 
     if (hPainelProcessos) ShowWindow(hPainelProcessos, SW_SHOW);
@@ -6675,6 +6851,7 @@ static void ToggleCompactMode(void)
         if (hGraphTemp) ShowWindow(hGraphTemp, SW_HIDE);
         if (hGraphDisk) ShowWindow(hGraphDisk, SW_HIDE);
         if (hGraphNet) ShowWindow(hGraphNet, SW_HIDE);
+        if (hGraphGPU) ShowWindow(hGraphGPU, SW_HIDE);
         if (hGraphProcesses) ShowWindow(hGraphProcesses, SW_HIDE);
         if (hPainelProcessos) ShowWindow(hPainelProcessos, SW_HIDE);
         if (hEditPesquisaProc) ShowWindow(hEditPesquisaProc, SW_HIDE);
