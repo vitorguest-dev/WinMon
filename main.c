@@ -83,6 +83,13 @@ static const IID LOCAL_IID_IWbemLocator =
 #define MAX_CORES 64
 #define MAX_GPU_COUNTERS 256
 
+/* Tipos de engine GPU (mesmos que o Gestor de Tarefas monitoriza) */
+#define GPU_ENG_3D      0
+#define GPU_ENG_COPY    1
+#define GPU_ENG_ENCODE  2
+#define GPU_ENG_DECODE  3
+#define GPU_ENG_COUNT   4
+
 #define LIMITE_RAM_PERCENT_DEFAULT 90.0
 #define LIMITE_DISCO_PERCENT_DEFAULT 95.0
 #define LIMITE_CPU_PERCENT_DEFAULT 90.0
@@ -183,7 +190,10 @@ typedef struct
     double diskWrite[HISTORICO_PONTOS];
     double netDown[HISTORICO_PONTOS];
     double netUp[HISTORICO_PONTOS];
-    double gpu[HISTORICO_PONTOS];
+    double gpu[HISTORICO_PONTOS];          /* 3D (usado no overlay) */
+    double gpuCopy[HISTORICO_PONTOS];
+    double gpuEncode[HISTORICO_PONTOS];
+    double gpuDecode[HISTORICO_PONTOS];
     double core[MAX_CORES][HISTORICO_PONTOS];
     SYSTEMTIME timestamp[HISTORICO_PONTOS];
     ULONGLONG tickMs[HISTORICO_PONTOS];
@@ -371,8 +381,9 @@ PDH_HCOUNTER hCounterCPU = NULL;
 PDH_HCOUNTER hCounterCoresCPU[MAX_CORES];
 PDH_HCOUNTER hCounterDiskRead = NULL;
 PDH_HCOUNTER hCounterDiskWrite = NULL;
-static PDH_HCOUNTER hCounterGpu[MAX_GPU_COUNTERS];
-static int numGpuCounters = 0;
+/* Contadores PDH separados por tipo de engine GPU */
+static PDH_HCOUNTER hCounterGpu[GPU_ENG_COUNT][MAX_GPU_COUNTERS];
+static int numGpuCounters[GPU_ENG_COUNT] = {0, 0, 0, 0};
 
 HFONT hFontMonitor = NULL;
 HFONT hFontUI = NULL;
@@ -396,7 +407,10 @@ static double ultimoDiskWrite = 0.0;
 static double ultimoDiscoUsoPercent = 0.0;
 static double ultimoNetDown = 0.0;
 static double ultimoNetUp = 0.0;
-static double ultimoGpuPercent = 0.0;
+static double ultimoGpuPercent = 0.0;   /* 3D — usado no overlay */
+static double ultimoGpuCopy    = 0.0;
+static double ultimoGpuEncode  = 0.0;
+static double ultimoGpuDecode  = 0.0;
 
 static IntervaloAlerta intervalosAlerta[MAX_ALERT_RANGES];
 static int totalIntervalosAlerta = 0;
@@ -698,7 +712,8 @@ static void MostrarDialogoHistoricoAlertas(HWND hwndPai);
 
 static void AdicionarHistorico(double cpu, double ram, double temp,
                                double diskRead, double diskWrite,
-                               double netDown, double netUp, double gpu)
+                               double netDown, double netUp, double gpu,
+                               double gpuCopy, double gpuEncode, double gpuDecode)
 {
     int i;
 
@@ -711,6 +726,9 @@ static void AdicionarHistorico(double cpu, double ram, double temp,
     historico.netDown[historico.pos] = netDown;
     historico.netUp[historico.pos] = netUp;
     historico.gpu[historico.pos] = gpu;
+    historico.gpuCopy[historico.pos]   = gpuCopy;
+    historico.gpuEncode[historico.pos] = gpuEncode;
+    historico.gpuDecode[historico.pos] = gpuDecode;
     GetLocalTime(&historico.timestamp[historico.pos]);
     historico.tickMs[historico.pos] = GetTickCount64();
 
@@ -984,32 +1002,63 @@ void MonitorarRede(char *buffer, size_t size, size_t *offset)
 
 void MonitorarGPU(char *buffer, size_t size, size_t *offset)
 {
-    double gpuAtual = 0.0;
-    int i;
+    /* Nomes internos dos tipos de engine (mesmos que o Gestor de Tarefas) */
+    static const char *nomeEng[GPU_ENG_COUNT] = {"3D", "Copy", "Encode", "Decode"};
+
+    double valores[GPU_ENG_COUNT] = {0.0, 0.0, 0.0, 0.0};
+    int valido[GPU_ENG_COUNT]     = {0,   0,   0,   0  };
+    int e, i;
     int algumValido = 0;
 
-    /* GPU Engine/WDDM: funciona com GPUs dedicadas e, quando o driver
-       disponibiliza o contador, tambem com iGPUs. Nao somamos engines,
-       porque isso poderia produzir valores superiores a 100%%. */
-    for (i = 0; i < numGpuCounters; i++)
+    /*
+     * O Gestor de Tarefas soma a utilizacao de todos os engines
+     * do mesmo tipo (3D, Copy, Encode, Decode) e limita a 100%.
+     * Fazemos o mesmo: para cada tipo, somamos os valores PDH de
+     * todos os contadores desse tipo e clampamos em [0, 100].
+     */
+    for (e = 0; e < GPU_ENG_COUNT; e++)
     {
-        PDH_FMT_COUNTERVALUE value;
-        if (hCounterGpu[i] &&
-            PdhGetFormattedCounterValue(hCounterGpu[i], PDH_FMT_DOUBLE,
-                                        NULL, &value) == ERROR_SUCCESS &&
-            value.CStatus == ERROR_SUCCESS &&
-            value.doubleValue >= 0.0 && value.doubleValue <= 100.0)
+        double soma = 0.0;
+        for (i = 0; i < numGpuCounters[e]; i++)
         {
-            if (!algumValido || value.doubleValue > gpuAtual)
-                gpuAtual = value.doubleValue;
+            PDH_FMT_COUNTERVALUE value;
+            if (hCounterGpu[e][i] &&
+                PdhGetFormattedCounterValue(hCounterGpu[e][i], PDH_FMT_DOUBLE,
+                                            NULL, &value) == ERROR_SUCCESS &&
+                value.CStatus == ERROR_SUCCESS &&
+                value.doubleValue >= 0.0)
+            {
+                soma += value.doubleValue;
+                valido[e] = 1;
+            }
+        }
+        if (valido[e])
+        {
+            if (soma > 100.0) soma = 100.0;
+            valores[e] = soma;
             algumValido = 1;
         }
     }
 
-    ultimoGpuPercent = algumValido ? gpuAtual : 0.0;
+    ultimoGpuPercent = valido[GPU_ENG_3D]     ? valores[GPU_ENG_3D]     : 0.0;
+    ultimoGpuCopy    = valido[GPU_ENG_COPY]   ? valores[GPU_ENG_COPY]   : 0.0;
+    ultimoGpuEncode  = valido[GPU_ENG_ENCODE] ? valores[GPU_ENG_ENCODE] : 0.0;
+    ultimoGpuDecode  = valido[GPU_ENG_DECODE] ? valores[GPU_ENG_DECODE] : 0.0;
+
     if (algumValido)
-        AppendFormat(buffer, size, offset,
-                     "=== [ GPU ] ===\r\nUso Atual da GPU: %.1f%%\r\n\r\n", gpuAtual);
+    {
+        AppendFormat(buffer, size, offset, "=== [ GPU ] ===\r\n");
+        for (e = 0; e < GPU_ENG_COUNT; e++)
+        {
+            if (valido[e])
+                AppendFormat(buffer, size, offset,
+                             "GPU %s: %.1f%%\r\n", nomeEng[e], valores[e]);
+            else
+                AppendFormat(buffer, size, offset,
+                             "GPU %s: N/A\r\n", nomeEng[e]);
+        }
+        AppendFormat(buffer, size, offset, "\r\n");
+    }
     else
         AppendFormat(buffer, size, offset,
                      "=== [ GPU ] ===\r\nUso Atual da GPU: N/A (contador GPU Engine indisponivel)\r\n\r\n");
@@ -1871,8 +1920,8 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
     RECT graph;
     HBRUSH bg = CreateSolidBrush(g_mainConfig.corFundoGrafico);
     char currentText[128];
-    const char *names[3];
-    COLORREF colors[3];
+    const char *names[4];
+    COLORREF colors[4];
     int n = 0;
     int i;
     int viewStart = 0;
@@ -2063,14 +2112,30 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
 
     case GRAPH_GPU:
     {
-        names[0] = "GPU";
-        colors[0] = g_mainConfig.corGraficoGpu;
-        n = 1;
-        snprintf(currentText, sizeof(currentText), "Atual: %.1f%%", ultimoGpuPercent);
-        DrawGraphLegend(hdc, &client, "GPU — utilizacao temporal", names, colors, n, currentText);
+        /* 4 series: 3D, Copy, Encode, Decode — igual ao Gestor de Tarefas */
+        names[0] = "3D";
+        names[1] = "Copy";
+        names[2] = "Encode";
+        names[3] = "Decode";
+        colors[0] = g_mainConfig.corGraficoGpu;          /* roxo  */
+        colors[1] = RGB(80,  180, 220);                  /* azul  */
+        colors[2] = RGB(80,  210, 130);                  /* verde */
+        colors[3] = RGB(220, 160,  60);                  /* laranja */
+        n = 4;
+        snprintf(currentText, sizeof(currentText),
+                 "3D:%.1f%%  Cp:%.1f%%  En:%.1f%%  De:%.1f%%",
+                 ultimoGpuPercent, ultimoGpuCopy,
+                 ultimoGpuEncode, ultimoGpuDecode);
+        DrawGraphLegend(hdc, &client, "GPU — utilizacao por engine", names, colors, n, currentText);
         DrawGraphGrid(hdc, graph, 100.0);
-        DrawSeriesView(hdc, graph, historico.gpu, viewStart, viewCount,
+        DrawSeriesView(hdc, graph, historico.gpu,       viewStart, viewCount,
                        100.0, colors[0], g_mainConfig.espessuraLinhas);
+        DrawSeriesView(hdc, graph, historico.gpuCopy,   viewStart, viewCount,
+                       100.0, colors[1], g_mainConfig.espessuraLinhas);
+        DrawSeriesView(hdc, graph, historico.gpuEncode, viewStart, viewCount,
+                       100.0, colors[2], g_mainConfig.espessuraLinhas);
+        DrawSeriesView(hdc, graph, historico.gpuDecode, viewStart, viewCount,
+                       100.0, colors[3], g_mainConfig.espessuraLinhas);
         DrawTimeLabelsView(hdc, graph, viewStart, viewCount);
         break;
     }
@@ -5481,12 +5546,23 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
                 LineTo(hdc, cx, rc.bottom - OV_PAD);
             }
 
-            if (numGpuCounters > 0)
+            if (numGpuCounters[GPU_ENG_3D] > 0)
             {
+                /* Overlay mostra apenas carga 3D (igual ao Gestor de Tarefas) */
                 snprintf(vBuf, sizeof(vBuf), "%.1f%%", ultimoGpuPercent);
-                snprintf(sBuf, sizeof(sBuf), "WDDM / GPU Engine");
+                snprintf(sBuf, sizeof(sBuf), "GPU 3D");
                 col = (OvColuna){"GPU", ovPerfis[ovPerfilActivo].corTextoLabel, vBuf, sBuf,
                                  ultimoGpuPercent, RGB(120, 80, 190)};
+            }
+            else if (numGpuCounters[GPU_ENG_COPY]   > 0 ||
+                     numGpuCounters[GPU_ENG_ENCODE]  > 0 ||
+                     numGpuCounters[GPU_ENG_DECODE]  > 0)
+            {
+                /* GPU sem engine 3D (ex: iGPU sem DX) — mostrar N/A para 3D */
+                snprintf(vBuf, sizeof(vBuf), "N/A");
+                snprintf(sBuf, sizeof(sBuf), "Sem engine 3D");
+                col = (OvColuna){"GPU", ovPerfis[ovPerfilActivo].corTextoLabel, vBuf, sBuf,
+                                 -1.0, 0};
             }
             else
             {
@@ -6165,7 +6241,10 @@ void AtualizarMonitor()
         ultimoDiskWrite,
         ultimoNetDown,
         ultimoNetUp,
-        ultimoGpuPercent);
+        ultimoGpuPercent,
+        ultimoGpuCopy,
+        ultimoGpuEncode,
+        ultimoGpuDecode);
 
     {
         int i;
@@ -6290,9 +6369,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 "\\PhysicalDisk(_Total)\\Disk Write Bytes/sec",
                 0, &hCounterDiskWrite);
 
-            /* Enumerar engines GPU expostos pelo WDDM; se nao existirem,
-               a funcionalidade original continua a funcionar e a GPU fica N/A. */
+            /* Enumerar engines GPU expostos pelo WDDM, separados por tipo.
+             * O Gestor de Tarefas mostra 3D, Copy, Encode e Decode somando
+             * a utilizacao de todos os engines do mesmo tipo.
+             * Os nomes dos tipos no path PDH sao:
+             *   engtype_3D, engtype_Copy, engtype_VideoEncode, engtype_VideoDecode
+             */
             {
+                /* Padroes de filtragem por tipo de engine */
+                static const struct { int idx; const char *engtype; } kEngTypes[GPU_ENG_COUNT] = {
+                    { GPU_ENG_3D,     "engtype_3D"          },
+                    { GPU_ENG_COPY,   "engtype_Copy"        },
+                    { GPU_ENG_ENCODE, "engtype_VideoEncode" },
+                    { GPU_ENG_DECODE, "engtype_VideoDecode" },
+                };
+                int t;
+
+                /* Primeiro expandir todos os paths de GPU Engine de uma vez */
                 DWORD gpuPathChars = 0;
                 DWORD status = PdhExpandWildCardPathA(
                     NULL, "\\GPU Engine(*)\\Utilization Percentage",
@@ -6309,13 +6402,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                             gpuPaths, &chars, 0);
                         if (status == ERROR_SUCCESS)
                         {
-                            char *path = gpuPaths;
-                            while (*path && numGpuCounters < MAX_GPU_COUNTERS)
+                            /* Para cada tipo de engine, filtrar os paths
+                             * que contem a substring do tipo correspondente */
+                            for (t = 0; t < GPU_ENG_COUNT; t++)
                             {
-                                PDH_HCOUNTER counter = NULL;
-                                if (PdhAddEnglishCounterA(hQuery, path, 0, &counter) == ERROR_SUCCESS && counter)
-                                    hCounterGpu[numGpuCounters++] = counter;
-                                path += strlen(path) + 1;
+                                const char *filterStr = kEngTypes[t].engtype;
+                                int engIdx = kEngTypes[t].idx;
+                                char *path = gpuPaths;
+
+                                while (*path && numGpuCounters[engIdx] < MAX_GPU_COUNTERS)
+                                {
+                                    /* Verificar se este path pertence ao tipo */
+                                    if (strstr(path, filterStr) != NULL)
+                                    {
+                                        PDH_HCOUNTER counter = NULL;
+                                        if (PdhAddEnglishCounterA(hQuery, path, 0, &counter) == ERROR_SUCCESS && counter)
+                                            hCounterGpu[engIdx][numGpuCounters[engIdx]++] = counter;
+                                    }
+                                    path += strlen(path) + 1;
+                                }
                             }
                         }
                         free(gpuPaths);
