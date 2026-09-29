@@ -1,0 +1,3 @@
+timestamp,cpu_pct,ram_pct,disk_read_bps,disk_write_bps,net_down_bps,net_up_bps,gpu_pct,core0_pct,core1_pct,core2_pct,core3_pct,core4_pct,core5_pct,core6_pct,core7_pct,core8_pct,core9_pct,core10_pct,core11_pct,core12_pct,core13_pct,core14_pct,core15_pct,core16_pct,core17_pct,core18_pct,core19_pct
+2026-09-29 10:13:40,0.00,30.00,16240.86,109625.79,0.00,0.00,0.00,0.92,0.00,0.00,8.66,2.47,10.21,13.30,0.92,0.92,0.00,0.00,4.02,2.47,24.14,17.95,0.00,0.92,0.00,0.00
+2026-09-29 10:13:50,0.00,30.00,0.00,0.00,708.00,0.00,0.00,2.99,2.99,0.00,0.00,4.53,0.00,6.07,0.00,2.99,0.00,0.00,4.53,2.99,1.45,1.45,0.00,4.53,1.45,2.99

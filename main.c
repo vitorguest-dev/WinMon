@@ -302,7 +302,7 @@ static double limiteDiscoPercent = LIMITE_DISCO_PERCENT_DEFAULT;
 
 static FILE *hLogCSV = NULL;
 static int logAtivo = 0;
-static int logTickContador = 0;
+static ULONGLONG logUltimoTickMs = 0;   /* instante da ultima linha gravada */
 static char logNomeFicheiro[MAX_PATH] = {0};
 
 static int numZonasTemp = 0;
@@ -679,20 +679,110 @@ static double ObterTemperaturaMaxima(void)
     return maxTemp;
 }
 
-static void RegistarEventoAlerta(const char *recurso, double valor, double limite)
+#define ALERTAS_FICHEIRO "winmon_alertas.csv"
+static unsigned g_alertHistoryRev = 0; /* incrementa a cada alteracao (refresco do dialogo) */
+
+/* Caminho absoluto na pasta do executavel (evita depender do diretorio de trabalho) */
+static void CaminhoDados(const char *nome, char *out, size_t n)
 {
-    AlertaHistoricoItem *item;
+    char *p;
+    DWORD len = GetModuleFileNameA(NULL, out, (DWORD)n);
+    if (len == 0 || len >= n)
+    {
+        snprintf(out, n, "%s", nome);
+        return;
+    }
+    p = strrchr(out, '\\');
+    if (p)
+        *(p + 1) = '\0';
+    else
+        out[0] = '\0';
+    strncat_s(out, n, nome, _TRUNCATE);
+}
+
+static void AlertaAdicionarMemoria(const AlertaHistoricoItem *novo)
+{
     if (g_alertHistoryCount >= ALERT_HISTORY_MAX)
     {
         memmove(&g_alertHistory[0], &g_alertHistory[1],
                 sizeof(g_alertHistory[0]) * (ALERT_HISTORY_MAX - 1));
         g_alertHistoryCount = ALERT_HISTORY_MAX - 1;
     }
-    item = &g_alertHistory[g_alertHistoryCount++];
-    GetLocalTime(&item->timestamp);
-    strncpy_s(item->recurso, sizeof(item->recurso), recurso, _TRUNCATE);
-    item->valor = valor;
-    item->limite = limite;
+    g_alertHistory[g_alertHistoryCount++] = *novo;
+    g_alertHistoryRev++;
+}
+
+static void AlertaGuardarNoFicheiro(const AlertaHistoricoItem *it)
+{
+    char caminho[MAX_PATH];
+    FILE *f = NULL;
+    long tam;
+
+    CaminhoDados(ALERTAS_FICHEIRO, caminho, sizeof(caminho));
+    if (fopen_s(&f, caminho, "a") != 0 || !f)
+        return;
+    fseek(f, 0, SEEK_END);
+    tam = ftell(f);
+    if (tam <= 0)
+        fprintf(f, "timestamp,recurso,valor,limite\n");
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d,%s,%.2f,%.2f\n",
+            it->timestamp.wYear, it->timestamp.wMonth, it->timestamp.wDay,
+            it->timestamp.wHour, it->timestamp.wMinute, it->timestamp.wSecond,
+            it->recurso, it->valor, it->limite);
+    fflush(f);
+    fclose(f);
+}
+
+static void AlertaLimparFicheiro(void)
+{
+    char caminho[MAX_PATH];
+    CaminhoDados(ALERTAS_FICHEIRO, caminho, sizeof(caminho));
+    DeleteFileA(caminho);
+}
+
+static void CarregarHistoricoAlertas(void)
+{
+    char caminho[MAX_PATH];
+    char linha[256];
+    FILE *f = NULL;
+
+    CaminhoDados(ALERTAS_FICHEIRO, caminho, sizeof(caminho));
+    if (fopen_s(&f, caminho, "r") != 0 || !f)
+        return;
+    while (fgets(linha, sizeof(linha), f))
+    {
+        AlertaHistoricoItem it;
+        unsigned a, mo, d, h, mi, se;
+        char rec[32];
+        double v, l;
+        if (sscanf_s(linha, "%u-%u-%u %u:%u:%u,%31[^,],%lf,%lf",
+                     &a, &mo, &d, &h, &mi, &se, rec, (unsigned)sizeof(rec), &v, &l) != 9)
+            continue; /* cabecalho ou linha invalida */
+        ZeroMemory(&it, sizeof(it));
+        it.timestamp.wYear = (WORD)a;
+        it.timestamp.wMonth = (WORD)mo;
+        it.timestamp.wDay = (WORD)d;
+        it.timestamp.wHour = (WORD)h;
+        it.timestamp.wMinute = (WORD)mi;
+        it.timestamp.wSecond = (WORD)se;
+        strncpy_s(it.recurso, sizeof(it.recurso), rec, _TRUNCATE);
+        it.valor = v;
+        it.limite = l;
+        AlertaAdicionarMemoria(&it);
+    }
+    fclose(f);
+}
+
+static void RegistarEventoAlerta(const char *recurso, double valor, double limite)
+{
+    AlertaHistoricoItem item;
+    ZeroMemory(&item, sizeof(item));
+    GetLocalTime(&item.timestamp);
+    strncpy_s(item.recurso, sizeof(item.recurso), recurso, _TRUNCATE);
+    item.valor = valor;
+    item.limite = limite;
+    AlertaAdicionarMemoria(&item);
+    AlertaGuardarNoFicheiro(&item);
 }
 
 static void AtualizarHistoricoAlertas(void)
@@ -3798,17 +3888,23 @@ static void IniciarLogCSV(void)
         return;
 
     GetLocalTime(&st);
-    snprintf(logNomeFicheiro, sizeof(logNomeFicheiro),
-             "winmon_log_%04d%02d%02d_%02d%02d%02d.csv",
-             st.wYear, st.wMonth, st.wDay,
-             st.wHour, st.wMinute, st.wSecond);
+    {
+        char nome[64];
+        snprintf(nome, sizeof(nome),
+                 "winmon_log_%04d%02d%02d_%02d%02d%02d.csv",
+                 st.wYear, st.wMonth, st.wDay,
+                 st.wHour, st.wMinute, st.wSecond);
+        CaminhoDados(nome, logNomeFicheiro, sizeof(logNomeFicheiro));
+    }
 
     err = fopen_s(&hLogCSV, logNomeFicheiro, "a");
     if (err != 0 || !hLogCSV)
     {
-        MessageBoxA(hMainWindow,
-                    "Nao foi possivel criar o ficheiro de log.",
-                    "Erro de Log", MB_OK | MB_ICONERROR);
+        char msg[MAX_PATH + 96];
+        snprintf(msg, sizeof(msg),
+                 "Nao foi possivel criar o ficheiro de log:\n%s\n(erro %d)",
+                 logNomeFicheiro, (int)err);
+        MessageBoxA(hMainWindow, msg, "Erro de Log", MB_OK | MB_ICONERROR);
         hLogCSV = NULL;
         logAtivo = 0;
         return;
@@ -3830,7 +3926,7 @@ static void IniciarLogCSV(void)
     fflush(hLogCSV);
 
     logAtivo = 1;
-    logTickContador = 0;
+    logUltimoTickMs = 0; /* forca gravar a 1.a linha logo no proximo ciclo */
 }
 
 static void FecharLogCSV(void)
@@ -3851,10 +3947,14 @@ static void EscreverLinhaLog(void)
     if (!logAtivo || !hLogCSV)
         return;
 
-    logTickContador++;
-    if (logTickContador < LOG_INTERVALO_SEGUNDOS)
-        return;
-    logTickContador = 0;
+    {
+        /* intervalo em tempo real (independente do intervalo de atualizacao) */
+        ULONGLONG agora = GetTickCount64();
+        if (logUltimoTickMs != 0 &&
+            agora - logUltimoTickMs < (ULONGLONG)LOG_INTERVALO_SEGUNDOS * 1000ULL - 200ULL)
+            return;
+        logUltimoTickMs = agora;
+    }
 
     GetLocalTime(&st);
 
@@ -6317,6 +6417,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         INITCOMMONCONTROLSEX icc;
 
         hMainWindow = hwnd;
+        CarregarHistoricoAlertas();
 
         icc.dwSize = sizeof(icc);
         icc.dwICC = ICC_TAB_CLASSES;
@@ -7115,9 +7216,27 @@ static LRESULT CALLBACK CompactProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 /* ------------------------------------------------------------------------- */
 /* Historico de alertas                                                      */
 /* ------------------------------------------------------------------------- */
+static void PreencherListaAlertas(HWND hList)
+{
+    int i;
+    char linha[192];
+    const SYSTEMTIME *t;
+    SendMessageA(hList, LB_RESETCONTENT, 0, 0);
+    /* mais recentes primeiro */
+    for (i = g_alertHistoryCount - 1; i >= 0; i--)
+    {
+        t = &g_alertHistory[i].timestamp;
+        snprintf(linha, sizeof(linha), "%02d/%02d/%04d %02d:%02d:%02d  |  %s  %.1f (limite %.1f)",
+                 t->wDay, t->wMonth, t->wYear, t->wHour, t->wMinute, t->wSecond,
+                 g_alertHistory[i].recurso, g_alertHistory[i].valor, g_alertHistory[i].limite);
+        SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)linha);
+    }
+}
+
 static LRESULT CALLBACK AlertHistoryProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     static HWND hList = NULL;
+    static unsigned revMostrada = 0;
     (void)lParam;
     switch (msg)
     {
@@ -7128,27 +7247,33 @@ static LRESULT CALLBACK AlertHistoryProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         CreateWindowExA(0, "BUTTON", "Limpar historico", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                         10, 320, 130, 28, hwnd, (HMENU)(UINT_PTR)IDC_ALERT_HISTORY_CLEAR,
                         GetModuleHandle(NULL), NULL);
+        PreencherListaAlertas(hList);
+        revMostrada = g_alertHistoryRev;
+        SetTimer(hwnd, 1, 1000, NULL);
+        return 0;
+    case WM_TIMER:
+        if (hList && revMostrada != g_alertHistoryRev)
         {
-            int i; char linha[192]; SYSTEMTIME *t;
-            for (i = 0; i < g_alertHistoryCount; i++)
-            {
-                t = &g_alertHistory[i].timestamp;
-                snprintf(linha, sizeof(linha), "%02d/%02d/%04d %02d:%02d:%02d  |  %s  %.1f (limite %.1f)",
-                         t->wDay, t->wMonth, t->wYear, t->wHour, t->wMinute, t->wSecond,
-                         g_alertHistory[i].recurso, g_alertHistory[i].valor, g_alertHistory[i].limite);
-                SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)linha);
-            }
+            PreencherListaAlertas(hList);
+            revMostrada = g_alertHistoryRev;
         }
         return 0;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_ALERT_HISTORY_CLEAR && HIWORD(wParam) == BN_CLICKED)
         {
             g_alertHistoryCount = 0;
-            if (hList) SendMessageA(hList, LB_RESETCONTENT, 0, 0);
+            g_alertHistoryRev++;
+            AlertaLimparFicheiro();
+            if (hList)
+            {
+                PreencherListaAlertas(hList);
+                revMostrada = g_alertHistoryRev;
+            }
             return 0;
         }
         break;
     case WM_CLOSE:
+        KillTimer(hwnd, 1);
         hAlertHistory = NULL;
         DestroyWindow(hwnd);
         return 0;
