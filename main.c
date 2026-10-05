@@ -84,11 +84,11 @@ static const IID LOCAL_IID_IWbemLocator =
 #define MAX_GPU_COUNTERS 256
 
 /* Tipos de engine GPU (mesmos que o Gestor de Tarefas monitoriza) */
-#define GPU_ENG_3D      0
-#define GPU_ENG_COPY    1
-#define GPU_ENG_ENCODE  2
-#define GPU_ENG_DECODE  3
-#define GPU_ENG_COUNT   4
+#define GPU_ENG_3D 0
+#define GPU_ENG_COPY 1
+#define GPU_ENG_ENCODE 2
+#define GPU_ENG_DECODE 3
+#define GPU_ENG_COUNT 4
 
 #define LIMITE_RAM_PERCENT_DEFAULT 90.0
 #define LIMITE_DISCO_PERCENT_DEFAULT 95.0
@@ -111,12 +111,12 @@ static const IID LOCAL_IID_IWbemLocator =
 #define OVERLAY_CLASS_NAME "WinMonOverlayClass"
 
 /* Hotkey global: Ctrl+Shift+O para toggle do overlay */
-#define HOTKEY_ID_OVERLAY  1
-#define HOTKEY_ID_COMPACT  2
+#define HOTKEY_ID_OVERLAY 1
+#define HOTKEY_ID_COMPACT 2
 #define HOTKEY_MOD_OVERLAY (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT)
-#define HOTKEY_VK_OVERLAY  'O'
+#define HOTKEY_VK_OVERLAY 'O'
 #define HOTKEY_MOD_COMPACT (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT)
-#define HOTKEY_VK_COMPACT  'C'
+#define HOTKEY_VK_COMPACT 'C'
 
 #define OV_FONT_MIN 8
 #define OV_FONT_MAX 32
@@ -190,7 +190,7 @@ typedef struct
     double diskWrite[HISTORICO_PONTOS];
     double netDown[HISTORICO_PONTOS];
     double netUp[HISTORICO_PONTOS];
-    double gpu[HISTORICO_PONTOS];          /* 3D (usado no overlay) */
+    double gpu[HISTORICO_PONTOS]; /* 3D (usado no overlay) */
     double gpuCopy[HISTORICO_PONTOS];
     double gpuEncode[HISTORICO_PONTOS];
     double gpuDecode[HISTORICO_PONTOS];
@@ -302,7 +302,7 @@ static double limiteDiscoPercent = LIMITE_DISCO_PERCENT_DEFAULT;
 
 static FILE *hLogCSV = NULL;
 static int logAtivo = 0;
-static ULONGLONG logUltimoTickMs = 0;   /* instante da ultima linha gravada */
+static ULONGLONG logUltimoTickMs = 0; /* instante da ultima linha gravada */
 static char logNomeFicheiro[MAX_PATH] = {0};
 
 static int numZonasTemp = 0;
@@ -407,10 +407,10 @@ static double ultimoDiskWrite = 0.0;
 static double ultimoDiscoUsoPercent = 0.0;
 static double ultimoNetDown = 0.0;
 static double ultimoNetUp = 0.0;
-static double ultimoGpuPercent = 0.0;   /* 3D — usado no overlay */
-static double ultimoGpuCopy    = 0.0;
-static double ultimoGpuEncode  = 0.0;
-static double ultimoGpuDecode  = 0.0;
+static double ultimoGpuPercent = 0.0; /* 3D — usado no overlay */
+static double ultimoGpuCopy = 0.0;
+static double ultimoGpuEncode = 0.0;
+static double ultimoGpuDecode = 0.0;
 
 static IntervaloAlerta intervalosAlerta[MAX_ALERT_RANGES];
 static int totalIntervalosAlerta = 0;
@@ -422,6 +422,7 @@ typedef struct
     char recurso[32];
     double valor;
     double limite;
+    char culpado[128];
 } AlertaHistoricoItem;
 
 static AlertaHistoricoItem g_alertHistory[ALERT_HISTORY_MAX];
@@ -492,15 +493,18 @@ typedef struct
     int dragging;
     int dragX;
     int dragStartEnd;
+    int hoverX;
+    int isHovering;
 } GraphViewState;
 
 static GraphViewState g_graphViews[7] = {
-    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
-    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
-    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
-    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
-    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0},
-    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0}};
+    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0, 0, 0},
+    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0, 0, 0},
+    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0, 0, 0},
+    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0, 0, 0},
+    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0, 0, 0},
+    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0, 0, 0},
+    {GRAPH_DEFAULT_VISIBLE, 0, 0, 0, 0, 0, 0}};
 
 static int ovMonitorIndex = 0;
 
@@ -675,7 +679,8 @@ static double ObterTemperaturaMaxima(void)
     double maxTemp = 0.0;
     int i;
     for (i = 0; i < numZonasTemp; i++)
-        if (tempAtual[i] > maxTemp) maxTemp = tempAtual[i];
+        if (tempAtual[i] > maxTemp)
+            maxTemp = tempAtual[i];
     return maxTemp;
 }
 
@@ -721,16 +726,48 @@ static void AlertaGuardarNoFicheiro(const AlertaHistoricoItem *it)
     CaminhoDados(ALERTAS_FICHEIRO, caminho, sizeof(caminho));
     if (fopen_s(&f, caminho, "a") != 0 || !f)
         return;
+
     fseek(f, 0, SEEK_END);
     tam = ftell(f);
     if (tam <= 0)
-        fprintf(f, "timestamp,recurso,valor,limite\n");
-    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d,%s,%.2f,%.2f\n",
+        fprintf(f, "timestamp,recurso,valor,limite,culpado\n");
+
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d,%s,%.2f,%.2f,%s\n",
             it->timestamp.wYear, it->timestamp.wMonth, it->timestamp.wDay,
             it->timestamp.wHour, it->timestamp.wMinute, it->timestamp.wSecond,
-            it->recurso, it->valor, it->limite);
+            it->recurso, it->valor, it->limite, it->culpado);
     fflush(f);
     fclose(f);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Balloon & WMI                                                             */
+/* ------------------------------------------------------------------------- */
+
+static void EnviarBalloon(const char *titulo, const char *msg)
+{
+    ULONGLONG agora = GetTickCount64();
+
+    if (agora - ultimoBalloonTick <
+        (ULONGLONG)BALLOON_COOLDOWN_SEGUNDOS * 1000ULL)
+        return;
+
+    if (!trayIconAtivo)
+    {
+        Shell_NotifyIconA(NIM_ADD, &nid);
+        trayIconAtivo = 1;
+    }
+
+    nid.uFlags |= NIF_INFO;
+    nid.dwInfoFlags = NIIF_WARNING;
+    strncpy_s(nid.szInfoTitle, sizeof(nid.szInfoTitle), titulo, _TRUNCATE);
+    strncpy_s(nid.szInfo, sizeof(nid.szInfo), msg, _TRUNCATE);
+    nid.uTimeout = 5000;
+
+    Shell_NotifyIconA(NIM_MODIFY, &nid);
+
+    nid.uFlags &= ~NIF_INFO;
+    ultimoBalloonTick = agora;
 }
 
 static void AlertaLimparFicheiro(void)
@@ -743,21 +780,27 @@ static void AlertaLimparFicheiro(void)
 static void CarregarHistoricoAlertas(void)
 {
     char caminho[MAX_PATH];
-    char linha[256];
+    char linha[512];
     FILE *f = NULL;
 
     CaminhoDados(ALERTAS_FICHEIRO, caminho, sizeof(caminho));
     if (fopen_s(&f, caminho, "r") != 0 || !f)
         return;
+
     while (fgets(linha, sizeof(linha), f))
     {
         AlertaHistoricoItem it;
         unsigned a, mo, d, h, mi, se;
         char rec[32];
+        char culpado[128] = "Desconhecido";
         double v, l;
-        if (sscanf_s(linha, "%u-%u-%u %u:%u:%u,%31[^,],%lf,%lf",
-                     &a, &mo, &d, &h, &mi, &se, rec, (unsigned)sizeof(rec), &v, &l) != 9)
-            continue; /* cabecalho ou linha invalida */
+
+        int parsed = sscanf_s(linha, "%u-%u-%u %u:%u:%u,%31[^,],%lf,%lf,%127[^\n]",
+                              &a, &mo, &d, &h, &mi, &se, rec, (unsigned)sizeof(rec), &v, &l, culpado, (unsigned)sizeof(culpado));
+
+        if (parsed < 10)
+            continue;
+
         ZeroMemory(&it, sizeof(it));
         it.timestamp.wYear = (WORD)a;
         it.timestamp.wMonth = (WORD)mo;
@@ -768,12 +811,13 @@ static void CarregarHistoricoAlertas(void)
         strncpy_s(it.recurso, sizeof(it.recurso), rec, _TRUNCATE);
         it.valor = v;
         it.limite = l;
+        strncpy_s(it.culpado, sizeof(it.culpado), culpado, _TRUNCATE);
         AlertaAdicionarMemoria(&it);
     }
     fclose(f);
 }
 
-static void RegistarEventoAlerta(const char *recurso, double valor, double limite)
+static void RegistarEventoAlerta(const char *recurso, double valor, double limite, const char *culpado)
 {
     AlertaHistoricoItem item;
     ZeroMemory(&item, sizeof(item));
@@ -781,8 +825,15 @@ static void RegistarEventoAlerta(const char *recurso, double valor, double limit
     strncpy_s(item.recurso, sizeof(item.recurso), recurso, _TRUNCATE);
     item.valor = valor;
     item.limite = limite;
+    strncpy_s(item.culpado, sizeof(item.culpado), culpado ? culpado : "Desconhecido", _TRUNCATE);
+
     AlertaAdicionarMemoria(&item);
     AlertaGuardarNoFicheiro(&item);
+
+    /* Mostrar Balloon Tooltip no Tray imediatamente com o Culpado */
+    char msg[256];
+    snprintf(msg, sizeof(msg), "%s %.1f (limite %.1f)\nCulpado: %s", recurso, valor, limite, item.culpado);
+    EnviarBalloon("Alerta de Sistema", msg);
 }
 
 static void AtualizarHistoricoAlertas(void)
@@ -790,9 +841,27 @@ static void AtualizarHistoricoAlertas(void)
     int cpu = ultimoCpuPercent > limiteCpuPercent;
     int ram = ultimoRamPercent > limiteRamPercent;
     int disco = ultimoDiscoUsoPercent > limiteDiscoPercent;
-    if (cpu && !g_alertCpuAnterior) RegistarEventoAlerta("CPU", ultimoCpuPercent, limiteCpuPercent);
-    if (ram && !g_alertRamAnterior) RegistarEventoAlerta("RAM", ultimoRamPercent, limiteRamPercent);
-    if (disco && !g_alertDiscoAnterior) RegistarEventoAlerta("Disco", ultimoDiscoUsoPercent, limiteDiscoPercent);
+
+    if (cpu && !g_alertCpuAnterior)
+    {
+        char culpado[128] = "Desconhecido";
+        if (totalListaProcessos > 0)
+            snprintf(culpado, sizeof(culpado), "%s (%.1f%%)", listaProcessos[0].exeFile, listaProcessos[0].cpuPercent);
+        RegistarEventoAlerta("CPU", ultimoCpuPercent, limiteCpuPercent, culpado);
+    }
+    if (ram && !g_alertRamAnterior)
+    {
+        char culpado[128] = "Desconhecido";
+        /* Como o array listaProcessos tem o qsort de RAM feito perto do final da rotina de monitorização, a posição 0 será o topo da RAM */
+        if (totalListaProcessos > 0)
+            snprintf(culpado, sizeof(culpado), "%s (%lu MB)", listaProcessos[0].exeFile, (unsigned long)listaProcessos[0].memUsageMB);
+        RegistarEventoAlerta("RAM", ultimoRamPercent, limiteRamPercent, culpado);
+    }
+    if (disco && !g_alertDiscoAnterior)
+    {
+        RegistarEventoAlerta("Disco", ultimoDiscoUsoPercent, limiteDiscoPercent, "I/O Intensivo");
+    }
+
     g_alertCpuAnterior = cpu;
     g_alertRamAnterior = ram;
     g_alertDiscoAnterior = disco;
@@ -816,7 +885,7 @@ static void AdicionarHistorico(double cpu, double ram, double temp,
     historico.netDown[historico.pos] = netDown;
     historico.netUp[historico.pos] = netUp;
     historico.gpu[historico.pos] = gpu;
-    historico.gpuCopy[historico.pos]   = gpuCopy;
+    historico.gpuCopy[historico.pos] = gpuCopy;
     historico.gpuEncode[historico.pos] = gpuEncode;
     historico.gpuDecode[historico.pos] = gpuDecode;
     GetLocalTime(&historico.timestamp[historico.pos]);
@@ -1096,7 +1165,7 @@ void MonitorarGPU(char *buffer, size_t size, size_t *offset)
     static const char *nomeEng[GPU_ENG_COUNT] = {"3D", "Copy", "Encode", "Decode"};
 
     double valores[GPU_ENG_COUNT] = {0.0, 0.0, 0.0, 0.0};
-    int valido[GPU_ENG_COUNT]     = {0,   0,   0,   0  };
+    int valido[GPU_ENG_COUNT] = {0, 0, 0, 0};
     int e, i;
     int algumValido = 0;
 
@@ -1124,16 +1193,17 @@ void MonitorarGPU(char *buffer, size_t size, size_t *offset)
         }
         if (valido[e])
         {
-            if (soma > 100.0) soma = 100.0;
+            if (soma > 100.0)
+                soma = 100.0;
             valores[e] = soma;
             algumValido = 1;
         }
     }
 
-    ultimoGpuPercent = valido[GPU_ENG_3D]     ? valores[GPU_ENG_3D]     : 0.0;
-    ultimoGpuCopy    = valido[GPU_ENG_COPY]   ? valores[GPU_ENG_COPY]   : 0.0;
-    ultimoGpuEncode  = valido[GPU_ENG_ENCODE] ? valores[GPU_ENG_ENCODE] : 0.0;
-    ultimoGpuDecode  = valido[GPU_ENG_DECODE] ? valores[GPU_ENG_DECODE] : 0.0;
+    ultimoGpuPercent = valido[GPU_ENG_3D] ? valores[GPU_ENG_3D] : 0.0;
+    ultimoGpuCopy = valido[GPU_ENG_COPY] ? valores[GPU_ENG_COPY] : 0.0;
+    ultimoGpuEncode = valido[GPU_ENG_ENCODE] ? valores[GPU_ENG_ENCODE] : 0.0;
+    ultimoGpuDecode = valido[GPU_ENG_DECODE] ? valores[GPU_ENG_DECODE] : 0.0;
 
     if (algumValido)
     {
@@ -1599,9 +1669,7 @@ static void DrawSeriesView(HDC hdc, RECT rc, const double *data,
         if (value > maxY)
             value = maxY;
 
-        x = rc.left + (count == 1 ? 0 :
-                       (int)(((double)i / (double)(count - 1)) *
-                             (rc.right - rc.left)));
+        x = rc.left + (count == 1 ? 0 : (int)(((double)i / (double)(count - 1)) * (rc.right - rc.left)));
         y = rc.bottom - (int)((value / maxY) * (rc.bottom - rc.top));
 
         if (!havePoint)
@@ -1624,8 +1692,7 @@ static void DrawTimeLabelsView(HDC hdc, RECT rc, int start, int count)
 
     for (i = 0; i < 5; i++)
     {
-        int sample = (count == 1) ? 0 :
-                     (int)(((long long)(count - 1) * i) / 4);
+        int sample = (count == 1) ? 0 : (int)(((long long)(count - 1) * i) / 4);
         int idx = HistoricoIndex(start + sample);
         char text[64];
         SYSTEMTIME *st = &historico.timestamp[idx];
@@ -1685,12 +1752,8 @@ static void DrawAlertRegionsView(HDC hdc, RECT rc, const double *data,
         if (isnan(value) || value <= threshold)
             continue;
 
-        x1 = rc.left + (count == 1 ? 0 :
-                        (int)(((double)i / (double)(count - 1)) *
-                              (rc.right - rc.left)));
-        x2 = (i == count - 1) ? rc.right :
-             rc.left + (int)(((double)(i + 1) / (double)(count - 1)) *
-                             (rc.right - rc.left));
+        x1 = rc.left + (count == 1 ? 0 : (int)(((double)i / (double)(count - 1)) * (rc.right - rc.left)));
+        x2 = (i == count - 1) ? rc.right : rc.left + (int)(((double)(i + 1) / (double)(count - 1)) * (rc.right - rc.left));
         if (x2 <= x1)
             x2 = x1 + 1;
 
@@ -1787,41 +1850,71 @@ static void DrawGraphLegend(HDC hdc, RECT *rc, const char *title,
     SelectObject(hdc, oldFont);
 }
 
-static void DrawDashboardCard(HDC hdc, RECT rc, const char *label,
-                              const char *value, COLORREF accent)
+static HFONT g_hValueFont = NULL;
+
+static void DrawDashboardCardLively(HDC hdc, RECT rc, const char *label, const char *value,
+                                    COLORREF accentBase, const double *historyData, double maxLim)
 {
+    double currentVal = 0.0;
+    if (historico.count > 0 && historyData)
+        currentVal = historyData[HistoricoIndex(historico.count - 1)];
+
+    COLORREF markerColor = accentBase;
+    if (maxLim > 0.0)
+    {
+        if (currentVal >= maxLim)
+            markerColor = RGB(220, 50, 50);
+        else if (currentVal >= maxLim * 0.85)
+            markerColor = RGB(220, 150, 20);
+    }
+
     HBRUSH panel = CreateSolidBrush(RGB(255, 255, 255));
-    HBRUSH marker = CreateSolidBrush(accent);
+    HBRUSH marker = CreateSolidBrush(markerColor);
     RECT markerRect = {rc.left, rc.top, rc.left + 5, rc.bottom};
     RECT labelRect = {rc.left + 16, rc.top + 12, rc.right - 10, rc.top + 31};
     RECT valueRect = {rc.left + 16, rc.top + 31, rc.right - 10, rc.bottom - 10};
-    HFONT oldFont;
-    HFONT valueFont;
 
     FillRect(hdc, &rc, panel);
     FillRect(hdc, &markerRect, marker);
     DeleteObject(panel);
     DeleteObject(marker);
 
+    /* Renderização da Sparkline e limite */
+    if (historico.count > 0 && maxLim > 0.0 && historyData)
+    {
+        int sparkPts = (historico.count < 60) ? historico.count : 60;
+        HPEN sparkPen = CreatePen(PS_SOLID, 1, RGB(230, 235, 240));
+        HPEN oldPen = (HPEN)SelectObject(hdc, sparkPen);
+
+        for (int i = 0; i < sparkPts; i++)
+        {
+            int idx = HistoricoIndex(historico.count - sparkPts + i);
+            double v = historyData[idx];
+            if (v > maxLim * 1.2)
+                v = maxLim * 1.2;
+
+            int divisor = (sparkPts == 1) ? 1 : sparkPts - 1;
+            int x = rc.left + 16 + (i * (rc.right - rc.left - 26)) / divisor;
+            int y = rc.bottom - 5 - (int)((v / (maxLim * 1.2)) * (rc.bottom - rc.top - 40));
+
+            if (i == 0)
+                MoveToEx(hdc, x, y, NULL);
+            else
+                LineTo(hdc, x, y);
+        }
+        SelectObject(hdc, oldPen);
+        DeleteObject(sparkPen);
+    }
+
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, RGB(102, 108, 116));
-    oldFont = (HFONT)SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
-    DrawTextA(hdc, label, -1, &labelRect,
-              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    HFONT oldFont = (HFONT)SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    DrawTextA(hdc, label, -1, &labelRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    valueFont = CreateFontA(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                            ANSI_CHARSET, OUT_DEFAULT_PRECIS,
-                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                            DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-    if (valueFont)
-        SelectObject(hdc, valueFont);
+    SelectObject(hdc, g_hValueFont);
     SetTextColor(hdc, RGB(32, 38, 45));
-    DrawTextA(hdc, value, -1, &valueRect,
-              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
+    DrawTextA(hdc, value, -1, &valueRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     SelectObject(hdc, oldFont);
-    if (valueFont)
-        DeleteObject(valueFont);
 }
 
 static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
@@ -1893,34 +1986,34 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
             if (i == 0)
             {
                 snprintf(value, sizeof(value), "%.1f%%", ultimoCpuPercent);
-                DrawDashboardCard(bufferDc, card, "CPU", value,
-                                  g_mainConfig.corGraficoCpu);
+                DrawDashboardCardLively(bufferDc, card, "CPU", value,
+                                        g_mainConfig.corGraficoCpu, historico.cpu, limiteCpuPercent);
             }
             else if (i == 1)
             {
                 snprintf(value, sizeof(value), "%.0f%%", ultimoRamPercent);
-                DrawDashboardCard(bufferDc, card, "Memoria", value,
-                                  g_mainConfig.corGraficoRam);
+                DrawDashboardCardLively(bufferDc, card, "Memoria", value,
+                                        g_mainConfig.corGraficoRam, historico.ram, limiteRamPercent);
             }
             else if (i == 2)
             {
                 snprintf(value, sizeof(value), "%.1f MB/s",
                          (ultimoDiskRead + ultimoDiskWrite) / 1048576.0);
-                DrawDashboardCard(bufferDc, card, "Disco I/O", value,
-                                  g_mainConfig.corGraficoDiscoRead);
+                DrawDashboardCardLively(bufferDc, card, "Disco I/O", value,
+                                        g_mainConfig.corGraficoDiscoRead, historico.diskRead, 500.0 * 1048576.0);
             }
             else if (i == 3)
             {
                 snprintf(value, sizeof(value), "%.1f MB/s",
                          (ultimoNetDown + ultimoNetUp) / 1048576.0);
-                DrawDashboardCard(bufferDc, card, "Rede", value,
-                                  g_mainConfig.corGraficoNetDown);
+                DrawDashboardCardLively(bufferDc, card, "Rede", value,
+                                        g_mainConfig.corGraficoNetDown, historico.netDown, 100.0 * 1048576.0);
             }
             else
             {
                 snprintf(value, sizeof(value), "%.1f%%", ultimoGpuPercent);
-                DrawDashboardCard(bufferDc, card, "GPU", value,
-                                  g_mainConfig.corGraficoGpu);
+                DrawDashboardCardLively(bufferDc, card, "GPU", value,
+                                        g_mainConfig.corGraficoGpu, historico.gpu, 100.0);
             }
         }
 
@@ -2207,10 +2300,10 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
         names[1] = "Copy";
         names[2] = "Encode";
         names[3] = "Decode";
-        colors[0] = g_mainConfig.corGraficoGpu;          /* roxo  */
-        colors[1] = RGB(80,  180, 220);                  /* azul  */
-        colors[2] = RGB(80,  210, 130);                  /* verde */
-        colors[3] = RGB(220, 160,  60);                  /* laranja */
+        colors[0] = g_mainConfig.corGraficoGpu; /* roxo  */
+        colors[1] = RGB(80, 180, 220);          /* azul  */
+        colors[2] = RGB(80, 210, 130);          /* verde */
+        colors[3] = RGB(220, 160, 60);          /* laranja */
         n = 4;
         snprintf(currentText, sizeof(currentText),
                  "3D:%.1f%%  Cp:%.1f%%  En:%.1f%%  De:%.1f%%",
@@ -2218,9 +2311,9 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
                  ultimoGpuEncode, ultimoGpuDecode);
         DrawGraphLegend(hdc, &client, "GPU — utilizacao por engine", names, colors, n, currentText);
         DrawGraphGrid(hdc, graph, 100.0);
-        DrawSeriesView(hdc, graph, historico.gpu,       viewStart, viewCount,
+        DrawSeriesView(hdc, graph, historico.gpu, viewStart, viewCount,
                        100.0, colors[0], g_mainConfig.espessuraLinhas);
-        DrawSeriesView(hdc, graph, historico.gpuCopy,   viewStart, viewCount,
+        DrawSeriesView(hdc, graph, historico.gpuCopy, viewStart, viewCount,
                        100.0, colors[1], g_mainConfig.espessuraLinhas);
         DrawSeriesView(hdc, graph, historico.gpuEncode, viewStart, viewCount,
                        100.0, colors[2], g_mainConfig.espessuraLinhas);
@@ -2276,7 +2369,73 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
     }
 
     if (type >= GRAPH_CPU && type <= GRAPH_PROCESS)
+    {
         DrawGraphViewportInfo(hdc, client, graph, type, viewStart, viewCount);
+
+        GraphViewState *view = &g_graphViews[type];
+        if (view->isHovering && view->hoverX >= graph.left && view->hoverX <= graph.right && viewCount > 0)
+        {
+            HPEN crossPen = CreatePen(PS_DOT, 1, RGB(100, 100, 100));
+            HPEN oldPen = (HPEN)SelectObject(hdc, crossPen);
+
+            MoveToEx(hdc, view->hoverX, graph.top, NULL);
+            LineTo(hdc, view->hoverX, graph.bottom);
+            SelectObject(hdc, oldPen);
+            DeleteObject(crossPen);
+
+            double ratio = (double)(view->hoverX - graph.left) / (graph.right - graph.left);
+            if (ratio < 0)
+                ratio = 0;
+            if (ratio > 1)
+                ratio = 1;
+
+            int sampleOffset = (int)(ratio * (viewCount - 1));
+            int idx = HistoricoIndex(viewStart + sampleOffset);
+
+            char tip[64];
+            SYSTEMTIME st = historico.timestamp[idx];
+            double val = 0.0;
+
+            switch (type)
+            {
+            case GRAPH_CPU:
+                val = historico.cpu[idx];
+                break;
+            case GRAPH_RAM:
+                val = historico.ram[idx];
+                break;
+            case GRAPH_TEMP:
+                val = historico.temp[idx];
+                break;
+            case GRAPH_DISK:
+                val = (historico.diskRead[idx] + historico.diskWrite[idx]) / 1048576.0;
+                break;
+            case GRAPH_NET:
+                val = (historico.netDown[idx] + historico.netUp[idx]) / 1048576.0;
+                break;
+            case GRAPH_GPU:
+                val = historico.gpu[idx];
+                break;
+            case GRAPH_PROCESS:
+                val = processoCpuTop[idx];
+                break;
+            }
+
+            snprintf(tip, sizeof(tip), "%02d:%02d:%02d | %.1f", st.wHour, st.wMinute, st.wSecond, val);
+
+            RECT tipRect = {view->hoverX + 10, graph.top + 10, view->hoverX + 140, graph.top + 30};
+            /* Prevenir que a tooltip saia pelo limite direito do ecrã */
+            if (tipRect.right > client.right)
+            {
+                tipRect.left = view->hoverX - 140;
+                tipRect.right = view->hoverX - 10;
+            }
+            FillRect(hdc, &tipRect, (HBRUSH)GetStockObject(WHITE_BRUSH));
+            FrameRect(hdc, &tipRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            SetTextColor(hdc, RGB(0, 0, 0));
+            DrawTextA(hdc, tip, -1, &tipRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
 }
 
 LRESULT CALLBACK GraphProc(HWND hwnd, UINT msg,
@@ -2314,36 +2473,60 @@ LRESULT CALLBACK GraphProc(HWND hwnd, UINT msg,
         return 0;
 
     case WM_MOUSEMOVE:
-        if (type >= GRAPH_CPU && type <= GRAPH_PROCESS &&
-            g_graphViews[type].dragging &&
-            historico.count > 0)
+        if (type >= GRAPH_CPU && type <= GRAPH_PROCESS)
         {
-            RECT client;
             GraphViewState *view = &g_graphViews[type];
-            int x = GET_X_LPARAM(lParam);
-            int visible = view->visible;
-            int width;
-            int deltaSamples;
-            int maxEnd;
-            GetClientRect(hwnd, &client);
-            width = client.right - 78;
-            if (visible < 2)
-                visible = 2;
-            if (width < 1)
-                width = 1;
-            deltaSamples = (int)(((long long)(view->dragX - x) *
-                                  (visible - 1)) / width);
-            view->endOffset = view->dragStartEnd + deltaSamples;
-            maxEnd = historico.count - visible;
-            if (maxEnd < 0)
-                maxEnd = 0;
-            if (view->endOffset < 0)
-                view->endOffset = 0;
-            if (view->endOffset > maxEnd)
-                view->endOffset = maxEnd;
+            if (view->dragging && historico.count > 0)
+            {
+                RECT client;
+                int x = GET_X_LPARAM(lParam);
+                int visible = view->visible;
+                int width;
+                int deltaSamples;
+                int maxEnd;
+                GetClientRect(hwnd, &client);
+                width = client.right - 78;
+                if (visible < 2)
+                    visible = 2;
+                if (width < 1)
+                    width = 1;
+                deltaSamples = (int)(((long long)(view->dragX - x) * (visible - 1)) / width);
+                view->endOffset = view->dragStartEnd + deltaSamples;
+                maxEnd = historico.count - visible;
+                if (maxEnd < 0)
+                    maxEnd = 0;
+                if (view->endOffset < 0)
+                    view->endOffset = 0;
+                if (view->endOffset > maxEnd)
+                    view->endOffset = maxEnd;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            else if (historico.count > 0)
+            {
+                view->hoverX = GET_X_LPARAM(lParam);
+                view->isHovering = 1;
+
+                TRACKMOUSEEVENT tme;
+                tme.cbSize = sizeof(TRACKMOUSEEVENT);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                tme.dwHoverTime = 0;
+                TrackMouseEvent(&tme);
+
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        if (type >= GRAPH_CPU && type <= GRAPH_PROCESS)
+        {
+            g_graphViews[type].isHovering = 0;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
+
+        /* Mantenha o resto que lá estava para WM_LBUTTONUP, WM_LBUTTONDBLCLK, etc. */
 
     case WM_LBUTTONUP:
         if (type >= GRAPH_CPU && type <= GRAPH_PROCESS &&
@@ -2510,8 +2693,8 @@ static void AtualizarHistoricoProcessos(void)
 }
 
 static void DrawSeriesProcessView(HDC hdc, RECT rc, const double *data,
-                                   int count, int pos, double maxY,
-                                   COLORREF color)
+                                  int count, int pos, double maxY,
+                                  COLORREF color)
 {
     HPEN pen;
     HPEN oldPen;
@@ -2546,9 +2729,7 @@ static void DrawSeriesProcessView(HDC hdc, RECT rc, const double *data,
             value = 0.0;
         if (value > maxY)
             value = maxY;
-        x = rc.left + (count == 1 ? 0 :
-                       (int)(((double)i / (double)(count - 1)) *
-                             (rc.right - rc.left)));
+        x = rc.left + (count == 1 ? 0 : (int)(((double)i / (double)(count - 1)) * (rc.right - rc.left)));
         y = rc.bottom - (int)((value / maxY) * (rc.bottom - rc.top));
         if (!havePoint)
             MoveToEx(hdc, x, y, NULL);
@@ -2866,7 +3047,6 @@ void AtualizarTituloJanela()
     SetWindowTextA(hMainWindow, titulo);
 }
 
-
 void AtualizarTooltipTray()
 {
     /* Atualizar sempre o szTip (mesmo sem tray visível) para que fique
@@ -3053,33 +3233,44 @@ static void ExportarGraficoPNG(HWND hwndGraph)
         goto cleanup;
 
     hr = factory->lpVtbl->CreateStream(factory, &stream);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
     hr = stream->lpVtbl->InitializeFromFilename(stream, wpath, GENERIC_WRITE);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
 
     hr = factory->lpVtbl->CreateEncoder(factory, &GUID_ContainerFormatPng,
-                                         NULL, &encoder);
-    if (FAILED(hr)) goto cleanup;
+                                        NULL, &encoder);
+    if (FAILED(hr))
+        goto cleanup;
     hr = encoder->lpVtbl->Initialize(encoder, (IStream *)stream,
                                      WICBitmapEncoderNoCache);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
 
     hr = encoder->lpVtbl->CreateNewFrame(encoder, &frame, NULL);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
     hr = frame->lpVtbl->Initialize(frame, NULL);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
     hr = frame->lpVtbl->SetSize(frame, width, height);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
 
     format = GUID_WICPixelFormat32bppBGRA;
     hr = frame->lpVtbl->SetPixelFormat(frame, &format);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
     hr = frame->lpVtbl->WritePixels(frame, height, stride, sizeBytes, pixels);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
     hr = frame->lpVtbl->Commit(frame);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
     hr = encoder->lpVtbl->Commit(encoder);
-    if (FAILED(hr)) goto cleanup;
+    if (FAILED(hr))
+        goto cleanup;
     success = 1;
 
 cleanup:
@@ -3089,16 +3280,26 @@ cleanup:
     else if (ofn.lpstrFile[0] && nome[0])
         MessageBoxA(hMainWindow, "Nao foi possivel exportar o grafico para PNG.",
                     "Erro ao exportar grafico", MB_OK | MB_ICONERROR);
-    if (frame) frame->lpVtbl->Release(frame);
-    if (encoder) encoder->lpVtbl->Release(encoder);
-    if (stream) stream->lpVtbl->Release(stream);
-    if (factory) factory->lpVtbl->Release(factory);
-    if (coNeedUninit) CoUninitialize();
-    if (pixels) free(pixels);
-    if (oldBmp) SelectObject(mem, oldBmp);
-    if (bmp) DeleteObject(bmp);
-    if (mem) DeleteDC(mem);
-    if (screen) ReleaseDC(hwndGraph, screen);
+    if (frame)
+        frame->lpVtbl->Release(frame);
+    if (encoder)
+        encoder->lpVtbl->Release(encoder);
+    if (stream)
+        stream->lpVtbl->Release(stream);
+    if (factory)
+        factory->lpVtbl->Release(factory);
+    if (coNeedUninit)
+        CoUninitialize();
+    if (pixels)
+        free(pixels);
+    if (oldBmp)
+        SelectObject(mem, oldBmp);
+    if (bmp)
+        DeleteObject(bmp);
+    if (mem)
+        DeleteDC(mem);
+    if (screen)
+        ReleaseDC(hwndGraph, screen);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -4711,36 +4912,6 @@ static void MostrarDialogoConfigTray(HWND hwndPai)
 #undef CTRL
 }
 
-/* ------------------------------------------------------------------------- */
-/* Balloon & WMI                                                             */
-/* ------------------------------------------------------------------------- */
-
-static void EnviarBalloon(const char *titulo, const char *msg)
-{
-    ULONGLONG agora = GetTickCount64();
-
-    if (agora - ultimoBalloonTick <
-        (ULONGLONG)BALLOON_COOLDOWN_SEGUNDOS * 1000ULL)
-        return;
-
-    if (!trayIconAtivo)
-    {
-        Shell_NotifyIconA(NIM_ADD, &nid);
-        trayIconAtivo = 1;
-    }
-
-    nid.uFlags |= NIF_INFO;
-    nid.dwInfoFlags = NIIF_WARNING;
-    strncpy_s(nid.szInfoTitle, sizeof(nid.szInfoTitle), titulo, _TRUNCATE);
-    strncpy_s(nid.szInfo, sizeof(nid.szInfo), msg, _TRUNCATE);
-    nid.uTimeout = 5000;
-
-    Shell_NotifyIconA(NIM_MODIFY, &nid);
-
-    nid.uFlags &= ~NIF_INFO;
-    ultimoBalloonTick = agora;
-}
-
 static void VerificarAlertasBalloon(void)
 {
     if (!alertaGlobalAtivo)
@@ -5329,7 +5500,7 @@ static BOOL ObterAreaMonitor(int monitorIndex, RECT *workArea)
 }
 
 static BOOL CALLBACK ContarMonitorCallback(HMONITOR hMon, HDC hdcMon,
-                                             LPRECT lprcMon, LPARAM lParam)
+                                           LPRECT lprcMon, LPARAM lParam)
 {
     int *count = (int *)lParam;
     (void)hMon;
@@ -5654,9 +5825,9 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
                 col = (OvColuna){"GPU", ovPerfis[ovPerfilActivo].corTextoLabel, vBuf, sBuf,
                                  ultimoGpuPercent, RGB(120, 80, 190)};
             }
-            else if (numGpuCounters[GPU_ENG_COPY]   > 0 ||
-                     numGpuCounters[GPU_ENG_ENCODE]  > 0 ||
-                     numGpuCounters[GPU_ENG_DECODE]  > 0)
+            else if (numGpuCounters[GPU_ENG_COPY] > 0 ||
+                     numGpuCounters[GPU_ENG_ENCODE] > 0 ||
+                     numGpuCounters[GPU_ENG_DECODE] > 0)
             {
                 /* GPU sem engine 3D (ex: iGPU sem DX) — mostrar N/A para 3D */
                 snprintf(vBuf, sizeof(vBuf), "N/A");
@@ -6417,6 +6588,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         INITCOMMONCONTROLSEX icc;
 
         hMainWindow = hwnd;
+        g_hValueFont = CreateFontA(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                   ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                   DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+
         CarregarHistoricoAlertas();
 
         icc.dwSize = sizeof(icc);
@@ -6478,11 +6654,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
              */
             {
                 /* Padroes de filtragem por tipo de engine */
-                static const struct { int idx; const char *engtype; } kEngTypes[GPU_ENG_COUNT] = {
-                    { GPU_ENG_3D,     "engtype_3D"          },
-                    { GPU_ENG_COPY,   "engtype_Copy"        },
-                    { GPU_ENG_ENCODE, "engtype_VideoEncode" },
-                    { GPU_ENG_DECODE, "engtype_VideoDecode" },
+                static const struct
+                {
+                    int idx;
+                    const char *engtype;
+                } kEngTypes[GPU_ENG_COUNT] = {
+                    {GPU_ENG_3D, "engtype_3D"},
+                    {GPU_ENG_COPY, "engtype_Copy"},
+                    {GPU_ENG_ENCODE, "engtype_VideoEncode"},
+                    {GPU_ENG_DECODE, "engtype_VideoDecode"},
                 };
                 int t;
 
@@ -6623,6 +6803,83 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 {
                     AbrirDetalheProcesso(g_lvProcessos[pnm->iItem].pid,
                                          g_lvProcessos[pnm->iItem].exeFile);
+                }
+                return 0;
+            }
+
+            /* --- NOVO CÓDIGO: Menu de Contexto (Right-Click) --- */
+            if (hdr->code == NM_RCLICK)
+            {
+                NMITEMACTIVATE *pnm = (NMITEMACTIVATE *)lParam;
+                if (pnm->iItem != -1 && pnm->iItem < g_lvTotal)
+                {
+                    DWORD pid = g_lvProcessos[pnm->iItem].pid;
+                    char pidStr[16];
+                    snprintf(pidStr, sizeof(pidStr), "%u", pid);
+
+                    HMENU hMenu = CreatePopupMenu();
+                    AppendMenuA(hMenu, MF_STRING, 1, "Terminar Processo");
+                    AppendMenuA(hMenu, MF_STRING, 2, "Definir Prioridade Alta");
+                    AppendMenuA(hMenu, MF_STRING, 3, "Abrir Localizacao do Ficheiro");
+                    AppendMenuA(hMenu, MF_STRING, 4, "Copiar PID");
+
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    UINT cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+                    DestroyMenu(hMenu);
+
+                    HANDLE hProc;
+                    switch (cmd)
+                    {
+                    case 1:
+                        if (MessageBoxA(hwnd, "Terminar este processo pode causar instabilidade. Deseja continuar?", "Aviso", MB_YESNO | MB_ICONWARNING) == IDYES)
+                        {
+                            hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                            if (hProc)
+                            {
+                                TerminateProcess(hProc, 0);
+                                CloseHandle(hProc);
+                            }
+                        }
+                        break;
+                    case 2:
+                        hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+                        if (hProc)
+                        {
+                            SetPriorityClass(hProc, HIGH_PRIORITY_CLASS);
+                            CloseHandle(hProc);
+                        }
+                        break;
+                    case 3:
+                        hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                        if (hProc)
+                        {
+                            char path[MAX_PATH];
+                            DWORD size = MAX_PATH;
+                            if (QueryFullProcessImageNameA(hProc, 0, path, &size))
+                            {
+                                char args[MAX_PATH + 32];
+                                snprintf(args, sizeof(args), "/select,\"%s\"", path);
+                                ShellExecuteA(NULL, "open", "explorer.exe", args, NULL, SW_SHOW);
+                            }
+                            CloseHandle(hProc);
+                        }
+                        break;
+                    case 4:
+                        if (OpenClipboard(hwnd))
+                        {
+                            EmptyClipboard();
+                            HGLOBAL hGlb = GlobalAlloc(GMEM_MOVEABLE, strlen(pidStr) + 1);
+                            if (hGlb)
+                            {
+                                memcpy(GlobalLock(hGlb), pidStr, strlen(pidStr) + 1);
+                                GlobalUnlock(hGlb);
+                                SetClipboardData(CF_TEXT, hGlb);
+                            }
+                            CloseClipboard();
+                        }
+                        break;
+                    }
                 }
                 return 0;
             }
@@ -6814,11 +7071,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         {
             if (abaAtual >= 1 && abaAtual <= 6)
             {
-                HWND graph = (abaAtual == 1) ? hGraphCPU :
-                             (abaAtual == 2) ? hGraphRAM :
-                             (abaAtual == 3) ? hGraphTemp :
-                             (abaAtual == 4) ? hGraphDisk :
-                             (abaAtual == 5) ? hGraphNet : hGraphGPU;
+                HWND graph = (abaAtual == 1) ? hGraphCPU : (abaAtual == 2) ? hGraphRAM
+                                                       : (abaAtual == 3)   ? hGraphTemp
+                                                       : (abaAtual == 4)   ? hGraphDisk
+                                                       : (abaAtual == 5)   ? hGraphNet
+                                                                           : hGraphGPU;
                 ExportarGraficoPNG(graph);
             }
             return 0;
@@ -7001,25 +7258,39 @@ static void AplicarVisibilidadeModoNormal(void)
     if (hBtnGraphPNG)
         ShowWindow(hBtnGraphPNG, SW_SHOW);
 
-    if (hGraphCPU) ShowWindow(hGraphCPU, SW_SHOW);
-    if (hGraphRAM) ShowWindow(hGraphRAM, SW_SHOW);
-    if (hGraphTemp) ShowWindow(hGraphTemp, SW_SHOW);
-    if (hGraphDisk) ShowWindow(hGraphDisk, SW_SHOW);
-    if (hGraphNet) ShowWindow(hGraphNet, SW_SHOW);
-    if (hGraphGPU) ShowWindow(hGraphGPU, SW_SHOW);
-    if (hGraphProcesses) ShowWindow(hGraphProcesses, SW_SHOW);
+    if (hGraphCPU)
+        ShowWindow(hGraphCPU, SW_SHOW);
+    if (hGraphRAM)
+        ShowWindow(hGraphRAM, SW_SHOW);
+    if (hGraphTemp)
+        ShowWindow(hGraphTemp, SW_SHOW);
+    if (hGraphDisk)
+        ShowWindow(hGraphDisk, SW_SHOW);
+    if (hGraphNet)
+        ShowWindow(hGraphNet, SW_SHOW);
+    if (hGraphGPU)
+        ShowWindow(hGraphGPU, SW_SHOW);
+    if (hGraphProcesses)
+        ShowWindow(hGraphProcesses, SW_SHOW);
 
-    if (hPainelProcessos) ShowWindow(hPainelProcessos, SW_SHOW);
-    if (hEditPesquisaProc) ShowWindow(hEditPesquisaProc, SW_SHOW);
-    if (hLabelProcCount) ShowWindow(hLabelProcCount, SW_SHOW);
-    if (hListViewProc) ShowWindow(hListViewProc, SW_SHOW);
+    if (hPainelProcessos)
+        ShowWindow(hPainelProcessos, SW_SHOW);
+    if (hEditPesquisaProc)
+        ShowWindow(hEditPesquisaProc, SW_SHOW);
+    if (hLabelProcCount)
+        ShowWindow(hLabelProcCount, SW_SHOW);
+    if (hListViewProc)
+        ShowWindow(hListViewProc, SW_SHOW);
 
-    if (hSettingsTitle) ShowWindow(hSettingsTitle, SW_SHOW);
+    if (hSettingsTitle)
+        ShowWindow(hSettingsTitle, SW_SHOW);
     for (i = 0; i < SETTINGS_SECTIONS; i++)
     {
-        if (hSettingsHeaders[i]) ShowWindow(hSettingsHeaders[i], SW_SHOW);
+        if (hSettingsHeaders[i])
+            ShowWindow(hSettingsHeaders[i], SW_SHOW);
         for (j = 0; j < 4; j++)
-            if (hSettingsActions[i][j]) ShowWindow(hSettingsActions[i][j], SW_SHOW);
+            if (hSettingsActions[i][j])
+                ShowWindow(hSettingsActions[i][j], SW_SHOW);
     }
 
     {
@@ -7043,35 +7314,58 @@ static void ToggleCompactMode(void)
         g_normalExStyle = GetWindowLongPtr(hMainWindow, GWL_EXSTYLE);
 
         g_compactMode = 1;
-        if (hTab) ShowWindow(hTab, SW_HIDE);
-        if (hEdit) ShowWindow(hEdit, SW_HIDE);
-        if (hDashboard) ShowWindow(hDashboard, SW_HIDE);
-        if (hBtnOverlay) ShowWindow(hBtnOverlay, SW_HIDE);
-        if (hBtnInterval) ShowWindow(hBtnInterval, SW_HIDE);
-        if (hBtnEstiloMain) ShowWindow(hBtnEstiloMain, SW_HIDE);
-        if (hBtnGraphPNG) ShowWindow(hBtnGraphPNG, SW_HIDE);
+        if (hTab)
+            ShowWindow(hTab, SW_HIDE);
+        if (hEdit)
+            ShowWindow(hEdit, SW_HIDE);
+        if (hDashboard)
+            ShowWindow(hDashboard, SW_HIDE);
+        if (hBtnOverlay)
+            ShowWindow(hBtnOverlay, SW_HIDE);
+        if (hBtnInterval)
+            ShowWindow(hBtnInterval, SW_HIDE);
+        if (hBtnEstiloMain)
+            ShowWindow(hBtnEstiloMain, SW_HIDE);
+        if (hBtnGraphPNG)
+            ShowWindow(hBtnGraphPNG, SW_HIDE);
         for (int i = 0; i < NUM_ABAS; i++)
-            if (hNav[i]) ShowWindow(hNav[i], SW_HIDE);
-        if (hGraphCPU) ShowWindow(hGraphCPU, SW_HIDE);
-        if (hGraphRAM) ShowWindow(hGraphRAM, SW_HIDE);
-        if (hGraphTemp) ShowWindow(hGraphTemp, SW_HIDE);
-        if (hGraphDisk) ShowWindow(hGraphDisk, SW_HIDE);
-        if (hGraphNet) ShowWindow(hGraphNet, SW_HIDE);
-        if (hGraphGPU) ShowWindow(hGraphGPU, SW_HIDE);
-        if (hGraphProcesses) ShowWindow(hGraphProcesses, SW_HIDE);
-        if (hPainelProcessos) ShowWindow(hPainelProcessos, SW_HIDE);
-        if (hEditPesquisaProc) ShowWindow(hEditPesquisaProc, SW_HIDE);
-        if (hLabelProcCount) ShowWindow(hLabelProcCount, SW_HIDE);
-        if (hListViewProc) ShowWindow(hListViewProc, SW_HIDE);
-        if (hSettingsTitle) ShowWindow(hSettingsTitle, SW_HIDE);
+            if (hNav[i])
+                ShowWindow(hNav[i], SW_HIDE);
+        if (hGraphCPU)
+            ShowWindow(hGraphCPU, SW_HIDE);
+        if (hGraphRAM)
+            ShowWindow(hGraphRAM, SW_HIDE);
+        if (hGraphTemp)
+            ShowWindow(hGraphTemp, SW_HIDE);
+        if (hGraphDisk)
+            ShowWindow(hGraphDisk, SW_HIDE);
+        if (hGraphNet)
+            ShowWindow(hGraphNet, SW_HIDE);
+        if (hGraphGPU)
+            ShowWindow(hGraphGPU, SW_HIDE);
+        if (hGraphProcesses)
+            ShowWindow(hGraphProcesses, SW_HIDE);
+        if (hPainelProcessos)
+            ShowWindow(hPainelProcessos, SW_HIDE);
+        if (hEditPesquisaProc)
+            ShowWindow(hEditPesquisaProc, SW_HIDE);
+        if (hLabelProcCount)
+            ShowWindow(hLabelProcCount, SW_HIDE);
+        if (hListViewProc)
+            ShowWindow(hListViewProc, SW_HIDE);
+        if (hSettingsTitle)
+            ShowWindow(hSettingsTitle, SW_HIDE);
         for (int i = 0; i < SETTINGS_SECTIONS; i++)
             for (int j = 0; j < 4; j++)
-                if (hSettingsActions[i][j]) ShowWindow(hSettingsActions[i][j], SW_HIDE);
+                if (hSettingsActions[i][j])
+                    ShowWindow(hSettingsActions[i][j], SW_HIDE);
         for (int i = 0; i < SETTINGS_SECTIONS; i++)
-            if (hSettingsHeaders[i]) ShowWindow(hSettingsHeaders[i], SW_HIDE);
+            if (hSettingsHeaders[i])
+                ShowWindow(hSettingsHeaders[i], SW_HIDE);
         {
             HWND hBtnCfg = GetDlgItem(hMainWindow, ID_CONFIG_OVERLAY);
-            if (hBtnCfg) ShowWindow(hBtnCfg, SW_HIDE);
+            if (hBtnCfg)
+                ShowWindow(hBtnCfg, SW_HIDE);
         }
 
         SetWindowLongPtr(hMainWindow, GWL_STYLE,
@@ -7086,14 +7380,14 @@ static void ToggleCompactMode(void)
                      SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         if (hCompact)
             ShowWindow(hCompact, SW_SHOW);
-        SetWindowTextA(hMainWindow, alertaGlobalAtivo ?
-                       "WinMon — Compacto  [!]" : "WinMon — Compacto");
+        SetWindowTextA(hMainWindow, alertaGlobalAtivo ? "WinMon — Compacto  [!]" : "WinMon — Compacto");
         AtualizarCompacto();
     }
     else
     {
         g_compactMode = 0;
-        if (hCompact) ShowWindow(hCompact, SW_HIDE);
+        if (hCompact)
+            ShowWindow(hCompact, SW_HIDE);
         SetWindowLongPtr(hMainWindow, GWL_STYLE, g_normalStyle);
         SetWindowLongPtr(hMainWindow, GWL_EXSTYLE, g_normalExStyle);
         SetWindowPos(hMainWindow, NULL,
@@ -7103,9 +7397,7 @@ static void ToggleCompactMode(void)
                      SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER);
         AplicarVisibilidadeModoNormal();
         SetWindowTextA(hMainWindow,
-                       alertaGlobalAtivo ?
-                       "Monitor de Hardware & Sistema (Win32) v6  —  [!] ALERTA" :
-                       "Monitor de Hardware & Sistema (Win32) v6");
+                       alertaGlobalAtivo ? "Monitor de Hardware & Sistema (Win32) v6  —  [!] ALERTA" : "Monitor de Hardware & Sistema (Win32) v6");
         MostrarAba(abaAtual);
         RedimensionarConteudo(hMainWindow);
     }
@@ -7146,9 +7438,11 @@ static LRESULT CALLBACK CompactProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
         pen = CreatePen(PS_SOLID, alertaGlobalAtivo ? 3 : 1,
                         alertaGlobalAtivo ? RGB(220, 45, 45) : RGB(82, 92, 105));
-        { HPEN old = (HPEN)SelectObject(hdc, pen);
-          Rectangle(hdc, 1, 1, rc.right - 1, rc.bottom - 1);
-          SelectObject(hdc, old); }
+        {
+            HPEN old = (HPEN)SelectObject(hdc, pen);
+            Rectangle(hdc, 1, 1, rc.right - 1, rc.bottom - 1);
+            SelectObject(hdc, old);
+        }
         DeleteObject(pen);
 
         c[0] = (RECT){10, 30, rc.right / 2 - 5, rc.bottom / 2 + 2};
@@ -7226,9 +7520,9 @@ static void PreencherListaAlertas(HWND hList)
     for (i = g_alertHistoryCount - 1; i >= 0; i--)
     {
         t = &g_alertHistory[i].timestamp;
-        snprintf(linha, sizeof(linha), "%02d/%02d/%04d %02d:%02d:%02d  |  %s  %.1f (limite %.1f)",
+        snprintf(linha, sizeof(linha), "%02d/%02d/%04d %02d:%02d:%02d  |  %s  %.1f (limite %.1f) - Culpado: %s",
                  t->wDay, t->wMonth, t->wYear, t->wHour, t->wMinute, t->wSecond,
-                 g_alertHistory[i].recurso, g_alertHistory[i].valor, g_alertHistory[i].limite);
+                 g_alertHistory[i].recurso, g_alertHistory[i].valor, g_alertHistory[i].limite, g_alertHistory[i].culpado);
         SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)linha);
     }
 }
