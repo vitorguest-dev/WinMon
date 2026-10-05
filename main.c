@@ -107,6 +107,9 @@ static const IID LOCAL_IID_IWbemLocator =
 #define ID_CONFIG_SETTINGS 1011
 #define ID_EXPORT_GRAPH_PNG 1012
 #define ID_TOGGLE_COMPACT 1013
+#define ID_SESSION_EXPORT 1014
+#define ID_SESSION_RESET 1015
+#define ID_SETTINGS_HELP 8021
 
 #define OVERLAY_CLASS_NAME "WinMonOverlayClass"
 
@@ -347,6 +350,7 @@ HWND hLabelProcCount = NULL;   /* "N processos" */
 #define IDC_SETTINGS_HDR_OVER 8003
 #define IDC_SETTINGS_HDR_TRAY 8004
 #define IDC_SETTINGS_HDR_DADOS 8005
+#define IDC_SETTINGS_HELP 8021
 #define IDC_SETTINGS_ALERT 8011
 #define IDC_SETTINGS_APAR 8012
 #define IDC_SETTINGS_OV_CFG 8013
@@ -481,6 +485,17 @@ static int g_compactMode = 0;
 static LONG_PTR g_normalStyle = 0;
 static LONG_PTR g_normalExStyle = 0;
 static RECT g_normalRect = {0};
+
+typedef struct
+{
+    ULONGLONG inicioTickMs;
+    unsigned long amostras;
+    double somaCpu, somaRam, somaTemp;
+    double maxCpu, maxRam, maxTemp;
+    unsigned long alertas;
+} WinMonSessionStats;
+
+static WinMonSessionStats g_session = {0};
 
 #define PROCESS_HISTORY_INVALID (NAN)
 static int g_processHistoryPos = -1;
@@ -1456,6 +1471,11 @@ static void ToggleCompactMode(void);
 static void AtualizarCompacto(void);
 static LRESULT CALLBACK CompactProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static void AplicarVisibilidadeModoNormal(void);
+static void SessaoIniciar(void);
+static void SessaoAdicionarAmostra(double cpu, double ram, double temp);
+static void SessaoExportarRelatorio(void);
+static void SessaoResetar(void);
+static void MostrarAjudaAtalhos(HWND hwndPai);
 
 /* ------------------------------------------------------------------------- */
 /* Graficos GDI                                                              */
@@ -1855,197 +1875,22 @@ static HFONT g_hValueFont = NULL;
 static void DrawDashboardCardLively(HDC hdc, RECT rc, const char *label, const char *value,
                                     COLORREF accentBase, const double *historyData, double maxLim)
 {
-    double currentVal = 0.0;
-    if (historico.count > 0 && historyData)
-        currentVal = historyData[HistoricoIndex(historico.count - 1)];
-
-    COLORREF markerColor = accentBase;
-    if (maxLim > 0.0)
-    {
-        if (currentVal >= maxLim)
-            markerColor = RGB(220, 50, 50);
-        else if (currentVal >= maxLim * 0.85)
-            markerColor = RGB(220, 150, 20);
-    }
-
-    HBRUSH panel = CreateSolidBrush(RGB(255, 255, 255));
-    HBRUSH marker = CreateSolidBrush(markerColor);
-    RECT markerRect = {rc.left, rc.top, rc.left + 5, rc.bottom};
-    RECT labelRect = {rc.left + 16, rc.top + 12, rc.right - 10, rc.top + 31};
-    RECT valueRect = {rc.left + 16, rc.top + 31, rc.right - 10, rc.bottom - 10};
-
-    FillRect(hdc, &rc, panel);
-    FillRect(hdc, &markerRect, marker);
-    DeleteObject(panel);
-    DeleteObject(marker);
-
-    /* Renderização da Sparkline e limite */
-    if (historico.count > 0 && maxLim > 0.0 && historyData)
-    {
-        int sparkPts = (historico.count < 60) ? historico.count : 60;
-        HPEN sparkPen = CreatePen(PS_SOLID, 1, RGB(230, 235, 240));
-        HPEN oldPen = (HPEN)SelectObject(hdc, sparkPen);
-
-        for (int i = 0; i < sparkPts; i++)
-        {
-            int idx = HistoricoIndex(historico.count - sparkPts + i);
-            double v = historyData[idx];
-            if (v > maxLim * 1.2)
-                v = maxLim * 1.2;
-
-            int divisor = (sparkPts == 1) ? 1 : sparkPts - 1;
-            int x = rc.left + 16 + (i * (rc.right - rc.left - 26)) / divisor;
-            int y = rc.bottom - 5 - (int)((v / (maxLim * 1.2)) * (rc.bottom - rc.top - 40));
-
-            if (i == 0)
-                MoveToEx(hdc, x, y, NULL);
-            else
-                LineTo(hdc, x, y);
-        }
-        SelectObject(hdc, oldPen);
-        DeleteObject(sparkPen);
-    }
-
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(102, 108, 116));
-    HFONT oldFont = (HFONT)SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
-    DrawTextA(hdc, label, -1, &labelRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    SelectObject(hdc, g_hValueFont);
-    SetTextColor(hdc, RGB(32, 38, 45));
-    DrawTextA(hdc, value, -1, &valueRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    SelectObject(hdc, oldFont);
+    double v=0.0; COLORREF markerColor=accentBase; HBRUSH panel,marker; RECT markerRect,labelRect,valueRect; HFONT oldFont;
+    if(historico.count>0&&historyData)v=historyData[HistoricoIndex(historico.count-1)];
+    if(maxLim>0.0){if(v>=maxLim)markerColor=RGB(220,50,50);else if(v>=maxLim*.85)markerColor=RGB(220,150,20);}
+    panel=CreateSolidBrush(RGB(255,255,255));marker=CreateSolidBrush(markerColor);markerRect=(RECT){rc.left,rc.top,rc.left+5,rc.bottom};labelRect=(RECT){rc.left+14,rc.top+7,rc.right-10,rc.top+24};valueRect=(RECT){rc.left+14,rc.top+23,rc.right-10,rc.bottom-6};FillRect(hdc,&rc,panel);FillRect(hdc,&markerRect,marker);DeleteObject(panel);DeleteObject(marker);
+    SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,RGB(102,108,116));oldFont=(HFONT)SelectObject(hdc,GetStockObject(DEFAULT_GUI_FONT));DrawTextA(hdc,label,-1,&labelRect,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SelectObject(hdc,g_hValueFont);SetTextColor(hdc,RGB(32,38,45));DrawTextA(hdc,value,-1,&valueRect,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SelectObject(hdc,oldFont);
 }
 
-static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
-                                      WPARAM wParam, LPARAM lParam)
+static LRESULT CALLBACK DashboardProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam)
 {
     (void)wParam;
-    (void)lParam;
-
-    switch (msg)
-    {
-    case WM_ERASEBKGND:
-        return 1;
-
-    case WM_PAINT:
-    {
-        PAINTSTRUCT ps;
-        HDC paintDc = BeginPaint(hwnd, &ps);
-        RECT client;
-        HDC bufferDc;
-        HBITMAP bufferBitmap;
-        HBITMAP oldBitmap;
-        HBRUSH background;
-        RECT card;
-        char value[64];
-        int gap = 10;
-        int cardWidth;
-        int i;
-        const int dashboardCards = 5;
-
-        GetClientRect(hwnd, &client);
-        bufferDc = CreateCompatibleDC(paintDc);
-        bufferBitmap = CreateCompatibleBitmap(paintDc,
-                                              client.right, client.bottom);
-
-        if (!bufferDc || !bufferBitmap)
-        {
-            if (bufferDc)
-                DeleteDC(bufferDc);
-            if (bufferBitmap)
-                DeleteObject(bufferBitmap);
-            EndPaint(hwnd, &ps);
-            return 0;
-        }
-
-        oldBitmap = (HBITMAP)SelectObject(bufferDc, bufferBitmap);
-        background = CreateSolidBrush(RGB(241, 244, 247));
-        FillRect(bufferDc, &client, background);
-        DeleteObject(background);
-
-        SetBkMode(bufferDc, TRANSPARENT);
-        SetTextColor(bufferDc, RGB(33, 39, 46));
-        {
-            RECT title = {16, 10, client.right - 16, 34};
-            DrawTextA(bufferDc, "Visao geral do sistema", -1, &title,
-                      DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        }
-
-        cardWidth = (client.right - 32 - gap * (dashboardCards - 1)) / dashboardCards;
-        if (cardWidth < 100)
-            cardWidth = 100;
-
-        for (i = 0; i < dashboardCards; i++)
-        {
-            card.left = 16 + i * (cardWidth + gap);
-            card.top = 42;
-            card.right = card.left + cardWidth;
-            card.bottom = 112;
-
-            if (i == 0)
-            {
-                snprintf(value, sizeof(value), "%.1f%%", ultimoCpuPercent);
-                DrawDashboardCardLively(bufferDc, card, "CPU", value,
-                                        g_mainConfig.corGraficoCpu, historico.cpu, limiteCpuPercent);
-            }
-            else if (i == 1)
-            {
-                snprintf(value, sizeof(value), "%.0f%%", ultimoRamPercent);
-                DrawDashboardCardLively(bufferDc, card, "Memoria", value,
-                                        g_mainConfig.corGraficoRam, historico.ram, limiteRamPercent);
-            }
-            else if (i == 2)
-            {
-                snprintf(value, sizeof(value), "%.1f MB/s",
-                         (ultimoDiskRead + ultimoDiskWrite) / 1048576.0);
-                DrawDashboardCardLively(bufferDc, card, "Disco I/O", value,
-                                        g_mainConfig.corGraficoDiscoRead, historico.diskRead, 500.0 * 1048576.0);
-            }
-            else if (i == 3)
-            {
-                snprintf(value, sizeof(value), "%.1f MB/s",
-                         (ultimoNetDown + ultimoNetUp) / 1048576.0);
-                DrawDashboardCardLively(bufferDc, card, "Rede", value,
-                                        g_mainConfig.corGraficoNetDown, historico.netDown, 100.0 * 1048576.0);
-            }
-            else
-            {
-                snprintf(value, sizeof(value), "%.1f%%", ultimoGpuPercent);
-                DrawDashboardCardLively(bufferDc, card, "GPU", value,
-                                        g_mainConfig.corGraficoGpu, historico.gpu, 100.0);
-            }
-        }
-
-        {
-            RECT status = {16, 124, client.right - 16, 158};
-            char statusText[160];
-            snprintf(statusText, sizeof(statusText),
-                     "%s   |   Processo lider: %.1f%% CPU   |   Historico: %d pontos",
-                     alertaGlobalAtivo ? "Estado: ALERTA" : "Estado: normal",
-                     processoCpuAtual, historico.count);
-            SetTextColor(bufferDc, alertaGlobalAtivo
-                                       ? RGB(190, 55, 45)
-                                       : RGB(82, 91, 101));
-            DrawTextA(bufferDc, statusText, -1, &status,
-                      DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        }
-
-        BitBlt(paintDc, 0, 0, client.right, client.bottom,
-               bufferDc, 0, 0, SRCCOPY);
-        SelectObject(bufferDc, oldBitmap);
-        DeleteObject(bufferBitmap);
-        DeleteDC(bufferDc);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-
-    case WM_SIZE:
-        InvalidateRect(hwnd, NULL, FALSE);
-        return 0;
-    }
-
-    return DefWindowProc(hwnd, msg, wParam, lParam);
+    switch(msg){
+    case WM_ERASEBKGND:return 1;
+    case WM_LBUTTONUP:{POINT pt={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};RECT rc;GetClientRect(hwnd,&rc);if(pt.y>=46&&pt.y<170){int gap=10,cw=(rc.right-32-gap*2)/3,col=(pt.x-16)/(cw+gap),row=(pt.y-46)/62;static const int targets[6]={TAB_CPU,TAB_MEMORIA,TAB_DISCO,TAB_REDE,TAB_GPU,TAB_TEMPERATURA};if(cw>100&&col>=0&&col<3&&row>=0&&row<2)SendMessageA(GetParent(hwnd),WM_COMMAND,MAKEWPARAM(targets[row*3+col],BN_CLICKED),0);}return 0;}
+    case WM_PAINT:{PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);RECT client;HDC mem=CreateCompatibleDC(dc);HBITMAP bmp,old;HBRUSH bg;int gap=10,cw,i;char value[64];GetClientRect(hwnd,&client);bmp=CreateCompatibleBitmap(dc,client.right,client.bottom);if(!mem||!bmp){if(mem)DeleteDC(mem);if(bmp)DeleteObject(bmp);EndPaint(hwnd,&ps);return 0;}old=(HBITMAP)SelectObject(mem,bmp);bg=CreateSolidBrush(RGB(241,244,247));FillRect(mem,&client,bg);DeleteObject(bg);SetBkMode(mem,TRANSPARENT);SetTextColor(mem,RGB(33,39,46));{RECT t={16,8,client.right-16,32};DrawTextA(mem,"Visao geral do sistema",-1,&t,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}cw=(client.right-32-gap*2)/3;if(cw<100)cw=100;for(i=0;i<6;i++){RECT card={16+(i%3)*(cw+gap),46+(i/3)*62,16+(i%3)*(cw+gap)+cw,102+(i/3)*62};switch(i){case 0:snprintf(value,sizeof(value),"%.1f%%",ultimoCpuPercent);DrawDashboardCardLively(mem,card,"CPU",value,g_mainConfig.corGraficoCpu,historico.cpu,limiteCpuPercent);break;case 1:snprintf(value,sizeof(value),"%.0f%%",ultimoRamPercent);DrawDashboardCardLively(mem,card,"Memoria",value,g_mainConfig.corGraficoRam,historico.ram,limiteRamPercent);break;case 2:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoDiskRead+ultimoDiskWrite)/1048576.0);DrawDashboardCardLively(mem,card,"Disco I/O",value,g_mainConfig.corGraficoDiscoRead,historico.diskRead,500.0*1048576.0);break;case 3:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoNetDown+ultimoNetUp)/1048576.0);DrawDashboardCardLively(mem,card,"Rede",value,g_mainConfig.corGraficoNetDown,historico.netDown,100.0*1048576.0);break;case 4:snprintf(value,sizeof(value),"%.1f%%",ultimoGpuPercent);DrawDashboardCardLively(mem,card,"GPU",value,g_mainConfig.corGraficoGpu,historico.gpu,100.0);break;default:snprintf(value,sizeof(value),"%.1f C",ObterTemperaturaMaxima());DrawDashboardCardLively(mem,card,"Temperatura",value,RGB(205,100,55),historico.temp,100.0);break;}}{RECT st={16,174,client.right-16,220};char txt[256];snprintf(txt,sizeof(txt),"Estado: %s | Processo lider: %.1f%% CPU | Historico: %d pontos | Clique num cartao para abrir o grafico",alertaGlobalAtivo?"ALERTA":"NORMAL",processoCpuAtual,historico.count);SetTextColor(mem,alertaGlobalAtivo?RGB(190,55,45):RGB(82,91,101));DrawTextA(mem,txt,-1,&st,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}BitBlt(dc,0,0,client.right,client.bottom,mem,0,0,SRCCOPY);SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);EndPaint(hwnd,&ps);return 0;}
+    case WM_SIZE:InvalidateRect(hwnd,NULL,FALSE);return 0;}
+    return DefWindowProc(hwnd,msg,wParam,lParam);
 }
 
 static void DrawAlertRegions(HDC hdc, RECT rc, const double *data,
@@ -3470,13 +3315,13 @@ static void RedimensionarConteudo(HWND hwnd)
         }
 
         if (hEdit)
-            MoveWindow(hEdit, rc.left, rc.top + 172,
+            MoveWindow(hEdit, rc.left, rc.top + 230,
                        rc.right - rc.left,
-                       rc.bottom - rc.top - 172, TRUE);
+                       rc.bottom - rc.top - 230, TRUE);
 
         if (hDashboard)
             MoveWindow(hDashboard, rc.left, rc.top,
-                       rc.right - rc.left, 172, TRUE);
+                       rc.right - rc.left, 230, TRUE);
 
         if (hGraphCPU)
             MoveWindow(hGraphCPU, rc.left, rc.top,
@@ -3853,7 +3698,7 @@ static void AtualizarDefinicoesVisibilidade(void)
         {
             if (hSettingsActions[i][j])
                 ShowWindow(hSettingsActions[i][j],
-                           (abaAtual == 8 && g_settingsOpen[i] && j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 3 : 1))))
+                           (abaAtual == 8 && g_settingsOpen[i] && j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 4 : 1))))
                                ? SW_SHOW
                                : SW_HIDE);
         }
@@ -3895,7 +3740,7 @@ static void RedimensionarDefinicoes(const RECT *content)
             if (hSettingsActions[i][j])
                 MoveWindow(hSettingsActions[i][j], x + 24, y,
                            (w > 270 ? 250 : w - 24), 24, TRUE);
-            if (g_settingsOpen[i] && (j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 3 : 1)))))
+            if (g_settingsOpen[i] && (j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 4 : 1)))))
                 y += 30;
         }
         y += 8;
@@ -3914,7 +3759,7 @@ static void CriarPainelDefinicoes(HWND hwndPai)
         {"Estilo e cores da janela principal", NULL, NULL, NULL},
         {"Configurar overlay", "Ativar overlay", "Modo compacto", NULL},
         {"Personalizar Tray", NULL, NULL, NULL},
-        {"Mudar intervalo de atualizacao", "Iniciar/parar log CSV", "Exportar snapshot", NULL}};
+        {"Mudar intervalo de atualizacao", "Iniciar/parar log CSV", "Exportar snapshot", "Atalhos e ajuda"}};
     const int headerIds[SETTINGS_SECTIONS] = {
         IDC_SETTINGS_HDR_ALERT, IDC_SETTINGS_HDR_APAR, IDC_SETTINGS_HDR_OVER,
         IDC_SETTINGS_HDR_TRAY, IDC_SETTINGS_HDR_DADOS};
@@ -3923,7 +3768,7 @@ static void CriarPainelDefinicoes(HWND hwndPai)
         {IDC_SETTINGS_APAR, 0, 0, 0},
         {IDC_SETTINGS_OV_CFG, IDC_SETTINGS_OV_TOGGLE, IDC_SETTINGS_COMPACT, 0},
         {IDC_SETTINGS_TRAY, 0, 0, 0},
-        {IDC_SETTINGS_INTERVAL, IDC_SETTINGS_LOG, IDC_SETTINGS_SNAPSHOT, 0}};
+        {IDC_SETTINGS_INTERVAL, IDC_SETTINGS_LOG, IDC_SETTINGS_SNAPSHOT, ID_SETTINGS_HELP}};
     int i, j;
 
     hSettingsTitle = CreateWindowExA(
@@ -4075,6 +3920,15 @@ static void CriarAbas(HWND hwnd)
 
     MostrarAba(0);
 }
+
+/* ------------------------------------------------------------------------- */
+/* Sessao de monitorizacao                                                   */
+/* ------------------------------------------------------------------------- */
+static void SessaoIniciar(void){ZeroMemory(&g_session,sizeof(g_session));g_session.inicioTickMs=GetTickCount64();}
+static void SessaoAdicionarAmostra(double cpu,double ram,double temp){g_session.amostras++;g_session.somaCpu+=cpu;g_session.somaRam+=ram;g_session.somaTemp+=temp;if(g_session.amostras==1||cpu>g_session.maxCpu)g_session.maxCpu=cpu;if(g_session.amostras==1||ram>g_session.maxRam)g_session.maxRam=ram;if(g_session.amostras==1||temp>g_session.maxTemp)g_session.maxTemp=temp;}
+static void SessaoResetar(void){SessaoIniciar();AtualizarDefinicoesVisibilidade();InvalidateRect(hDashboard,NULL,FALSE);}
+static void SessaoExportarRelatorio(void){char caminho[MAX_PATH],nome[96],msg[MAX_PATH+80];FILE*f;SYSTEMTIME st;double dur=(GetTickCount64()-g_session.inicioTickMs)/1000.0;GetLocalTime(&st);snprintf(nome,sizeof(nome),"winmon_sessao_%04d%02d%02d_%02d%02d%02d.csv",st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);CaminhoDados(nome,caminho,sizeof(caminho));if(fopen_s(&f,caminho,"w")!=0||!f){MessageBoxA(hMainWindow,"Nao foi possivel exportar a sessao.","WinMon",MB_OK|MB_ICONERROR);return;}fprintf(f,"metrica,valor\n");fprintf(f,"duracao_segundos,%.0f\n",dur);fprintf(f,"amostras,%lu\n",g_session.amostras);fprintf(f,"cpu_media_pct,%.2f\n",g_session.amostras?g_session.somaCpu/g_session.amostras:0.0);fprintf(f,"cpu_max_pct,%.2f\n",g_session.maxCpu);fprintf(f,"ram_media_pct,%.2f\n",g_session.amostras?g_session.somaRam/g_session.amostras:0.0);fprintf(f,"ram_max_pct,%.2f\n",g_session.maxRam);fprintf(f,"temperatura_media_c,%.2f\n",g_session.amostras?g_session.somaTemp/g_session.amostras:0.0);fprintf(f,"temperatura_max_c,%.2f\n",g_session.maxTemp);fprintf(f,"alertas,%lu\n",g_session.alertas);fclose(f);snprintf(msg,sizeof(msg),"Relatorio exportado para:\n%s",caminho);MessageBoxA(hMainWindow,msg,"WinMon",MB_OK|MB_ICONINFORMATION);}
+static void MostrarAjudaAtalhos(HWND hwndPai){MessageBoxA(hwndPai,"Ctrl+S  Exportar snapshot\nCtrl+L  Ligar/desligar log CSV\nCtrl+A  Alertas\nCtrl+E  Aparencia\nCtrl+O  Overlay\nCtrl+D  Definicoes\nCtrl+Shift+O  Overlay rapido\nCtrl+Shift+C  Modo compacto\n\nDashboard: clique num cartao para abrir o grafico.\nProcessos: duplo clique abre o historico do processo.","Atalhos e ajuda do WinMon",MB_OK|MB_ICONINFORMATION);}
 
 /* ------------------------------------------------------------------------- */
 /* Logging CSV Contínuo                                                      */
@@ -6504,10 +6358,13 @@ void AtualizarMonitor()
     MonitorarGPU(buffer, BUFFER_SIZE, &offset);
     MonitorarProcessos(buffer, BUFFER_SIZE, &offset);
 
-    AdicionarHistorico(
+    {
+        double tempSessao=ObterTemperaturaMaxima();
+        unsigned long alertasAntes=g_alertHistoryCount;
+        AdicionarHistorico(
         ultimoCpuPercent,
         ultimoRamPercent,
-        ObterTemperaturaMaxima(),
+        tempSessao,
         ultimoDiskRead,
         ultimoDiskWrite,
         ultimoNetDown,
@@ -6516,6 +6373,9 @@ void AtualizarMonitor()
         ultimoGpuCopy,
         ultimoGpuEncode,
         ultimoGpuDecode);
+        SessaoAdicionarAmostra(ultimoCpuPercent,ultimoRamPercent,tempSessao);
+        if(g_alertHistoryCount>(int)alertasAntes)g_session.alertas+=(unsigned long)(g_alertHistoryCount-alertasAntes);
+    }
 
     {
         int i;
@@ -6544,6 +6404,7 @@ void AtualizarMonitor()
     InvalidateRect(hGraphTemp, NULL, FALSE);
     InvalidateRect(hGraphDisk, NULL, FALSE);
     InvalidateRect(hGraphNet, NULL, FALSE);
+    InvalidateRect(hGraphGPU, NULL, FALSE);
     InvalidateRect(hGraphProcesses, NULL, FALSE);
     InvalidateRect(hDashboard, NULL, FALSE);
     if (hProcessDetail)
@@ -6605,6 +6466,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             numProcessadores = 1;
 
         ZeroMemory(&historico, sizeof(historico));
+        SessaoIniciar();
 
         hRichEditLib = LoadLibraryExW(L"Msftedit.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
 
@@ -7062,6 +6924,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             ExportarSnapshot();
             return 0;
         }
+        if (LOWORD(wParam) == ID_SETTINGS_HELP)
+        {
+            MostrarAjudaAtalhos(hwnd);
+            return 0;
+        }
         if (LOWORD(wParam) == IDC_SETTINGS_COMPACT)
         {
             ToggleCompactMode();
@@ -7088,6 +6955,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         if (LOWORD(wParam) == ID_EXPORT_SNAPSHOT)
         {
             ExportarSnapshot();
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_SESSION_EXPORT)
+        {
+            SessaoExportarRelatorio();
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_SESSION_RESET)
+        {
+            if (MessageBoxA(hwnd, "Reiniciar as estatisticas da sessao atual?", "WinMon", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                SessaoResetar();
             return 0;
         }
         if (LOWORD(wParam) == ID_TOGGLE_LOG)
@@ -7409,103 +7287,7 @@ static void AtualizarCompacto(void)
         InvalidateRect(hCompact, NULL, FALSE);
 }
 
-static LRESULT CALLBACK CompactProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    (void)wParam;
-    (void)lParam;
-
-    switch (msg)
-    {
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_PAINT:
-    {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        RECT rc;
-        HBRUSH bg;
-        HPEN pen;
-        RECT c[4];
-        const char *labels[4] = {"CPU", "RAM", "DISCO", "REDE"};
-        char vals[4][64];
-        char sub[4][64];
-        int i;
-
-        GetClientRect(hwnd, &rc);
-        bg = CreateSolidBrush(alertaGlobalAtivo ? RGB(48, 36, 36) : RGB(30, 35, 42));
-        FillRect(hdc, &rc, bg);
-        DeleteObject(bg);
-
-        pen = CreatePen(PS_SOLID, alertaGlobalAtivo ? 3 : 1,
-                        alertaGlobalAtivo ? RGB(220, 45, 45) : RGB(82, 92, 105));
-        {
-            HPEN old = (HPEN)SelectObject(hdc, pen);
-            Rectangle(hdc, 1, 1, rc.right - 1, rc.bottom - 1);
-            SelectObject(hdc, old);
-        }
-        DeleteObject(pen);
-
-        c[0] = (RECT){10, 30, rc.right / 2 - 5, rc.bottom / 2 + 2};
-        c[1] = (RECT){rc.right / 2 + 5, 30, rc.right - 10, rc.bottom / 2 + 2};
-        c[2] = (RECT){10, rc.bottom / 2 + 10, rc.right / 2 - 5, rc.bottom - 10};
-        c[3] = (RECT){rc.right / 2 + 5, rc.bottom / 2 + 10, rc.right - 10, rc.bottom - 10};
-
-        snprintf(vals[0], sizeof(vals[0]), "%.1f%%", ultimoCpuPercent);
-        snprintf(vals[1], sizeof(vals[1]), "%.0f%%", ultimoRamPercent);
-        snprintf(vals[2], sizeof(vals[2]), "%.1f MB/s", (ultimoDiskRead + ultimoDiskWrite) / 1048576.0);
-        snprintf(vals[3], sizeof(vals[3]), "%.1f MB/s", (ultimoNetDown + ultimoNetUp) / 1048576.0);
-        snprintf(sub[0], sizeof(sub[0]), "limite %.0f%%", limiteCpuPercent);
-        snprintf(sub[1], sizeof(sub[1]), "limite %.0f%%", limiteRamPercent);
-        strcpy_s(sub[2], sizeof(sub[2]), "I/O total");
-        strcpy_s(sub[3], sizeof(sub[3]), "D + U");
-
-        SetBkMode(hdc, TRANSPARENT);
-        for (i = 0; i < 4; i++)
-        {
-            RECT title = c[i];
-            RECT value = c[i];
-            RECT small = c[i];
-            title.bottom = title.top + 18;
-            value.top += 16;
-            value.bottom = value.top + 25;
-            small.top = value.bottom;
-            small.bottom = small.top + 18;
-            SetTextColor(hdc, RGB(130, 155, 180));
-            DrawTextA(hdc, labels[i], -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-            SetTextColor(hdc, RGB(238, 241, 245));
-            DrawTextA(hdc, vals[i], -1, &value, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-            SetTextColor(hdc, RGB(145, 150, 158));
-            DrawTextA(hdc, sub[i], -1, &small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        }
-
-        SetTextColor(hdc, alertaGlobalAtivo ? RGB(255, 110, 100) : RGB(150, 158, 168));
-        {
-            RECT title = {10, 7, rc.right - 10, 27};
-            DrawTextA(hdc, alertaGlobalAtivo ? "WinMon  •  ALERTA" : "WinMon  •  Compacto",
-                      -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        }
-        SetTextColor(hdc, RGB(110, 118, 128));
-        {
-            RECT help = {rc.right - 145, 7, rc.right - 10, 27};
-            DrawTextA(hdc, "Duplo-clique: abrir", -1, &help,
-                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-        }
-
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_LBUTTONDBLCLK:
-        ToggleCompactMode();
-        return 0;
-    case WM_RBUTTONUP:
-        ToggleCompactMode();
-        return 0;
-    case WM_SIZE:
-        InvalidateRect(hwnd, NULL, FALSE);
-        return 0;
-    }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
+static LRESULT CALLBACK CompactProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam){(void)wParam;(void)lParam;switch(msg){case WM_ERASEBKGND:return 1;case WM_PAINT:{PAINTSTRUCT ps;HDC hdc=BeginPaint(hwnd,&ps);RECT rc;HBRUSH bg;HPEN pen;int i;const char*lab[6]={"CPU","RAM","TEMP","GPU","DISCO","REDE"};char val[6][64];GetClientRect(hwnd,&rc);bg=CreateSolidBrush(alertaGlobalAtivo?RGB(48,36,36):RGB(30,35,42));FillRect(hdc,&rc,bg);DeleteObject(bg);pen=CreatePen(PS_SOLID,alertaGlobalAtivo?3:1,alertaGlobalAtivo?RGB(220,45,45):RGB(82,92,105));{HPEN old=(HPEN)SelectObject(hdc,pen);Rectangle(hdc,1,1,rc.right-1,rc.bottom-1);SelectObject(hdc,old);}DeleteObject(pen);snprintf(val[0],64,"%.1f%%",ultimoCpuPercent);snprintf(val[1],64,"%.0f%%",ultimoRamPercent);snprintf(val[2],64,"%.1f C",ObterTemperaturaMaxima());snprintf(val[3],64,"%.1f%%",ultimoGpuPercent);snprintf(val[4],64,"%.1f MB/s",(ultimoDiskRead+ultimoDiskWrite)/1048576.0);snprintf(val[5],64,"%.1f MB/s",(ultimoNetDown+ultimoNetUp)/1048576.0);SetBkMode(hdc,TRANSPARENT);for(i=0;i<6;i++){int col=i%3,row=i/3;RECT r={10+col*((rc.right-30)/3),34+row*58,10+(col+1)*((rc.right-30)/3)-5,88+row*58};RECT a=r,b=r;a.bottom=a.top+17;b.top+=16;SetTextColor(hdc,RGB(130,155,180));DrawTextA(hdc,lab[i],-1,&a,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SetTextColor(hdc,RGB(238,241,245));DrawTextA(hdc,val[i],-1,&b,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}SetTextColor(hdc,alertaGlobalAtivo?RGB(255,110,100):RGB(150,158,168));{RECT t={10,7,rc.right-10,28};DrawTextA(hdc,alertaGlobalAtivo?"WinMon  •  ALERTA":"WinMon  •  Compacto",-1,&t,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}SetTextColor(hdc,RGB(110,118,128));{RECT t={rc.right-170,7,rc.right-10,28};DrawTextA(hdc,"Duplo-clique: abrir",-1,&t,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);}EndPaint(hwnd,&ps);return 0;}case WM_LBUTTONDBLCLK:ToggleCompactMode();return 0;case WM_RBUTTONUP:ToggleCompactMode();return 0;case WM_SIZE:InvalidateRect(hwnd,NULL,FALSE);return 0;}return DefWindowProc(hwnd,msg,wParam,lParam);}
 
 /* ------------------------------------------------------------------------- */
 /* Historico de alertas                                                      */
