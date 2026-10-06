@@ -136,7 +136,7 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_GPU 2007
 #define TAB_PROCESSOS 2008
 #define TAB_DEFINICOES 2009
-#define NAV_LARGURA 148
+#define NAV_LARGURA 188
 #define NUM_ABAS 9
 #define ALERT_HISTORY_MAX 100
 
@@ -279,9 +279,9 @@ static MainUiConfig g_mainConfig = {
         .lfFaceName = "Consolas"},
     .corFundoEdit = RGB(255, 255, 255),
     .corTextoEdit = RGB(0, 0, 0),
-    .corFundoGrafico = RGB(250, 251, 252),
-    .corGrelhaGrafico = RGB(225, 228, 232),
-    .corEixoGrafico = RGB(180, 185, 190),
+    .corFundoGrafico = RGB(248, 250, 252),
+    .corGrelhaGrafico = RGB(226, 231, 236),
+    .corEixoGrafico = RGB(170, 178, 187),
     .corTextoGrafico = RGB(40, 44, 48),
     .corGraficoCpu = RGB(35, 115, 210),
     .corGraficoRam = RGB(145, 75, 185),
@@ -323,6 +323,9 @@ HWND hEdit = NULL;
 HWND hTab = NULL;
 HWND hDashboard = NULL;
 HWND hNav[NUM_ABAS] = {NULL};
+HWND hAppTitle = NULL;
+HWND hAppSubtitle = NULL;
+HWND hAppStatus = NULL;
 HWND hBtnOverlay = NULL;
 HWND hBtnInterval = NULL;
 HWND hBtnEstiloMain = NULL;
@@ -1459,7 +1462,60 @@ static void RedimensionarPainelProcessos(HWND hwndPai);
 static void FiltrarListaProcessos(void);
 static LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg,
                                       WPARAM wParam, LPARAM lParam);
-static void DesenharBotaoNavegacao(const DRAWITEMSTRUCT *dis);
+static void DesenharBotaoNavegacao(const DRAWITEMSTRUCT *dis)
+{
+    RECT rc;
+    COLORREF bgColor;
+    COLORREF textColor;
+    COLORREF accentColor;
+    HFONT font;
+    HFONT oldFont;
+    char texto[64];
+    int ativo;
+    int hover;
+
+    if (!dis || !dis->hwndItem)
+        return;
+
+    rc = dis->rcItem;
+    ativo = GetDlgCtrlID(dis->hwndItem) == TAB_RESUMO + abaAtual;
+    hover = (dis->itemState & ODS_SELECTED) != 0;
+
+    bgColor = ativo ? RGB(39, 55, 73) : (hover ? RGB(31, 45, 60) : RGB(20, 29, 40));
+    textColor = ativo ? RGB(255, 255, 255) : RGB(197, 207, 218);
+    accentColor = ativo ? RGB(74, 157, 230) : RGB(20, 29, 40);
+
+    {
+        HBRUSH bg = CreateSolidBrush(bgColor);
+        FillRect(dis->hDC, &rc, bg);
+        DeleteObject(bg);
+    }
+
+    if (ativo)
+    {
+        RECT accent = {rc.left, rc.top + 4, rc.left + 4, rc.bottom - 4};
+        HBRUSH b = CreateSolidBrush(accentColor);
+        FillRect(dis->hDC, &accent, b);
+        DeleteObject(b);
+    }
+
+    GetWindowTextA(dis->hwndItem, texto, sizeof(texto));
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, textColor);
+    font = hFontUI ? hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    oldFont = (HFONT)SelectObject(dis->hDC, font);
+
+    {
+        RECT tr = rc;
+        tr.left += 16;
+        tr.right -= 10;
+        DrawTextA(dis->hDC, texto, -1, &tr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    SelectObject(dis->hDC, oldFont);
+}
+
 static void ObterFaixaGrafico(GraphType type, int *start, int *count);
 static void ResetGraphView(GraphType type);
 static void ZoomGraph(GraphType type, int delta, int anchorX, int graphWidth);
@@ -1878,7 +1934,7 @@ static void DrawDashboardCardLively(HDC hdc, RECT rc, const char *label, const c
     double v=0.0; COLORREF markerColor=accentBase; HBRUSH panel,marker; RECT markerRect,labelRect,valueRect; HFONT oldFont;
     if(historico.count>0&&historyData)v=historyData[HistoricoIndex(historico.count-1)];
     if(maxLim>0.0){if(v>=maxLim)markerColor=RGB(220,50,50);else if(v>=maxLim*.85)markerColor=RGB(220,150,20);}
-    panel=CreateSolidBrush(RGB(255,255,255));marker=CreateSolidBrush(markerColor);markerRect=(RECT){rc.left,rc.top,rc.left+5,rc.bottom};labelRect=(RECT){rc.left+14,rc.top+7,rc.right-10,rc.top+24};valueRect=(RECT){rc.left+14,rc.top+23,rc.right-10,rc.bottom-6};FillRect(hdc,&rc,panel);FillRect(hdc,&markerRect,marker);DeleteObject(panel);DeleteObject(marker);
+    panel=CreateSolidBrush(RGB(255,255,255));marker=CreateSolidBrush(markerColor);markerRect=(RECT){rc.left,rc.top,rc.left+5,rc.bottom};labelRect=(RECT){rc.left+16,rc.top+7,rc.right-10,rc.top+24};valueRect=(RECT){rc.left+16,rc.top+23,rc.right-10,rc.bottom-6};FillRect(hdc,&rc,panel);FillRect(hdc,&markerRect,marker);{HPEN bp=CreatePen(PS_SOLID,1,RGB(224,228,233));HPEN op=(HPEN)SelectObject(hdc,bp);HBRUSH ob=(HBRUSH)SelectObject(hdc,GetStockObject(NULL_BRUSH));Rectangle(hdc,rc.left,rc.top,rc.right,rc.bottom);SelectObject(hdc,ob);SelectObject(hdc,op);DeleteObject(bp);}DeleteObject(panel);DeleteObject(marker);
     SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,RGB(102,108,116));oldFont=(HFONT)SelectObject(hdc,GetStockObject(DEFAULT_GUI_FONT));DrawTextA(hdc,label,-1,&labelRect,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SelectObject(hdc,g_hValueFont);SetTextColor(hdc,RGB(32,38,45));DrawTextA(hdc,value,-1,&valueRect,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SelectObject(hdc,oldFont);
 }
 
@@ -1888,7 +1944,7 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lP
     switch(msg){
     case WM_ERASEBKGND:return 1;
     case WM_LBUTTONUP:{POINT pt={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};RECT rc;GetClientRect(hwnd,&rc);if(pt.y>=46&&pt.y<170){int gap=10,cw=(rc.right-32-gap*2)/3,col=(pt.x-16)/(cw+gap),row=(pt.y-46)/62;static const int targets[6]={TAB_CPU,TAB_MEMORIA,TAB_DISCO,TAB_REDE,TAB_GPU,TAB_TEMPERATURA};if(cw>100&&col>=0&&col<3&&row>=0&&row<2)SendMessageA(GetParent(hwnd),WM_COMMAND,MAKEWPARAM(targets[row*3+col],BN_CLICKED),0);}return 0;}
-    case WM_PAINT:{PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);RECT client;HDC mem=CreateCompatibleDC(dc);HBITMAP bmp,old;HBRUSH bg;int gap=10,cw,i;char value[64];GetClientRect(hwnd,&client);bmp=CreateCompatibleBitmap(dc,client.right,client.bottom);if(!mem||!bmp){if(mem)DeleteDC(mem);if(bmp)DeleteObject(bmp);EndPaint(hwnd,&ps);return 0;}old=(HBITMAP)SelectObject(mem,bmp);bg=CreateSolidBrush(RGB(241,244,247));FillRect(mem,&client,bg);DeleteObject(bg);SetBkMode(mem,TRANSPARENT);SetTextColor(mem,RGB(33,39,46));{RECT t={16,8,client.right-16,32};DrawTextA(mem,"Visao geral do sistema",-1,&t,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}cw=(client.right-32-gap*2)/3;if(cw<100)cw=100;for(i=0;i<6;i++){RECT card={16+(i%3)*(cw+gap),46+(i/3)*62,16+(i%3)*(cw+gap)+cw,102+(i/3)*62};switch(i){case 0:snprintf(value,sizeof(value),"%.1f%%",ultimoCpuPercent);DrawDashboardCardLively(mem,card,"CPU",value,g_mainConfig.corGraficoCpu,historico.cpu,limiteCpuPercent);break;case 1:snprintf(value,sizeof(value),"%.0f%%",ultimoRamPercent);DrawDashboardCardLively(mem,card,"Memoria",value,g_mainConfig.corGraficoRam,historico.ram,limiteRamPercent);break;case 2:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoDiskRead+ultimoDiskWrite)/1048576.0);DrawDashboardCardLively(mem,card,"Disco I/O",value,g_mainConfig.corGraficoDiscoRead,historico.diskRead,500.0*1048576.0);break;case 3:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoNetDown+ultimoNetUp)/1048576.0);DrawDashboardCardLively(mem,card,"Rede",value,g_mainConfig.corGraficoNetDown,historico.netDown,100.0*1048576.0);break;case 4:snprintf(value,sizeof(value),"%.1f%%",ultimoGpuPercent);DrawDashboardCardLively(mem,card,"GPU",value,g_mainConfig.corGraficoGpu,historico.gpu,100.0);break;default:snprintf(value,sizeof(value),"%.1f C",ObterTemperaturaMaxima());DrawDashboardCardLively(mem,card,"Temperatura",value,RGB(205,100,55),historico.temp,100.0);break;}}{RECT st={16,174,client.right-16,220};char txt[256];snprintf(txt,sizeof(txt),"Estado: %s | Processo lider: %.1f%% CPU | Historico: %d pontos | Clique num cartao para abrir o grafico",alertaGlobalAtivo?"ALERTA":"NORMAL",processoCpuAtual,historico.count);SetTextColor(mem,alertaGlobalAtivo?RGB(190,55,45):RGB(82,91,101));DrawTextA(mem,txt,-1,&st,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}BitBlt(dc,0,0,client.right,client.bottom,mem,0,0,SRCCOPY);SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);EndPaint(hwnd,&ps);return 0;}
+    case WM_PAINT:{PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);RECT client;HDC mem=CreateCompatibleDC(dc);HBITMAP bmp,old;HBRUSH bg;int gap=10,cw,i;char value[64];GetClientRect(hwnd,&client);bmp=CreateCompatibleBitmap(dc,client.right,client.bottom);if(!mem||!bmp){if(mem)DeleteDC(mem);if(bmp)DeleteObject(bmp);EndPaint(hwnd,&ps);return 0;}old=(HBITMAP)SelectObject(mem,bmp);bg=CreateSolidBrush(RGB(241,244,247));FillRect(mem,&client,bg);DeleteObject(bg);SetBkMode(mem,TRANSPARENT);SetTextColor(mem,RGB(28,36,45));{RECT t={16,8,client.right-16,32};DrawTextA(mem,"Visao geral do sistema",-1,&t,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}cw=(client.right-32-gap*2)/3;if(cw<100)cw=100;for(i=0;i<6;i++){RECT card={16+(i%3)*(cw+gap),46+(i/3)*62,16+(i%3)*(cw+gap)+cw,102+(i/3)*62};switch(i){case 0:snprintf(value,sizeof(value),"%.1f%%",ultimoCpuPercent);DrawDashboardCardLively(mem,card,"CPU",value,g_mainConfig.corGraficoCpu,historico.cpu,limiteCpuPercent);break;case 1:snprintf(value,sizeof(value),"%.0f%%",ultimoRamPercent);DrawDashboardCardLively(mem,card,"Memoria",value,g_mainConfig.corGraficoRam,historico.ram,limiteRamPercent);break;case 2:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoDiskRead+ultimoDiskWrite)/1048576.0);DrawDashboardCardLively(mem,card,"Disco I/O",value,g_mainConfig.corGraficoDiscoRead,historico.diskRead,500.0*1048576.0);break;case 3:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoNetDown+ultimoNetUp)/1048576.0);DrawDashboardCardLively(mem,card,"Rede",value,g_mainConfig.corGraficoNetDown,historico.netDown,100.0*1048576.0);break;case 4:snprintf(value,sizeof(value),"%.1f%%",ultimoGpuPercent);DrawDashboardCardLively(mem,card,"GPU",value,g_mainConfig.corGraficoGpu,historico.gpu,100.0);break;default:snprintf(value,sizeof(value),"%.1f C",ObterTemperaturaMaxima());DrawDashboardCardLively(mem,card,"Temperatura",value,RGB(205,100,55),historico.temp,100.0);break;}}{RECT st={16,174,client.right-16,220};char txt[256];snprintf(txt,sizeof(txt),"Estado: %s | Processo lider: %.1f%% CPU | Historico: %d pontos | Clique num cartao para abrir o grafico",alertaGlobalAtivo?"ALERTA":"NORMAL",processoCpuAtual,historico.count);SetTextColor(mem,alertaGlobalAtivo?RGB(190,55,45):RGB(82,91,101));DrawTextA(mem,txt,-1,&st,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}BitBlt(dc,0,0,client.right,client.bottom,mem,0,0,SRCCOPY);SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);EndPaint(hwnd,&ps);return 0;}
     case WM_SIZE:InvalidateRect(hwnd,NULL,FALSE);return 0;}
     return DefWindowProc(hwnd,msg,wParam,lParam);
 }
@@ -2752,8 +2808,8 @@ static LRESULT CALLBACK ProcessDetailProc(HWND hwnd, UINT msg, WPARAM wParam, LP
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO *mmi = (MINMAXINFO *)lParam;
-        mmi->ptMinTrackSize.x = 620;
-        mmi->ptMinTrackSize.y = 420;
+        mmi->ptMinTrackSize.x = 820;
+        mmi->ptMinTrackSize.y = 540;
         return 0;
     }
     case WM_CLOSE:
@@ -3186,7 +3242,7 @@ static void MostrarAba(int indice)
         ShowWindow(hGraphProcesses, SW_HIDE);
 
     if (hBtnGraphPNG)
-        ShowWindow(hBtnGraphPNG, (indice >= 1 && indice <= 5) ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnGraphPNG, (indice >= 1 && indice <= 6) ? SW_SHOW : SW_HIDE);
 
     /* painel de lista de processos: mostrar/esconder cada controlo */
     {
@@ -3205,61 +3261,6 @@ static void MostrarAba(int indice)
     InvalidateRect(hMainWindow, NULL, TRUE);
 }
 
-static void DesenharBotaoNavegacao(const DRAWITEMSTRUCT *dis)
-{
-    RECT rc;
-    HBRUSH fundo;
-    COLORREF corTexto;
-    COLORREF corFaixa;
-    HFONT fonte;
-    HFONT fonteAnterior;
-    char texto[64];
-    int ativo;
-
-    if (!dis || !dis->hwndItem)
-        return;
-
-    rc = dis->rcItem;
-    ativo = GetDlgCtrlID(dis->hwndItem) == TAB_RESUMO + abaAtual;
-    corTexto = (ativo || (dis->itemState & ODS_SELECTED))
-                   ? RGB(255, 255, 255)
-                   : RGB(205, 211, 218);
-    corFaixa = (ativo || (dis->itemState & ODS_SELECTED))
-                   ? RGB(55, 145, 215)
-                   : RGB(80, 88, 98);
-
-    fundo = CreateSolidBrush((ativo || (dis->itemState & ODS_SELECTED))
-                                 ? RGB(42, 53, 66)
-                                 : RGB(31, 39, 49));
-    FillRect(dis->hDC, &rc, fundo);
-    DeleteObject(fundo);
-
-    if (dis->itemState & ODS_FOCUS)
-    {
-        HPEN foco = CreatePen(PS_SOLID, 1, RGB(130, 190, 235));
-        HPEN anterior = (HPEN)SelectObject(dis->hDC, foco);
-        Rectangle(dis->hDC, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(dis->hDC, anterior);
-        DeleteObject(foco);
-    }
-
-    {
-        RECT faixa = {rc.left, rc.top, rc.left + 4, rc.bottom};
-        HBRUSH pincelFaixa = CreateSolidBrush(corFaixa);
-        FillRect(dis->hDC, &faixa, pincelFaixa);
-        DeleteObject(pincelFaixa);
-    }
-
-    GetWindowTextA(dis->hwndItem, texto, sizeof(texto));
-    SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, corTexto);
-    fonte = hFontUI ? hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    fonteAnterior = (HFONT)SelectObject(dis->hDC, fonte);
-    rc.left += 16;
-    DrawTextA(dis->hDC, texto, -1, &rc,
-              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(dis->hDC, fonteAnterior);
-}
 
 static void RedimensionarConteudo(HWND hwnd)
 {
@@ -3281,23 +3282,26 @@ static void RedimensionarConteudo(HWND hwnd)
      * 4. Definicoes [Ctrl+D]  : Largura 116 -> X = rc.right - 392
      */
 
+    if (hAppStatus)
+        MoveWindow(hAppStatus, NAV_LARGURA + 18, 4, 190, 24, TRUE);
+
     if (hBtnOverlay)
-        MoveWindow(hBtnOverlay, rc.right - 122, 3, 118, 22, TRUE);
+        MoveWindow(hBtnOverlay, rc.right - 132, 4, 128, 24, TRUE);
 
     {
         HWND hBtnCfg = GetDlgItem(hwnd, ID_CONFIG_OVERLAY);
         if (hBtnCfg)
-            MoveWindow(hBtnCfg, rc.right - 152, 3, 26, 22, TRUE);
+            MoveWindow(hBtnCfg, rc.right - 166, 4, 30, 24, TRUE);
     }
 
     if (hBtnInterval)
-        MoveWindow(hBtnInterval, rc.right - 272, 3, 116, 22, TRUE);
+        MoveWindow(hBtnInterval, rc.right - 288, 4, 116, 24, TRUE);
 
     if (hBtnEstiloMain)
-        MoveWindow(hBtnEstiloMain, rc.right - 392, 3, 116, 22, TRUE);
+        MoveWindow(hBtnEstiloMain, rc.right - 408, 4, 116, 24, TRUE);
 
     if (hBtnGraphPNG)
-        MoveWindow(hBtnGraphPNG, rc.right - 452, 3, 58, 22, TRUE);
+        MoveWindow(hBtnGraphPNG, rc.right - 468, 4, 58, 24, TRUE);
 
     if (hTab)
     {
@@ -3310,8 +3314,8 @@ static void RedimensionarConteudo(HWND hwnd)
         for (int i = 0; i < NUM_ABAS; i++)
         {
             if (hNav[i])
-                MoveWindow(hNav[i], 12, 42 + i * 38,
-                           NAV_LARGURA - 24, 30, TRUE);
+                MoveWindow(hNav[i], 12, 66 + i * 39,
+                           NAV_LARGURA - 24, 34, TRUE);
         }
 
         if (hEdit)
@@ -3578,7 +3582,7 @@ static void CriarPainelProcessos(HWND hwndPai)
 
     /* Label "Pesquisar:" — filho directo da janela principal */
     hPainelProcessos = CreateWindowExA(/* reutilizamos como label */
-                                       0, "STATIC", "Pesquisar:",
+                                       0, "STATIC", "Pesquisar processos",
                                        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
                                        0, 0, 74, 22,
                                        hwndPai, NULL, hInst, NULL);
@@ -3624,7 +3628,10 @@ static void CriarPainelProcessos(HWND hwndPai)
         return;
 
     ListView_SetExtendedListViewStyle(hListViewProc,
-                                      LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+                                      LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    ListView_SetBkColor(hListViewProc, RGB(255, 255, 255));
+    ListView_SetTextBkColor(hListViewProc, RGB(255, 255, 255));
+    ListView_SetTextColor(hListViewProc, RGB(42, 48, 56));
 
     /* Colunas */
     ZeroMemory(&lvc, sizeof(lvc));
@@ -3839,6 +3846,31 @@ static void CriarAbas(HWND hwnd)
     }
 
     ShowWindow(hTab, SW_HIDE);
+
+    hAppTitle = CreateWindowExA(
+        0, "STATIC", "WINMON",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        18, 12, NAV_LARGURA - 36, 28,
+        hwnd, NULL, GetModuleHandle(NULL), NULL);
+
+    hAppSubtitle = CreateWindowExA(
+        0, "STATIC", "Monitor de sistema",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        18, 36, NAV_LARGURA - 36, 18,
+        hwnd, NULL, GetModuleHandle(NULL), NULL);
+
+    hAppStatus = CreateWindowExA(
+        0, "STATIC", "[OK] Sistema normal",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        0, 0, 190, 24,
+        hwnd, NULL, GetModuleHandle(NULL), NULL);
+
+    if (hAppTitle && g_hValueFont)
+        SendMessage(hAppTitle, WM_SETFONT, (WPARAM)g_hValueFont, TRUE);
+    if (hAppSubtitle && hFontUI)
+        SendMessage(hAppSubtitle, WM_SETFONT, (WPARAM)hFontUI, TRUE);
+    if (hAppStatus && hFontUI)
+        SendMessage(hAppStatus, WM_SETFONT, (WPARAM)hFontUI, TRUE);
 
     hEdit = CreateWindowExA(
         0, "RICHEDIT50W", "A recolher dados do sistema...",
@@ -6392,6 +6424,9 @@ void AtualizarMonitor()
     AplicarCoresDeAlerta();
     AtualizarHistoricoAlertas();
     AtualizarTituloJanela();
+    if (hAppStatus)
+        SetWindowTextA(hAppStatus,
+                       alertaGlobalAtivo ? "[!] Alerta ativo" : "[OK] Sistema normal");
     AtualizarTooltipTray();
     VerificarAlertasBalloon();
     if (alertaGlobalAtivo && !alertaGlobalAnterior)
@@ -6449,6 +6484,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         INITCOMMONCONTROLSEX icc;
 
         hMainWindow = hwnd;
+        hFontUI = CreateFontA(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+                              CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                              DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
         g_hValueFont = CreateFontA(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                    ANSI_CHARSET, OUT_DEFAULT_PRECIS,
                                    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -6605,6 +6644,44 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         return 0;
     }
 
+    case WM_ERASEBKGND:
+    {
+        HDC dc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        {
+            HBRUSH bg = CreateSolidBrush(RGB(245, 247, 250));
+            FillRect(dc, &rc, bg);
+            DeleteObject(bg);
+        }
+        {
+            RECT rail = {0, 0, NAV_LARGURA, rc.bottom};
+            HBRUSH side = CreateSolidBrush(RGB(20, 29, 40));
+            FillRect(dc, &rail, side);
+            DeleteObject(side);
+        }
+        return 1;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC dc = (HDC)wParam;
+        HWND ctl = (HWND)lParam;
+        if (ctl == hAppTitle || ctl == hAppSubtitle)
+        {
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, ctl == hAppTitle ? RGB(245, 248, 252) : RGB(145, 159, 174));
+            return (LRESULT)GetStockObject(NULL_BRUSH);
+        }
+        if (ctl == hAppStatus)
+        {
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, alertaGlobalAtivo ? RGB(220, 92, 82) : RGB(78, 177, 124));
+            return (LRESULT)GetStockObject(NULL_BRUSH);
+        }
+        break;
+    }
+
     case WM_SIZE:
         RedimensionarConteudo(hwnd);
         return 0;
@@ -6612,8 +6689,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO *mmi = (MINMAXINFO *)lParam;
-        mmi->ptMinTrackSize.x = 620;
-        mmi->ptMinTrackSize.y = 420;
+        mmi->ptMinTrackSize.x = 820;
+        mmi->ptMinTrackSize.y = 540;
         return 0;
     }
 
@@ -7198,6 +7275,12 @@ static void ToggleCompactMode(void)
             ShowWindow(hEdit, SW_HIDE);
         if (hDashboard)
             ShowWindow(hDashboard, SW_HIDE);
+        if (hAppTitle)
+            ShowWindow(hAppTitle, SW_HIDE);
+        if (hAppSubtitle)
+            ShowWindow(hAppSubtitle, SW_HIDE);
+        if (hAppStatus)
+            ShowWindow(hAppStatus, SW_HIDE);
         if (hBtnOverlay)
             ShowWindow(hBtnOverlay, SW_HIDE);
         if (hBtnInterval)
@@ -7274,8 +7357,14 @@ static void ToggleCompactMode(void)
                      g_normalRect.bottom - g_normalRect.top,
                      SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER);
         AplicarVisibilidadeModoNormal();
+        if (hAppTitle)
+            ShowWindow(hAppTitle, SW_SHOW);
+        if (hAppSubtitle)
+            ShowWindow(hAppSubtitle, SW_SHOW);
+        if (hAppStatus)
+            ShowWindow(hAppStatus, SW_SHOW);
         SetWindowTextA(hMainWindow,
-                       alertaGlobalAtivo ? "Monitor de Hardware & Sistema (Win32) v6  —  [!] ALERTA" : "Monitor de Hardware & Sistema (Win32) v6");
+                       alertaGlobalAtivo ? "WinMon — Monitor de sistema  [!] ALERTA" : "WinMon — Monitor de sistema");
         MostrarAba(abaAtual);
         RedimensionarConteudo(hMainWindow);
     }
@@ -7492,7 +7581,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
             WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        980, 760,
+        1180, 780,
         NULL, NULL, hInstance, NULL);
 
     if (!hwnd)
