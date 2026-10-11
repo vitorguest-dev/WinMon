@@ -154,6 +154,7 @@ typedef struct
     SIZE_T memUsageMB;
     double cpuPercent;
     char exeFile[MAX_PATH];
+    int instancias; /* >1 apenas em linhas agrupadas (aba Processos) */
 } ProcessoInfo;
 
 typedef struct
@@ -374,6 +375,12 @@ static int g_settingsOpen[SETTINGS_SECTIONS] = {1, 1, 1, 1, 1};
 /* estado de ordenação do ListView */
 static int g_lvSortCol = 1;  /* coluna activa (0=Nome,1=PID,2=CPU,3=RAM) */
 static int g_lvSortDesc = 1; /* 1=descendente, 0=ascendente */
+
+/* agrupamento de processos pelo nome (ex.: 30x chrome.exe -> 1 linha) */
+#define IDC_CHK_AGRUPAR 6004
+static int g_lvAgrupar = 0;    /* 1 = vista agrupada */
+static int g_lvAgruparUI = -1; /* ultimo estado refletido na UI */
+HWND hChkAgrupar = NULL;
 
 /* snapshot filtrado para o ListView */
 static ProcessoInfo g_lvProcessos[MAX_PROCESSES];
@@ -3253,6 +3260,8 @@ static void MostrarAba(int indice)
             ShowWindow(hEditPesquisaProc, visProc);
         if (hLabelProcCount)
             ShowWindow(hLabelProcCount, visProc);
+        if (hChkAgrupar)
+            ShowWindow(hChkAgrupar, visProc);
         if (hListViewProc)
             ShowWindow(hListViewProc, visProc);
     }
@@ -3379,10 +3388,19 @@ static void RedimensionarConteudo(HWND hwnd)
                 MoveWindow(hEditPesquisaProc,
                            cx + 4 + lblW + 4, cy + 3, editW, 22, TRUE);
 
-            if (hLabelProcCount)
-                MoveWindow(hLabelProcCount,
-                           cx + 4 + lblW + 4 + editW + 8, cy + 4,
-                           cw - (4 + lblW + 4 + editW + 8) - 4, 22, TRUE);
+            {
+                int chkW = 140;
+                int xChk = cx + 4 + lblW + 4 + editW + 8;
+                int xCnt = xChk + chkW + 4;
+                int wCnt = cx + cw - xCnt - 4;
+                if (wCnt < 0)
+                    wCnt = 0;
+
+                if (hChkAgrupar)
+                    MoveWindow(hChkAgrupar, xChk, cy + 4, chkW, 22, TRUE);
+                if (hLabelProcCount)
+                    MoveWindow(hLabelProcCount, xCnt, cy + 4, wCnt, 22, TRUE);
+            }
 
             if (hListViewProc && ch > barH)
                 MoveWindow(hListViewProc,
@@ -3397,6 +3415,8 @@ static void RedimensionarConteudo(HWND hwnd)
  * ========================================================================= */
 
 /* Comparadores para qsort — usam g_lvSortCol / g_lvSortDesc */
+static void DefinirAgrupamentoProcessos(int ligado, int persistir);
+
 static int CompararLvProc(const void *a, const void *b)
 {
     const ProcessoInfo *p1 = (const ProcessoInfo *)a;
@@ -3408,74 +3428,119 @@ static int CompararLvProc(const void *a, const void *b)
     case 0: /* Nome */
         r = _stricmp(p1->exeFile, p2->exeFile);
         break;
-    case 1: /* PID */
-        r = (p1->pid > p2->pid) ? 1 : (p1->pid < p2->pid) ? -1
-                                                          : 0;
+    case 1: /* PID (ou n.o de instancias na vista agrupada) */
+        if (g_lvAgrupar)
+            r = (p1->instancias > p2->instancias) - (p1->instancias < p2->instancias);
+        else
+            r = (p1->pid > p2->pid) - (p1->pid < p2->pid);
         break;
     case 2: /* CPU */
-        r = (p1->cpuPercent > p2->cpuPercent) ? 1 : (p1->cpuPercent < p2->cpuPercent) ? -1
-                                                                                      : 0;
+        r = (p1->cpuPercent > p2->cpuPercent) - (p1->cpuPercent < p2->cpuPercent);
         break;
     case 3: /* RAM */
-        r = (p1->memUsageMB > p2->memUsageMB) ? 1 : (p1->memUsageMB < p2->memUsageMB) ? -1
-                                                                                      : 0;
+        r = (p1->memUsageMB > p2->memUsageMB) - (p1->memUsageMB < p2->memUsageMB);
         break;
     }
-    return g_lvSortDesc ? -r : r;
+    if (r != 0)
+        return g_lvSortDesc ? -r : r;
+
+    /* desempate estavel: evita linhas a "saltar" quando os valores sao iguais */
+    r = _stricmp(p1->exeFile, p2->exeFile);
+    if (r == 0)
+        r = (p1->pid > p2->pid) - (p1->pid < p2->pid);
+    return r;
 }
 
-/* Preenche g_lvProcessos com base no filtro de texto actual */
+static void ParaMinusculas(char *dst, size_t n, const char *src)
+{
+    size_t i = 0;
+    if (!dst || n == 0)
+        return;
+    for (; src && src[i] && i + 1 < n; i++)
+        dst[i] = (char)tolower((unsigned char)src[i]);
+    dst[i] = '\0';
+}
+
+/* filtro vazio aceita tudo; caso contrario testa nome e PID */
+static int ProcessoPassaFiltro(const ProcessoInfo *p, const char *filtroLow)
+{
+    char nomeLow[MAX_PATH];
+    char pidStr[16];
+
+    if (filtroLow[0] == '\0')
+        return 1;
+
+    ParaMinusculas(nomeLow, sizeof(nomeLow), p->exeFile);
+    if (strstr(nomeLow, filtroLow) != NULL)
+        return 1;
+
+    snprintf(pidStr, sizeof(pidStr), "%u", p->pid);
+    return strstr(pidStr, filtroLow) != NULL;
+}
+
+/* Instancia "principal" de cada grupo = a de maior CPU (desempate: RAM).
+ * O seu PID e usado em "Abrir Localizacao" na vista agrupada. */
+static double g_grpMelhorCpu[MAX_PROCESSES];
+static SIZE_T g_grpMelhorMem[MAX_PROCESSES];
+
+static int EncontrarGrupoLv(const char *nome, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+    {
+        if (_stricmp(g_lvProcessos[i].exeFile, nome) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* Preenche g_lvProcessos com base no filtro de texto actual.
+ * Com g_lvAgrupar ativo, as instancias com o mesmo nome fundem-se numa
+ * linha (CPU e RAM somados). O filtro aplica-se antes de agrupar. */
 static void FiltrarListaProcessos(void)
 {
     char filtro[MAX_PATH];
     char filtroLow[MAX_PATH];
-    int i, n;
+    int i, n = 0;
 
     filtro[0] = '\0';
     if (hEditPesquisaProc)
         GetWindowTextA(hEditPesquisaProc, filtro, (int)sizeof(filtro));
+    ParaMinusculas(filtroLow, sizeof(filtroLow), filtro);
 
-    /* converte filtro para minúsculas para comparação case-insensitive */
-    strncpy_s(filtroLow, sizeof(filtroLow), filtro, _TRUNCATE);
-    {
-        char *p;
-        for (p = filtroLow; *p; p++)
-            *p = (char)tolower((unsigned char)*p);
-    }
-
-    n = 0;
     for (i = 0; i < g_totalProcessosBruto && n < MAX_PROCESSES; i++)
     {
-        if (filtroLow[0] == '\0')
+        const ProcessoInfo *p = &listaProcessos[i];
+        int g;
+
+        if (!ProcessoPassaFiltro(p, filtroLow))
+            continue;
+
+        g = g_lvAgrupar ? EncontrarGrupoLv(p->exeFile, n) : -1;
+
+        if (g < 0)
         {
-            /* sem filtro — copia tudo */
-            g_lvProcessos[n++] = listaProcessos[i];
+            g_lvProcessos[n] = *p;
+            g_lvProcessos[n].instancias = 1;
+            g_grpMelhorCpu[n] = p->cpuPercent;
+            g_grpMelhorMem[n] = p->memUsageMB;
+            n++;
         }
         else
         {
-            /* testa match no nome */
-            char nomeLow[MAX_PATH];
-            strncpy_s(nomeLow, sizeof(nomeLow),
-                      listaProcessos[i].exeFile, _TRUNCATE);
-            {
-                char *p;
-                for (p = nomeLow; *p; p++)
-                    *p = (char)tolower((unsigned char)*p);
-            }
+            ProcessoInfo *grp = &g_lvProcessos[g];
 
-            if (strstr(nomeLow, filtroLow) != NULL)
-            {
-                g_lvProcessos[n++] = listaProcessos[i];
-                continue;
-            }
+            grp->cpuPercent += p->cpuPercent;
+            grp->memUsageMB += p->memUsageMB;
+            grp->instancias++;
 
-            /* testa match no PID */
+            if (p->cpuPercent > g_grpMelhorCpu[g] ||
+                (p->cpuPercent == g_grpMelhorCpu[g] &&
+                 p->memUsageMB > g_grpMelhorMem[g]))
             {
-                char pidStr[16];
-                snprintf(pidStr, sizeof(pidStr), "%u",
-                         listaProcessos[i].pid);
-                if (strstr(pidStr, filtroLow) != NULL)
-                    g_lvProcessos[n++] = listaProcessos[i];
+                g_grpMelhorCpu[g] = p->cpuPercent;
+                g_grpMelhorMem[g] = p->memUsageMB;
+                grp->pid = p->pid;
             }
         }
     }
@@ -3487,19 +3552,200 @@ static void FiltrarListaProcessos(void)
               sizeof(ProcessoInfo), CompararLvProc);
 }
 
+static void AtualizarLabelContagemProc(void)
+{
+    char buf[96];
+
+    if (!hLabelProcCount)
+        return;
+
+    if (g_lvAgrupar)
+        snprintf(buf, sizeof(buf), "%d processos em %d grupos",
+                 g_totalProcessosBruto, g_lvTotal);
+    else
+        snprintf(buf, sizeof(buf), "%d processos  (%d visíveis)",
+                 g_totalProcessosBruto, g_lvTotal);
+    SetWindowTextA(hLabelProcCount, buf);
+}
+
+/* Reflete g_lvAgrupar na checkbox e no cabecalho da coluna 1 */
+static void SincronizarUIAgrupamento(void)
+{
+    if (hChkAgrupar)
+        Button_SetCheck(hChkAgrupar, g_lvAgrupar ? BST_CHECKED : BST_UNCHECKED);
+
+    if (hListViewProc)
+    {
+        LVCOLUMNA col;
+        ZeroMemory(&col, sizeof(col));
+        col.mask = LVCF_TEXT;
+        col.pszText = g_lvAgrupar ? "PID / Inst." : "PID";
+        ListView_SetColumn(hListViewProc, 1, &col);
+    }
+    g_lvAgruparUI = g_lvAgrupar;
+}
+
+/* Desliga o agrupamento e filtra pelo nome: mostra as instancias individuais */
+static void MostrarInstanciasGrupo(const char *nome)
+{
+    char copia[MAX_PATH];
+
+    strncpy_s(copia, sizeof(copia), nome, _TRUNCATE);
+    DefinirAgrupamentoProcessos(0, 0);
+    if (hEditPesquisaProc)
+        SetWindowTextA(hEditPesquisaProc, copia); /* EN_CHANGE refaz a lista */
+}
+
+static void CopiarTextoClipboard(HWND hwnd, const char *txt)
+{
+    size_t len = strlen(txt) + 1;
+    HGLOBAL hGlb;
+
+    if (!OpenClipboard(hwnd))
+        return;
+    EmptyClipboard();
+    hGlb = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (hGlb)
+    {
+        void *dst = GlobalLock(hGlb);
+        if (dst)
+        {
+            memcpy(dst, txt, len);
+            GlobalUnlock(hGlb);
+            if (!SetClipboardData(CF_TEXT, hGlb))
+                GlobalFree(hGlb);
+        }
+        else
+            GlobalFree(hGlb);
+    }
+    CloseClipboard();
+}
+
+/* Menu de contexto de uma linha agrupada (varias instancias).
+ * Os dados do grupo sao copiados antes de mostrar o menu, porque o timer
+ * continua a correr e g_lvProcessos pode ser reconstruido entretanto. */
+static void MenuContextoGrupo(HWND hwnd, const ProcessoInfo *grupo)
+{
+    char nome[MAX_PATH];
+    char txt[256];
+    DWORD pidPrincipal = grupo->pid;
+    int inst = grupo->instancias;
+    HMENU hMenu;
+    POINT pt;
+    UINT cmd;
+    int i;
+
+    strncpy_s(nome, sizeof(nome), grupo->exeFile, _TRUNCATE);
+
+    hMenu = CreatePopupMenu();
+    if (!hMenu)
+        return;
+
+    snprintf(txt, sizeof(txt), "Terminar todas as instancias (%d)", inst);
+    AppendMenuA(hMenu, MF_STRING, 1, txt);
+    snprintf(txt, sizeof(txt), "Definir Prioridade Alta (%d instancias)", inst);
+    AppendMenuA(hMenu, MF_STRING, 2, txt);
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hMenu, MF_STRING, 3, "Ver instancias individuais");
+    AppendMenuA(hMenu, MF_STRING, 4, "Abrir Localizacao do Ficheiro");
+    AppendMenuA(hMenu, MF_STRING, 5, "Copiar nome");
+
+    GetCursorPos(&pt);
+    cmd = (UINT)TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                               pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
+
+    switch (cmd)
+    {
+    case 1:
+    {
+        int total = 0, ok = 0;
+
+        snprintf(txt, sizeof(txt),
+                 "Terminar as %d instancias de %s?\n"
+                 "Isto pode causar perda de dados e instabilidade.",
+                 inst, nome);
+        if (MessageBoxA(hwnd, txt, "Aviso", MB_YESNO | MB_ICONWARNING) != IDYES)
+            break;
+
+        for (i = 0; i < totalListaProcessos; i++)
+        {
+            HANDLE hProc;
+
+            if (_stricmp(listaProcessos[i].exeFile, nome) != 0)
+                continue;
+            total++;
+            hProc = OpenProcess(PROCESS_TERMINATE, FALSE, listaProcessos[i].pid);
+            if (hProc)
+            {
+                if (TerminateProcess(hProc, 0))
+                    ok++;
+                CloseHandle(hProc);
+            }
+        }
+        if (ok < total)
+        {
+            snprintf(txt, sizeof(txt),
+                     "Foram terminadas %d de %d instancias "
+                     "(as restantes exigem mais permissoes).",
+                     ok, total);
+            MessageBoxA(hwnd, txt, "WinMon", MB_OK | MB_ICONINFORMATION);
+        }
+        break;
+    }
+    case 2:
+        for (i = 0; i < totalListaProcessos; i++)
+        {
+            HANDLE hProc;
+
+            if (_stricmp(listaProcessos[i].exeFile, nome) != 0)
+                continue;
+            hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, listaProcessos[i].pid);
+            if (hProc)
+            {
+                SetPriorityClass(hProc, HIGH_PRIORITY_CLASS);
+                CloseHandle(hProc);
+            }
+        }
+        break;
+    case 3:
+        MostrarInstanciasGrupo(nome);
+        break;
+    case 4:
+    {
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pidPrincipal);
+        if (hProc)
+        {
+            char path[MAX_PATH];
+            DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameA(hProc, 0, path, &size))
+            {
+                char args[MAX_PATH + 32];
+                snprintf(args, sizeof(args), "/select,\"%s\"", path);
+                ShellExecuteA(NULL, "open", "explorer.exe", args, NULL, SW_SHOW);
+            }
+            CloseHandle(hProc);
+        }
+        break;
+    }
+    case 5:
+        CopiarTextoClipboard(hwnd, nome);
+        break;
+    }
+}
+
 /* Actualiza o conteúdo do ListView com os dados mais recentes */
 static void AtualizarListViewProcessos(void)
 {
-    char buf[64];
-    int i;
-
     if (!hListViewProc)
         return;
 
-    /* guarda o total bruto antes de filtrar */
     /* (MonitorarProcessos() já preencheu listaProcessos[],
        e usamos totalListaProcessos, preenchido pelo mesmo ciclo de recolha. */
     g_totalProcessosBruto = totalListaProcessos; /* mesmo ciclo */
+
+    if (g_lvAgruparUI != g_lvAgrupar)
+        SincronizarUIAgrupamento();
 
     FiltrarListaProcessos();
 
@@ -3510,15 +3756,7 @@ static void AtualizarListViewProcessos(void)
     SendMessage(hListViewProc, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(hListViewProc, NULL, FALSE);
 
-    /* Actualiza label de contagem */
-    if (hLabelProcCount)
-    {
-        snprintf(buf, sizeof(buf), "%d processos  (%d visíveis)",
-                 g_totalProcessosBruto, g_lvTotal);
-        SetWindowTextA(hLabelProcCount, buf);
-    }
-
-    (void)i;
+    AtualizarLabelContagemProc();
 }
 
 /* Callback de notificação do ListView (LVN_GETDISPINFO para virtual list) */
@@ -3539,9 +3777,13 @@ static void LvProcGetDispInfo(NMLVDISPINFOA *pdi)
         strncpy_s(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
                   g_lvProcessos[idx].exeFile, _TRUNCATE);
         break;
-    case 1: /* PID */
-        snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
-                 "%u", g_lvProcessos[idx].pid);
+    case 1: /* PID (ou n.o de instancias num grupo) */
+        if (g_lvAgrupar && g_lvProcessos[idx].instancias > 1)
+            snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
+                     "%d inst.", g_lvProcessos[idx].instancias);
+        else
+            snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
+                     "%u", g_lvProcessos[idx].pid);
         break;
     case 2: /* CPU */
         snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
@@ -3603,6 +3845,15 @@ static void CriarPainelProcessos(HWND hwndPai)
         0, 0, 260, 22,
         hwndPai,
         (HMENU)(UINT_PTR)IDC_LABEL_PROC_COUNT,
+        hInst, NULL);
+
+    /* Checkbox "Agrupar por nome" */
+    hChkAgrupar = CreateWindowExA(
+        0, "BUTTON", "Agrupar por nome",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        0, 0, 140, 22,
+        hwndPai,
+        (HMENU)(UINT_PTR)IDC_CHK_AGRUPAR,
         hInst, NULL);
 
     /* ListView virtual — filho directo da janela principal */
@@ -3921,12 +4172,6 @@ static void CriarAbas(HWND hwnd)
         hwnd, (HMENU)(UINT_PTR)ID_CYCLE_INTERVAL,
         GetModuleHandle(NULL), NULL);
 
-    hBtnEstiloMain = CreateWindowExA(
-        0, "BUTTON", "Definicoes [Ctrl+D]",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        0, 0, 116, 22,
-        hwnd, (HMENU)(UINT_PTR)ID_CONFIG_SETTINGS,
-        GetModuleHandle(NULL), NULL);
 
     hBtnGraphPNG = CreateWindowExA(
         0, "BUTTON", "PNG",
@@ -4240,6 +4485,11 @@ static void CarregarConfigIni(void)
                              val, sizeof(val), INI_FICHEIRO);
     intervaloAtualizacaoMs = (UINT)atoi(val);
 
+    g_lvAgrupar = GetPrivateProfileIntA(INI_SECAO_GERAL, "AgruparProcessos",
+                                        0, INI_FICHEIRO)
+                      ? 1
+                      : 0;
+
     if (!_finite(limiteCpuPercent) || limiteCpuPercent < 1.0 || limiteCpuPercent > 100.0)
         limiteCpuPercent = LIMITE_CPU_PERCENT_DEFAULT;
     if (!_finite(limiteRamPercent) || limiteRamPercent < 1.0 || limiteRamPercent > 100.0)
@@ -4263,6 +4513,28 @@ static void GravarConfigIni(void)
 
     snprintf(val, sizeof(val), "%.1f", limiteDiscoPercent);
     WritePrivateProfileStringA(INI_SECAO, "LimiteDisco", val, INI_FICHEIRO);
+}
+
+/* Liga/desliga a vista agrupada. persistir=0 para mudancas temporarias
+ * (ex.: "Ver instancias individuais"). */
+static void DefinirAgrupamentoProcessos(int ligado, int persistir)
+{
+    g_lvAgrupar = ligado ? 1 : 0;
+
+    /* ordenar por PID nao faz sentido em grupos: passa a RAM (desc) */
+    if (g_lvAgrupar && g_lvSortCol == 1)
+    {
+        g_lvSortCol = 3;
+        g_lvSortDesc = 1;
+    }
+
+    SincronizarUIAgrupamento();
+
+    if (persistir)
+        WritePrivateProfileStringA(INI_SECAO_GERAL, "AgruparProcessos",
+                                   g_lvAgrupar ? "1" : "0", INI_FICHEIRO);
+
+    AtualizarListViewProcessos();
 }
 
 #define IDC_EDIT_CPU 3001
@@ -6455,14 +6727,7 @@ void AtualizarMonitor()
         /* mesmo fora da aba, mantemos o filtro actualizado
            para que ao mudar de aba a lista já esteja pronta */
         FiltrarListaProcessos();
-        if (hLabelProcCount)
-        {
-            char _cntbuf[64];
-            snprintf(_cntbuf, sizeof(_cntbuf),
-                     "%d processos  (%d visíveis)",
-                     g_totalProcessosBruto, g_lvTotal);
-            SetWindowTextA(hLabelProcCount, _cntbuf);
-        }
+        AtualizarLabelContagemProc();
     }
 
     AtualizarOverlay();
@@ -6615,6 +6880,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
 
         InicializarTemperaturaCPU();
         CarregarConfigIni();
+        SincronizarUIAgrupamento();
         CarregarConfigVisual();
         CarregarConfigTray();
         AtualizarTextoIntervalo();
@@ -6740,8 +7006,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 NMITEMACTIVATE *pnm = (NMITEMACTIVATE *)lParam;
                 if (pnm->iItem >= 0 && pnm->iItem < g_lvTotal)
                 {
-                    AbrirDetalheProcesso(g_lvProcessos[pnm->iItem].pid,
-                                         g_lvProcessos[pnm->iItem].exeFile);
+                    if (g_lvAgrupar && g_lvProcessos[pnm->iItem].instancias > 1)
+                        MostrarInstanciasGrupo(g_lvProcessos[pnm->iItem].exeFile);
+                    else
+                        AbrirDetalheProcesso(g_lvProcessos[pnm->iItem].pid,
+                                             g_lvProcessos[pnm->iItem].exeFile);
                 }
                 return 0;
             }
@@ -6752,6 +7021,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 NMITEMACTIVATE *pnm = (NMITEMACTIVATE *)lParam;
                 if (pnm->iItem != -1 && pnm->iItem < g_lvTotal)
                 {
+                    if (g_lvAgrupar && g_lvProcessos[pnm->iItem].instancias > 1)
+                    {
+                        MenuContextoGrupo(hwnd, &g_lvProcessos[pnm->iItem]);
+                        return 0;
+                    }
+
                     DWORD pid = g_lvProcessos[pnm->iItem].pid;
                     char pidStr[16];
                     snprintf(pidStr, sizeof(pidStr), "%u", pid);
@@ -6919,6 +7194,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             int indice = LOWORD(wParam) - TAB_RESUMO;
             TabCtrl_SetCurSel(hTab, indice);
             MostrarAba(indice);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_CHK_AGRUPAR &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            DefinirAgrupamentoProcessos(
+                Button_GetCheck(hChkAgrupar) == BST_CHECKED, 1);
             return 0;
         }
         if (LOWORD(wParam) == IDC_EDIT_PESQUISA_PROC &&
@@ -7234,6 +7516,8 @@ static void AplicarVisibilidadeModoNormal(void)
         ShowWindow(hEditPesquisaProc, SW_SHOW);
     if (hLabelProcCount)
         ShowWindow(hLabelProcCount, SW_SHOW);
+    if (hChkAgrupar)
+        ShowWindow(hChkAgrupar, SW_SHOW);
     if (hListViewProc)
         ShowWindow(hListViewProc, SW_SHOW);
 
@@ -7312,6 +7596,8 @@ static void ToggleCompactMode(void)
             ShowWindow(hEditPesquisaProc, SW_HIDE);
         if (hLabelProcCount)
             ShowWindow(hLabelProcCount, SW_HIDE);
+        if (hChkAgrupar)
+            ShowWindow(hChkAgrupar, SW_HIDE);
         if (hListViewProc)
             ShowWindow(hListViewProc, SW_HIDE);
         if (hSettingsTitle)
