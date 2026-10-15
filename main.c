@@ -198,6 +198,8 @@ typedef struct
     double gpuCopy[HISTORICO_PONTOS];
     double gpuEncode[HISTORICO_PONTOS];
     double gpuDecode[HISTORICO_PONTOS];
+    double ping[HISTORICO_PONTOS];      /* ms; -1 = perdido; NAN = sem dados */
+    double wifiSinal[HISTORICO_PONTOS]; /* % ; NAN = sem Wi-Fi ligado */
     double core[MAX_CORES][HISTORICO_PONTOS];
     SYSTEMTIME timestamp[HISTORICO_PONTOS];
     ULONGLONG tickMs[HISTORICO_PONTOS];
@@ -469,6 +471,583 @@ static int ovTotalH = 0;
 
 static ProcessoInfo listaProcessos[MAX_PROCESSES];
 static HistoricoMonitor historico;
+
+/* ------------------------------------------------------------------------- */
+/* Latencia (ICMP) e Wi-Fi (WLAN API)                                        */
+/* DLLs carregadas dinamicamente de System32 (sem novas libs no linker) e    */
+/* recolha numa thread propria, para nunca bloquear a interface.             */
+/* ------------------------------------------------------------------------- */
+
+#define PING_ALVOS 3
+#define PING_JANELA 60
+#define PING_INTERVALO_MS 1000
+#define PING_PAINEL_ALTURA_MIN 480
+
+typedef struct
+{
+    ULONG Address;
+    ULONG Status;
+    ULONG RoundTripTime;
+    USHORT DataSize;
+    USHORT Reserved;
+    PVOID Data;
+    UCHAR Ttl;
+    UCHAR Tos;
+    UCHAR Flags;
+    UCHAR OptionsSize;
+    PUCHAR OptionsData;
+} WmIcmpReply;
+
+typedef HANDLE(WINAPI *PfnIcmpCreateFile)(void);
+typedef BOOL(WINAPI *PfnIcmpCloseHandle)(HANDLE);
+typedef DWORD(WINAPI *PfnIcmpSendEcho)(HANDLE, ULONG, LPVOID, WORD, LPVOID, LPVOID, DWORD, DWORD);
+
+typedef struct
+{
+    GUID guid;
+    WCHAR desc[256];
+    int estado;
+} WmWlanIntf;
+
+typedef struct
+{
+    DWORD n;
+    DWORD idx;
+    WmWlanIntf intf[1];
+} WmWlanIntfList;
+
+typedef struct
+{
+    ULONG ssidLen;
+    UCHAR ssid[32];
+    int bssType;
+    UCHAR bssid[6];
+    int phy;
+    ULONG phyIdx;
+    ULONG sinal;
+    ULONG rxKbps;
+    ULONG txKbps;
+} WmWlanAssoc;
+
+typedef struct
+{
+    BOOL seg;
+    BOOL onex;
+    int auth;
+    int cipher;
+} WmWlanSeg;
+
+typedef struct
+{
+    int estado;
+    int modo;
+    WCHAR perfil[256];
+    WmWlanAssoc assoc;
+    WmWlanSeg seguranca;
+} WmWlanConn;
+
+typedef DWORD(WINAPI *PfnWlanOpenHandle)(DWORD, PVOID, PDWORD, PHANDLE);
+typedef DWORD(WINAPI *PfnWlanCloseHandle)(HANDLE, PVOID);
+typedef DWORD(WINAPI *PfnWlanEnumInterfaces)(HANDLE, PVOID, WmWlanIntfList **);
+typedef DWORD(WINAPI *PfnWlanQueryInterface)(HANDLE, const GUID *, int, PVOID, PDWORD, PVOID *, PVOID);
+typedef VOID(WINAPI *PfnWlanFreeMemory)(PVOID);
+
+typedef struct
+{
+    int ativo;
+    int alvo;
+    int semGateway;
+    char alvoNome[48];
+    double ultimoMs; /* NAN = sem dados, -1 = pacote perdido */
+    double minMs;
+    double maxMs;
+    double mediaMs;
+    double jitterMs;
+    unsigned long enviados;
+    unsigned long recebidos;
+    double perdaJanela; /* % nos ultimos PING_JANELA pacotes */
+} PingEstado;
+
+typedef struct
+{
+    int adaptador;
+    int ligado;
+    char ssid[64];
+    char adaptadorNome[96];
+    int qualidade; /* 0..100 */
+    double dbm;    /* estimativa a partir da qualidade */
+    ULONG rxKbps;
+    ULONG txKbps;
+    int phy;
+    int auth;
+} WifiEstado;
+
+static CRITICAL_SECTION g_pwCs;
+static int g_pwCsInit = 0;
+static HANDLE g_pwThread = NULL;
+static HANDLE g_pwStopEvt = NULL;
+static volatile LONG g_pingAlvoIdx = 1;
+static PingEstado g_pingEst;
+static WifiEstado g_wifiEst;
+static RECT g_pingTitleRect = {0, 0, 0, 0};
+static const char *const g_pingAlvoNome[PING_ALVOS] = {"Gateway", "1.1.1.1", "8.8.8.8"};
+static const BYTE g_pingAlvoIp[PING_ALVOS][4] = {{0, 0, 0, 0}, {1, 1, 1, 1}, {8, 8, 8, 8}};
+
+static void PingGuardarAlvo(void)
+{
+    HKEY hk;
+    DWORD v = (DWORD)g_pingAlvoIdx;
+
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\WinMon\\Ping", 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS)
+    {
+        RegSetValueExA(hk, "Alvo", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        RegCloseKey(hk);
+    }
+}
+
+static void PingCarregarAlvo(void)
+{
+    HKEY hk;
+    DWORD v = 0, sz = sizeof(v), t = 0;
+
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\WinMon\\Ping", 0,
+                      KEY_QUERY_VALUE, &hk) == ERROR_SUCCESS)
+    {
+        if (RegQueryValueExA(hk, "Alvo", NULL, &t, (BYTE *)&v, &sz) == ERROR_SUCCESS &&
+            t == REG_DWORD && v < PING_ALVOS)
+            g_pingAlvoIdx = (LONG)v;
+        RegCloseKey(hk);
+    }
+}
+
+static void PingCiclarAlvo(void)
+{
+    LONG n = (g_pingAlvoIdx + 1) % PING_ALVOS;
+    InterlockedExchange(&g_pingAlvoIdx, n);
+    PingGuardarAlvo();
+}
+
+static int PingObterGateway(ULONG *addr, char *txt, size_t n)
+{
+    ULONG len = 0;
+    PIP_ADAPTER_INFO info, p;
+    int ok = 0;
+
+    if (GetAdaptersInfo(NULL, &len) != ERROR_BUFFER_OVERFLOW || len == 0)
+        return 0;
+    info = (PIP_ADAPTER_INFO)malloc(len);
+    if (!info)
+        return 0;
+    if (GetAdaptersInfo(info, &len) == NO_ERROR)
+    {
+        for (p = info; p && !ok; p = p->Next)
+        {
+            unsigned a = 0, b = 0, c = 0, d = 0;
+            const char *s = p->GatewayList.IpAddress.String;
+
+            if (sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+                a < 256 && b < 256 && c < 256 && d < 256 && (a | b | c | d) != 0)
+            {
+                *addr = (ULONG)(a | (b << 8) | (c << 16) | ((ULONG)d << 24));
+                snprintf(txt, n, "%u.%u.%u.%u", a, b, c, d);
+                ok = 1;
+            }
+        }
+    }
+    free(info);
+    return ok;
+}
+
+static void WifiSsidParaAnsi(const UCHAR *s, ULONG len, char *out, size_t n)
+{
+    WCHAR wb[64];
+    char raw[40];
+    int wl;
+
+    if (len > 32)
+        len = 32;
+    if (len == 0)
+    {
+        snprintf(out, n, "(oculta)");
+        return;
+    }
+    memcpy(raw, s, len);
+    raw[len] = '\0';
+    wl = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw, (int)len, wb, 63);
+    if (wl > 0)
+    {
+        wb[wl] = L'\0';
+        if (WideCharToMultiByte(CP_ACP, 0, wb, -1, out, (int)n, NULL, NULL) > 0)
+            return;
+    }
+    snprintf(out, n, "%s", raw);
+}
+
+static const char *WifiPhyNome(int phy)
+{
+    switch (phy)
+    {
+    case 2:
+        return "802.11 DSSS";
+    case 4:
+        return "802.11a";
+    case 5:
+        return "802.11b";
+    case 6:
+        return "802.11g";
+    case 7:
+        return "Wi-Fi 4 (802.11n)";
+    case 8:
+        return "Wi-Fi 5 (802.11ac)";
+    case 10:
+        return "Wi-Fi 6 (802.11ax)";
+    case 11:
+        return "Wi-Fi 7 (802.11be)";
+    default:
+        return "Norma n/d";
+    }
+}
+
+static const char *WifiAuthNome(int auth)
+{
+    switch (auth)
+    {
+    case 1:
+        return "Aberta";
+    case 2:
+        return "WEP";
+    case 3:
+        return "WPA";
+    case 4:
+        return "WPA-PSK";
+    case 6:
+        return "WPA2";
+    case 7:
+        return "WPA2-PSK";
+    case 8:
+        return "WPA3-Ent 192";
+    case 9:
+        return "WPA3";
+    case 10:
+        return "OWE";
+    case 11:
+        return "WPA3-Ent";
+    default:
+        return "Seg. n/d";
+    }
+}
+
+/* Chamado apenas pela thread de recolha. */
+static void WifiConsultar(WifiEstado *w)
+{
+    static HMODULE hWlan = NULL;
+    static HANDLE cli = NULL;
+    static int tentou = 0;
+    static unsigned retry = 0;
+    static PfnWlanOpenHandle fOpen;
+    static PfnWlanCloseHandle fClose;
+    static PfnWlanEnumInterfaces fEnum;
+    static PfnWlanQueryInterface fQuery;
+    static PfnWlanFreeMemory fFree;
+    WmWlanIntfList *lista = NULL;
+    DWORD i, k = 0;
+
+    memset(w, 0, sizeof(*w));
+
+    if (!tentou)
+    {
+        tentou = 1;
+        hWlan = LoadLibraryExW(L"wlanapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (hWlan)
+        {
+            fOpen = (PfnWlanOpenHandle)(void *)GetProcAddress(hWlan, "WlanOpenHandle");
+            fClose = (PfnWlanCloseHandle)(void *)GetProcAddress(hWlan, "WlanCloseHandle");
+            fEnum = (PfnWlanEnumInterfaces)(void *)GetProcAddress(hWlan, "WlanEnumInterfaces");
+            fQuery = (PfnWlanQueryInterface)(void *)GetProcAddress(hWlan, "WlanQueryInterface");
+            fFree = (PfnWlanFreeMemory)(void *)GetProcAddress(hWlan, "WlanFreeMemory");
+            if (!fOpen || !fClose || !fEnum || !fQuery || !fFree)
+            {
+                FreeLibrary(hWlan);
+                hWlan = NULL;
+            }
+        }
+    }
+    if (!hWlan)
+        return;
+
+    if (!cli)
+    {
+        DWORD neg = 0;
+        if ((retry++ % 5) != 0)
+            return; /* servico WLAN parado: tenta de novo de vez em quando */
+        if (fOpen(2, NULL, &neg, &cli) != ERROR_SUCCESS)
+        {
+            cli = NULL;
+            return;
+        }
+    }
+
+    if (fEnum(cli, NULL, &lista) != ERROR_SUCCESS || !lista)
+    {
+        fClose(cli, NULL); /* handle invalido (servico reiniciou): reabre depois */
+        cli = NULL;
+        return;
+    }
+
+    if (lista->n > 0)
+    {
+        WmWlanConn *c = NULL;
+        DWORD sz = 0;
+
+        for (i = 0; i < lista->n; i++)
+            if (lista->intf[i].estado == 1)
+            {
+                k = i;
+                break;
+            }
+
+        w->adaptador = 1;
+        if (WideCharToMultiByte(CP_ACP, 0, lista->intf[k].desc, -1,
+                                w->adaptadorNome, (int)sizeof(w->adaptadorNome),
+                                NULL, NULL) <= 0)
+            w->adaptadorNome[0] = '\0';
+
+        if (lista->intf[k].estado == 1 &&
+            fQuery(cli, &lista->intf[k].guid, 7 /* current_connection */, NULL, &sz,
+                   (PVOID *)&c, NULL) == ERROR_SUCCESS &&
+            c)
+        {
+            w->ligado = (c->estado == 1);
+            if (w->ligado)
+            {
+                WifiSsidParaAnsi(c->assoc.ssid, c->assoc.ssidLen, w->ssid, sizeof(w->ssid));
+                w->qualidade = (int)c->assoc.sinal;
+                if (w->qualidade > 100)
+                    w->qualidade = 100;
+                w->dbm = (double)w->qualidade / 2.0 - 100.0;
+                w->rxKbps = c->assoc.rxKbps;
+                w->txKbps = c->assoc.txKbps;
+                w->phy = c->assoc.phy;
+                w->auth = c->seguranca.auth;
+            }
+            fFree(c);
+        }
+    }
+    fFree(lista);
+}
+
+static DWORD WINAPI PingWifiThread(LPVOID arg)
+{
+    HMODULE hIp;
+    PfnIcmpCreateFile fCreate = NULL;
+    PfnIcmpCloseHandle fClose = NULL;
+    PfnIcmpSendEcho fSend = NULL;
+    HANDLE hIcmp = INVALID_HANDLE_VALUE;
+    LONG lastAlvo = -1;
+    ULONG gwAddr = 0;
+    char gwTxt[24] = {0};
+    int gwOk = 0;
+    unsigned long iter = 0;
+    double prevRtt = -1.0, jitter = 0.0, soma = 0.0, mn = 0.0, mx = 0.0;
+    unsigned long env = 0, rec = 0;
+    BYTE janela[PING_JANELA];
+    int jPos = 0, jCount = 0;
+    static const char payload[] = "WinMon ping 0123456789abcde";
+
+    (void)arg;
+    memset(janela, 0, sizeof(janela));
+
+    hIp = LoadLibraryExW(L"iphlpapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (hIp)
+    {
+        fCreate = (PfnIcmpCreateFile)(void *)GetProcAddress(hIp, "IcmpCreateFile");
+        fClose = (PfnIcmpCloseHandle)(void *)GetProcAddress(hIp, "IcmpCloseHandle");
+        fSend = (PfnIcmpSendEcho)(void *)GetProcAddress(hIp, "IcmpSendEcho");
+        if (fCreate && fClose && fSend)
+            hIcmp = fCreate();
+    }
+
+    while (WaitForSingleObject(g_pwStopEvt, 0) != WAIT_OBJECT_0)
+    {
+        ULONGLONG t0 = GetTickCount64();
+        LONG alvo = g_pingAlvoIdx;
+        ULONG addr = 0;
+        char nome[48];
+        int semGw = 0;
+        double ultimo = NAN;
+        ULONGLONG gasto;
+
+        if (alvo < 0 || alvo >= PING_ALVOS)
+            alvo = 1;
+
+        if (alvo != lastAlvo)
+        {
+            lastAlvo = alvo;
+            gwOk = 0;
+            prevRtt = -1.0;
+            jitter = soma = mn = mx = 0.0;
+            env = rec = 0;
+            jPos = jCount = 0;
+            memset(janela, 0, sizeof(janela));
+        }
+
+        if (alvo == 0)
+        {
+            if (!gwOk || (iter % 15) == 0)
+                gwOk = PingObterGateway(&gwAddr, gwTxt, sizeof(gwTxt));
+            if (gwOk)
+            {
+                addr = gwAddr;
+                snprintf(nome, sizeof(nome), "Gateway %s", gwTxt);
+            }
+            else
+            {
+                semGw = 1;
+                snprintf(nome, sizeof(nome), "Gateway (nao encontrado)");
+            }
+        }
+        else
+        {
+            addr = (ULONG)(g_pingAlvoIp[alvo][0] | (g_pingAlvoIp[alvo][1] << 8) |
+                           (g_pingAlvoIp[alvo][2] << 16) | ((ULONG)g_pingAlvoIp[alvo][3] << 24));
+            snprintf(nome, sizeof(nome), "%s", g_pingAlvoNome[alvo]);
+        }
+
+        if (!semGw)
+        {
+            int perdido = 1;
+
+            if (hIcmp != INVALID_HANDLE_VALUE && hIcmp != NULL)
+            {
+                union
+                {
+                    WmIcmpReply r;
+                    BYTE b[256];
+                } rep;
+                DWORD n;
+
+                memset(&rep, 0, sizeof(rep));
+                n = fSend(hIcmp, addr, (LPVOID)payload, (WORD)sizeof(payload),
+                          NULL, rep.b, (DWORD)sizeof(rep.b), 1000);
+                if (n > 0 && rep.r.Status == 0)
+                {
+                    double rtt = (double)rep.r.RoundTripTime;
+
+                    perdido = 0;
+                    rec++;
+                    soma += rtt;
+                    if (rec == 1 || rtt < mn)
+                        mn = rtt;
+                    if (rec == 1 || rtt > mx)
+                        mx = rtt;
+                    if (prevRtt >= 0.0)
+                        jitter += (fabs(rtt - prevRtt) - jitter) / 16.0;
+                    prevRtt = rtt;
+                    ultimo = rtt;
+                }
+            }
+
+            env++;
+            if (perdido)
+                ultimo = -1.0;
+            janela[jPos] = (BYTE)perdido;
+            jPos = (jPos + 1) % PING_JANELA;
+            if (jCount < PING_JANELA)
+                jCount++;
+        }
+
+        EnterCriticalSection(&g_pwCs);
+        g_pingEst.ativo = 1;
+        g_pingEst.alvo = (int)alvo;
+        g_pingEst.semGateway = semGw;
+        snprintf(g_pingEst.alvoNome, sizeof(g_pingEst.alvoNome), "%s", nome);
+        g_pingEst.ultimoMs = ultimo;
+        g_pingEst.minMs = mn;
+        g_pingEst.maxMs = mx;
+        g_pingEst.mediaMs = rec ? soma / (double)rec : 0.0;
+        g_pingEst.jitterMs = jitter;
+        g_pingEst.enviados = env;
+        g_pingEst.recebidos = rec;
+        {
+            int perdas = 0, j;
+            for (j = 0; j < jCount; j++)
+                perdas += janela[j];
+            g_pingEst.perdaJanela = jCount ? 100.0 * (double)perdas / (double)jCount : 0.0;
+        }
+        LeaveCriticalSection(&g_pwCs);
+
+        if ((iter % 2) == 0)
+        {
+            WifiEstado w;
+            WifiConsultar(&w);
+            EnterCriticalSection(&g_pwCs);
+            g_wifiEst = w;
+            LeaveCriticalSection(&g_pwCs);
+        }
+        iter++;
+
+        gasto = GetTickCount64() - t0;
+        if (gasto < PING_INTERVALO_MS)
+            WaitForSingleObject(g_pwStopEvt, (DWORD)(PING_INTERVALO_MS - gasto));
+    }
+
+    if (hIcmp != INVALID_HANDLE_VALUE && hIcmp != NULL && fClose)
+        fClose(hIcmp);
+    return 0;
+}
+
+static void PingWifiIniciar(void)
+{
+    if (g_pwThread)
+        return;
+    if (!g_pwCsInit)
+    {
+        InitializeCriticalSection(&g_pwCs);
+        g_pwCsInit = 1;
+    }
+    memset(&g_pingEst, 0, sizeof(g_pingEst));
+    g_pingEst.ultimoMs = NAN;
+    memset(&g_wifiEst, 0, sizeof(g_wifiEst));
+    PingCarregarAlvo();
+
+    g_pwStopEvt = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!g_pwStopEvt)
+        return;
+    g_pwThread = CreateThread(NULL, 0, PingWifiThread, NULL, 0, NULL);
+    if (!g_pwThread)
+    {
+        CloseHandle(g_pwStopEvt);
+        g_pwStopEvt = NULL;
+    }
+}
+
+static void PingWifiParar(void)
+{
+    if (!g_pwThread)
+        return;
+    SetEvent(g_pwStopEvt);
+    WaitForSingleObject(g_pwThread, 3000);
+    CloseHandle(g_pwThread);
+    g_pwThread = NULL;
+    CloseHandle(g_pwStopEvt);
+    g_pwStopEvt = NULL;
+}
+
+static void PingWifiObter(PingEstado *p, WifiEstado *w)
+{
+    if (!g_pwCsInit)
+    {
+        memset(p, 0, sizeof(*p));
+        p->ultimoMs = NAN;
+        memset(w, 0, sizeof(*w));
+        return;
+    }
+    EnterCriticalSection(&g_pwCs);
+    *p = g_pingEst;
+    *w = g_wifiEst;
+    LeaveCriticalSection(&g_pwCs);
+}
 
 static int abaAtual = 0;
 
@@ -923,6 +1502,8 @@ static void AdicionarHistorico(double cpu, double ram, double temp,
 
     processoCpuTop[historico.pos] = 0.0;
     processoRamTop[historico.pos] = 0.0;
+    historico.ping[historico.pos] = NAN;
+    historico.wifiSinal[historico.pos] = NAN;
 
     if (historico.count < HISTORICO_PONTOS)
         historico.count++;
@@ -1182,6 +1763,49 @@ void MonitorarRede(char *buffer, size_t size, size_t *offset)
     }
 
     free(pIfTable);
+}
+
+void MonitorarLatenciaWifi(char *buffer, size_t size, size_t *offset)
+{
+    PingEstado p;
+    WifiEstado w;
+
+    PingWifiObter(&p, &w);
+
+    AppendFormat(buffer, size, offset, "=== [ LATENCIA & WI-FI ] ===\r\n");
+
+    if (!p.ativo)
+        AppendFormat(buffer, size, offset, "Ping: a iniciar...\r\n");
+    else if (p.semGateway)
+        AppendFormat(buffer, size, offset, "Ping (%s): sem gateway (clica no grafico de Rede para mudar de alvo)\r\n", p.alvoNome);
+    else if (isnan(p.ultimoMs))
+        AppendFormat(buffer, size, offset, "Ping (%s): a medir...\r\n", p.alvoNome);
+    else
+    {
+        char ult[32];
+
+        if (p.ultimoMs < 0.0)
+            snprintf(ult, sizeof(ult), "perdido");
+        else if (p.ultimoMs < 1.0)
+            snprintf(ult, sizeof(ult), "<1 ms");
+        else
+            snprintf(ult, sizeof(ult), "%.0f ms", p.ultimoMs);
+
+        AppendFormat(buffer, size, offset,
+                     "Ping (%s): %s | Media %.1f ms | Jitter %.1f ms | Perda %.1f%%\r\n",
+                     p.alvoNome, ult, p.mediaMs, p.jitterMs, p.perdaJanela);
+    }
+
+    if (!w.adaptador)
+        AppendFormat(buffer, size, offset, "Wi-Fi: sem adaptador Wi-Fi\r\n\r\n");
+    else if (!w.ligado)
+        AppendFormat(buffer, size, offset, "Wi-Fi: desligado (%s)\r\n\r\n", w.adaptadorNome);
+    else
+        AppendFormat(buffer, size, offset,
+                     "Wi-Fi: %s | Sinal %d%% (~%.0f dBm) | %lu/%lu Mbps | %s | %s\r\n\r\n",
+                     w.ssid, w.qualidade, w.dbm,
+                     (unsigned long)(w.rxKbps / 1000), (unsigned long)(w.txKbps / 1000),
+                     WifiPhyNome(w.phy), WifiAuthNome(w.auth));
 }
 
 void MonitorarGPU(char *buffer, size_t size, size_t *offset)
@@ -2005,6 +2629,250 @@ static void DrawAlertRegions(HDC hdc, RECT rc, const double *data,
     DeleteObject(brush);
 }
 
+static void DrawLatencySeries(HDC hdc, RECT rc, int start, int count,
+                              double maxY, COLORREF cor, int thickness)
+{
+    HPEN pen = CreatePen(PS_SOLID, thickness, cor);
+    HPEN penLoss = CreatePen(PS_SOLID, 1, RGB(210, 60, 50));
+    HPEN oldPen;
+    BOOL havePoint = FALSE;
+    int i;
+
+    if (!pen || !penLoss || count <= 0 || maxY <= 0.0)
+    {
+        if (pen)
+            DeleteObject(pen);
+        if (penLoss)
+            DeleteObject(penLoss);
+        return;
+    }
+
+    oldPen = (HPEN)SelectObject(hdc, pen);
+    for (i = 0; i < count; i++)
+    {
+        double v = historico.ping[HistoricoIndex(start + i)];
+        int x = rc.left + (count == 1 ? 0 : (int)(((double)i / (double)(count - 1)) * (rc.right - rc.left)));
+
+        if (isnan(v))
+        {
+            havePoint = FALSE;
+            continue;
+        }
+        if (v < 0.0) /* pacote perdido: marca vermelha vertical */
+        {
+            SelectObject(hdc, penLoss);
+            MoveToEx(hdc, x, rc.bottom, NULL);
+            LineTo(hdc, x, rc.top);
+            SelectObject(hdc, pen);
+            havePoint = FALSE;
+            continue;
+        }
+        if (v > maxY)
+            v = maxY;
+        {
+            int y = rc.bottom - (int)((v / maxY) * (rc.bottom - rc.top));
+            if (!havePoint)
+                MoveToEx(hdc, x, y, NULL);
+            else
+                LineTo(hdc, x, y);
+            havePoint = TRUE;
+        }
+    }
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+    DeleteObject(penLoss);
+}
+
+/* Painel por baixo do grafico de rede: latencia (esquerda) + Wi-Fi (direita). */
+static void DesenharPainelLatenciaWifi(HDC hdc, RECT client, RECT upper,
+                                       int viewStart, int viewCount)
+{
+    PingEstado p;
+    WifiEstado w;
+    RECT pr;
+    HFONT oldFont;
+    int top, usable, i;
+    double maxY = 40.0;
+    char txt[160];
+    GraphViewState *vw = &g_graphViews[GRAPH_NET];
+
+    SetRectEmpty(&g_pingTitleRect);
+    if (client.bottom < PING_PAINEL_ALTURA_MIN || viewCount <= 0)
+        return;
+
+    PingWifiObter(&p, &w);
+
+    top = upper.bottom + 52; /* deixa livre: rotulos de tempo + linha 'Janela: ...' do grafico de cima */
+    usable = client.right - 20 - 58;
+    pr.left = 58;
+    pr.top = top + 46;
+    pr.right = 58 + (usable * 58) / 100;
+    pr.bottom = client.bottom - 40;
+    if (pr.bottom - pr.top < 50 || pr.right - pr.left < 120)
+        return;
+
+    oldFont = (HFONT)SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(hdc, TRANSPARENT);
+
+    /* escala do eixo Y (valores "redondos" divisiveis por 4 para a grelha) */
+    for (i = 0; i < viewCount; i++)
+    {
+        double v = historico.ping[HistoricoIndex(viewStart + i)];
+        if (!isnan(v) && v > maxY * 0.9)
+            maxY = v / 0.9;
+    }
+    {
+        static const double passos[] = {40, 100, 200, 400, 800, 1600};
+        int k;
+        double sel = passos[5];
+        for (k = 0; k < 6; k++)
+            if (maxY <= passos[k])
+            {
+                sel = passos[k];
+                break;
+            }
+        maxY = sel;
+    }
+
+    /* titulo (clicavel: muda o alvo) */
+    snprintf(txt, sizeof(txt), "Latencia (ping) -> %s   [clique para mudar de alvo]",
+             p.ativo ? p.alvoNome : g_pingAlvoNome[g_pingAlvoIdx % PING_ALVOS]);
+    SetTextColor(hdc, g_mainConfig.corTextoGrafico);
+    TextOutA(hdc, pr.left, top, txt, (int)strlen(txt));
+    SetRect(&g_pingTitleRect, pr.left, top - 2, pr.right, top + 18);
+
+    if (p.ativo && !p.semGateway && !isnan(p.ultimoMs))
+    {
+        char ult[32];
+        RECT st = {pr.left, top + 19, pr.right, top + 36};
+
+        if (p.ultimoMs < 0.0)
+            snprintf(ult, sizeof(ult), "perdido");
+        else if (p.ultimoMs < 1.0)
+            snprintf(ult, sizeof(ult), "<1 ms");
+        else
+            snprintf(ult, sizeof(ult), "%.0f ms", p.ultimoMs);
+        snprintf(txt, sizeof(txt), "Atual %s | Min %.0f | Med %.1f | Max %.0f ms | Jitter %.1f | Perda %.1f%% (%lu/%lu)",
+                 ult, p.minMs, p.mediaMs, p.maxMs, p.jitterMs, p.perdaJanela,
+                 p.enviados - p.recebidos, p.enviados);
+        SetTextColor(hdc, RGB(105, 110, 116));
+        DrawTextA(hdc, txt, -1, &st, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    else if (p.ativo && p.semGateway)
+    {
+        SetTextColor(hdc, RGB(190, 55, 45));
+        TextOutA(hdc, pr.left, top + 20, "Gateway nao encontrado - clique para escolher outro alvo", 56);
+    }
+
+    DrawGraphGrid(hdc, pr, maxY);
+    DrawLatencySeries(hdc, pr, viewStart, viewCount, maxY, RGB(46, 160, 110),
+                      g_mainConfig.espessuraLinhas);
+    DrawTimeLabelsView(hdc, pr, viewStart, viewCount);
+
+    /* cursor sincronizado com o grafico de cima */
+    if (vw->isHovering && vw->hoverX >= upper.left && vw->hoverX <= upper.right)
+    {
+        double ratio = (double)(vw->hoverX - upper.left) / (double)(upper.right - upper.left);
+        int x = pr.left + (int)(ratio * (pr.right - pr.left));
+        int off = (int)(ratio * (viewCount - 1));
+        double v = historico.ping[HistoricoIndex(viewStart + off)];
+        HPEN cp = CreatePen(PS_DOT, 1, RGB(100, 100, 100));
+        HPEN op = (HPEN)SelectObject(hdc, cp);
+
+        MoveToEx(hdc, x, pr.top, NULL);
+        LineTo(hdc, x, pr.bottom);
+        SelectObject(hdc, op);
+        DeleteObject(cp);
+
+        if (isnan(v))
+            snprintf(txt, sizeof(txt), "sem dados");
+        else if (v < 0.0)
+            snprintf(txt, sizeof(txt), "perdido");
+        else
+            snprintf(txt, sizeof(txt), "%.0f ms", v);
+        SetTextColor(hdc, g_mainConfig.corTextoGrafico);
+        TextOutA(hdc, x + 4 + 90 > pr.right ? x - 70 : x + 4, pr.top + 2, txt, (int)strlen(txt));
+    }
+
+    /* ---- Wi-Fi ---- */
+    {
+        int wl = pr.right + 28, wr = client.right - 20, y = top;
+
+        if (wr - wl >= 150)
+        {
+            SetTextColor(hdc, g_mainConfig.corTextoGrafico);
+            TextOutA(hdc, wl, y, "Wi-Fi", 5);
+            y = top + 22;
+            SetTextColor(hdc, RGB(105, 110, 116));
+
+            if (!w.adaptador)
+            {
+                snprintf(txt, sizeof(txt), "Sem adaptador Wi-Fi (ou servico WLAN parado)");
+                TextOutA(hdc, wl, y, txt, (int)strlen(txt));
+            }
+            else if (!w.ligado)
+            {
+                snprintf(txt, sizeof(txt), "Desligado");
+                TextOutA(hdc, wl, y, txt, (int)strlen(txt));
+                SetTextColor(hdc, RGB(130, 135, 140));
+                TextOutA(hdc, wl, y + 18, w.adaptadorNome, (int)strlen(w.adaptadorNome));
+            }
+            else
+            {
+                RECT bar, bf, spark;
+                COLORREF cb = w.qualidade >= 60 ? RGB(46, 160, 110)
+                              : w.qualidade >= 35 ? RGB(215, 160, 40)
+                                                  : RGB(210, 60, 50);
+
+                SetTextColor(hdc, g_mainConfig.corTextoGrafico);
+                snprintf(txt, sizeof(txt), "Rede: %s", w.ssid);
+                TextOutA(hdc, wl, y, txt, (int)strlen(txt));
+                SetTextColor(hdc, RGB(105, 110, 116));
+                snprintf(txt, sizeof(txt), "Sinal: %d%% (~%.0f dBm)", w.qualidade, w.dbm);
+                TextOutA(hdc, wl, y + 18, txt, (int)strlen(txt));
+
+                bar.left = wl;
+                bar.right = wr;
+                bar.top = y + 38;
+                bar.bottom = y + 48;
+                bf = bar;
+                bf.right = bar.left + ((bar.right - bar.left) * w.qualidade) / 100;
+                {
+                    HBRUSH bb = CreateSolidBrush(g_mainConfig.corGrelhaGrafico);
+                    HBRUSH bs = CreateSolidBrush(cb);
+                    FillRect(hdc, &bar, bb);
+                    FillRect(hdc, &bf, bs);
+                    DeleteObject(bb);
+                    DeleteObject(bs);
+                }
+
+                snprintf(txt, sizeof(txt), "Velocidade: RX %lu / TX %lu Mbps",
+                         (unsigned long)(w.rxKbps / 1000), (unsigned long)(w.txKbps / 1000));
+                TextOutA(hdc, wl, y + 54, txt, (int)strlen(txt));
+                snprintf(txt, sizeof(txt), "%s | %s", WifiPhyNome(w.phy), WifiAuthNome(w.auth));
+                TextOutA(hdc, wl, y + 72, txt, (int)strlen(txt));
+
+                spark.left = wl;
+                spark.right = wr;
+                spark.top = y + 112;
+                spark.bottom = pr.bottom;
+                if (spark.bottom - spark.top >= 24)
+                {
+                    HBRUSH fb = CreateSolidBrush(g_mainConfig.corEixoGrafico);
+
+                    TextOutA(hdc, wl, y + 92, "Historico do sinal (%)", 22);
+                    FrameRect(hdc, &spark, fb);
+                    DeleteObject(fb);
+                    DrawSeriesView(hdc, spark, historico.wifiSinal, viewStart, viewCount,
+                                   100.0, cb, 1);
+                }
+            }
+        }
+    }
+
+    SelectObject(hdc, oldFont);
+}
+
 static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
 {
     RECT client;
@@ -2171,6 +3039,10 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
     {
         double maxVal = 1024.0 * 1024.0;
 
+        /* espaco para o painel de latencia + Wi-Fi por baixo */
+        if (client.bottom >= PING_PAINEL_ALTURA_MIN)
+            graph.bottom = graph.top + ((graph.bottom - graph.top) * 42) / 100;
+
         for (i = 0; i < HISTORICO_PONTOS; i++)
         {
             if (historico.netDown[i] > maxVal)
@@ -2198,6 +3070,7 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
         DrawSeriesView(hdc, graph, historico.netUp, viewStart, viewCount,
                        maxVal, colors[1], g_mainConfig.espessuraLinhas);
         DrawTimeLabelsView(hdc, graph, viewStart, viewCount);
+        DesenharPainelLatenciaWifi(hdc, client, graph, viewStart, viewCount);
         break;
     }
 
@@ -2370,6 +3243,16 @@ LRESULT CALLBACK GraphProc(HWND hwnd, UINT msg,
         return 0;
 
     case WM_LBUTTONDOWN:
+        if (type == GRAPH_NET && !IsRectEmpty(&g_pingTitleRect))
+        {
+            POINT cp = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (PtInRect(&g_pingTitleRect, cp))
+            {
+                PingCiclarAlvo();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
         if (type >= GRAPH_CPU && type <= GRAPH_PROCESS)
         {
             GraphViewState *view = &g_graphViews[type];
@@ -6659,6 +7542,7 @@ void AtualizarMonitor()
     MonitorarDiscos(buffer, BUFFER_SIZE, &offset);
     MonitorarDiscoIO(buffer, BUFFER_SIZE, &offset);
     MonitorarRede(buffer, BUFFER_SIZE, &offset);
+    MonitorarLatenciaWifi(buffer, BUFFER_SIZE, &offset);
     MonitorarGPU(buffer, BUFFER_SIZE, &offset);
     MonitorarProcessos(buffer, BUFFER_SIZE, &offset);
 
@@ -6689,6 +7573,14 @@ void AtualizarMonitor()
 
     processoCpuTop[historico.pos] = processoCpuAtual;
     processoRamTop[historico.pos] = processoRamAtual;
+
+    {
+        PingEstado pe;
+        WifiEstado we;
+        PingWifiObter(&pe, &we);
+        historico.ping[historico.pos] = (pe.ativo && !pe.semGateway) ? pe.ultimoMs : NAN;
+        historico.wifiSinal[historico.pos] = we.ligado ? (double)we.qualidade : NAN;
+    }
 
     strncpy_s(ultimoSnapshot, BUFFER_SIZE, buffer, _TRUNCATE);
 
@@ -6771,6 +7663,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
 
         ZeroMemory(&historico, sizeof(historico));
         SessaoIniciar();
+        PingWifiIniciar();
 
         hRichEditLib = LoadLibraryExW(L"Msftedit.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
 
@@ -7423,6 +8316,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         UnregisterHotKey(hwnd, HOTKEY_ID_OVERLAY);
         UnregisterHotKey(hwnd, HOTKEY_ID_COMPACT);
         KillTimer(hwnd, TIMER_ID);
+        PingWifiParar();
 
         FecharOverlay();
         if (hProcessDetail && IsWindow(hProcessDetail))
