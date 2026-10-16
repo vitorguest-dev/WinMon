@@ -218,6 +218,7 @@ typedef struct
     int mostrarDisco;
     int mostrarNet;
     int mostrarGpu;
+    int mostrarPing;
     int clickThrough;
 
     COLORREF corBg;
@@ -462,6 +463,7 @@ static OvPerfil ovPerfis[OV_MAX_PERFIS];
 #define OV_DISCO (ovPerfis[ovPerfilActivo].mostrarDisco)
 #define OV_NET (ovPerfis[ovPerfilActivo].mostrarNet)
 #define OV_GPU (ovPerfis[ovPerfilActivo].mostrarGpu)
+#define OV_PING (ovPerfis[ovPerfilActivo].mostrarPing)
 #define OV_CLICKTHRU (ovPerfis[ovPerfilActivo].clickThrough)
 
 static int ovColW = 120;
@@ -6210,6 +6212,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[0].mostrarDisco = 0;
     ovPerfis[0].mostrarNet = 1;
     ovPerfis[0].mostrarGpu = 0;
+    ovPerfis[0].mostrarPing = 0;
     ovPerfis[0].clickThrough = 1;
     ovPerfis[0].corBg = RGB(14, 14, 16);
     ovPerfis[0].corBorda = RGB(60, 63, 70);
@@ -6233,6 +6236,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[1].mostrarDisco = 1;
     ovPerfis[1].mostrarNet = 1;
     ovPerfis[1].mostrarGpu = 0;
+    ovPerfis[1].mostrarPing = 0;
     ovPerfis[1].clickThrough = 0;
     ovPerfis[1].corBg = RGB(20, 22, 26);
     ovPerfis[1].corBorda = RGB(70, 75, 85);
@@ -6256,6 +6260,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[2].mostrarDisco = 1;
     ovPerfis[2].mostrarNet = 1;
     ovPerfis[2].mostrarGpu = 0;
+    ovPerfis[2].mostrarPing = 0;
     ovPerfis[2].clickThrough = 0;
     ovPerfis[2].corBg = RGB(14, 14, 16);
     ovPerfis[2].corBorda = RGB(60, 63, 70);
@@ -6321,6 +6326,8 @@ static void GravarPerfisOverlay(void)
         RegSetValueExA(hk, "MostrarNet", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
         v = (DWORD)ovPerfis[i].mostrarGpu;
         RegSetValueExA(hk, "MostrarGpu", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarPing;
+        RegSetValueExA(hk, "MostrarPing", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
         v = (DWORD)ovPerfis[i].clickThrough;
         RegSetValueExA(hk, "ClickThrough", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
 
@@ -6413,6 +6420,8 @@ static void CarregarPerfisOverlay(void)
             ovPerfis[i].mostrarNet = (int)v;
         if (RegQueryValueExA(hk, "MostrarGpu", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].mostrarGpu = (int)v;
+        if (RegQueryValueExA(hk, "MostrarPing", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarPing = (int)v;
         if (RegQueryValueExA(hk, "ClickThrough", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].clickThrough = (int)v;
 
@@ -6644,6 +6653,8 @@ static void RecalcOverlaySize(void)
     if (OV_NET)
         ncols++;
     if (OV_GPU)
+        ncols++;
+    if (OV_PING)
         ncols++;
     if (OV_TEMP)
         ncols++;
@@ -6903,6 +6914,62 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
             cx += ovColW;
         }
 
+        if (OV_PING)
+        {
+            PingEstado pe;
+            WifiEstado we;
+            COLORREF cPing = RGB(46, 160, 110);
+            double bPct = -1.0;
+
+            if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
+            {
+                SelectObject(hdc, penSep);
+                MoveToEx(hdc, cx, cy, NULL);
+                LineTo(hdc, cx, rc.bottom - OV_PAD);
+            }
+
+            PingWifiObter(&pe, &we);
+            if (!pe.ativo)
+            {
+                snprintf(vBuf, sizeof(vBuf), "--");
+                snprintf(sBuf, sizeof(sBuf), "a iniciar");
+            }
+            else if (pe.semGateway)
+            {
+                snprintf(vBuf, sizeof(vBuf), "N/A");
+                snprintf(sBuf, sizeof(sBuf), "sem gateway");
+            }
+            else if (isnan(pe.ultimoMs))
+            {
+                snprintf(vBuf, sizeof(vBuf), "--");
+                snprintf(sBuf, sizeof(sBuf), "a medir");
+            }
+            else if (pe.ultimoMs < 0.0)
+            {
+                /* pacote perdido */
+                snprintf(vBuf, sizeof(vBuf), "perdido");
+                snprintf(sBuf, sizeof(sBuf), "perda %.0f%%", pe.perdaJanela);
+                bPct = 100.0;
+                cPing = RGB(220, 60, 60);
+            }
+            else
+            {
+                snprintf(vBuf, sizeof(vBuf), "%.0f ms", pe.ultimoMs);
+                if (pe.perdaJanela > 0.0)
+                    snprintf(sBuf, sizeof(sBuf), "perda %.0f%%", pe.perdaJanela);
+                else
+                    snprintf(sBuf, sizeof(sBuf), "jit %.1f ms", pe.jitterMs);
+                bPct = (pe.ultimoMs > 200.0 ? 200.0 : pe.ultimoMs) / 2.0;
+                if (pe.ultimoMs >= 100.0)
+                    cPing = RGB(220, 60, 60);
+                else if (pe.ultimoMs >= 50.0)
+                    cPing = RGB(235, 170, 40);
+            }
+            col = (OvColuna){"PING", ovPerfis[ovPerfilActivo].corTextoLabel, vBuf, sBuf, bPct, cPing};
+            DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+            cx += ovColW;
+        }
+
         if (OV_TEMP)
         {
             if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
@@ -7061,6 +7128,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 #define IDC_OV_DISCO 4007
 #define IDC_OV_NET 4008
 #define IDC_OV_GPU 4026
+#define IDC_OV_PING 4027
 #define IDC_OV_CLICKTHRU 4009
 #define IDC_OV_BTN_NOVO 4010
 #define IDC_OV_BTN_APAGAR 4011
@@ -7123,6 +7191,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
         CheckDlgButton(hDlg, IDC_OV_DISCO, OV_DISCO ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_NET, OV_NET ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_GPU, OV_GPU ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_PING, OV_PING ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, OV_CLICKTHRU ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[ovPerfilActivo].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[ovPerfilActivo].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
@@ -7155,6 +7224,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
                 CheckDlgButton(hDlg, IDC_OV_DISCO, ovPerfis[sel].mostrarDisco ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_NET, ovPerfis[sel].mostrarNet ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_GPU, ovPerfis[sel].mostrarGpu ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_PING, ovPerfis[sel].mostrarPing ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, ovPerfis[sel].clickThrough ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[sel].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[sel].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
@@ -7300,6 +7370,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
             ovPerfis[sel].mostrarDisco = (IsDlgButtonChecked(hDlg, IDC_OV_DISCO) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarNet = (IsDlgButtonChecked(hDlg, IDC_OV_NET) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarGpu = (IsDlgButtonChecked(hDlg, IDC_OV_GPU) == BST_CHECKED) ? 1 : 0;
+            ovPerfis[sel].mostrarPing = (IsDlgButtonChecked(hDlg, IDC_OV_PING) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].clickThrough = (IsDlgButtonChecked(hDlg, IDC_OV_CLICKTHRU) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarBarras = (IsDlgButtonChecked(hDlg, IDC_OV_BARRAS) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarSeparadores = (IsDlgButtonChecked(hDlg, IDC_OV_SEPARADORES) == BST_CHECKED) ? 1 : 0;
@@ -7383,7 +7454,7 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     DLGTEMPLATE *dt = (DLGTEMPLATE *)p;
     dt->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT;
     dt->dwExtendedStyle = 0;
-    dt->cdit = 35;
+    dt->cdit = 37;
     dt->x = 0;
     dt->y = 0;
     dt->cx = 280;
@@ -7414,10 +7485,11 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 78, 75, 10, -1, 0x0082, L"Opac. (30-255):");
     ADD_CTRL(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 0, 90, 76, 35, 12, IDC_OV_OPACITY, 0x0081, L"");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 96, 55, 12, IDC_OV_NET, 0x0080, L"Rede");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 65, 96, 65, 12, IDC_OV_TEMP, 0x0080, L"Temperatura");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 133, 96, 75, 12, IDC_OV_DISCO, 0x0080, L"Disco I/O");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 213, 96, 45, 12, IDC_OV_GPU, 0x0080, L"GPU");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 96, 38, 12, IDC_OV_NET, 0x0080, L"Rede");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 47, 96, 60, 12, IDC_OV_TEMP, 0x0080, L"Temperatura");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 108, 96, 52, 12, IDC_OV_DISCO, 0x0080, L"Disco I/O");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 161, 96, 34, 12, IDC_OV_GPU, 0x0080, L"GPU");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 197, 96, 55, 12, IDC_OV_PING, 0x0080, L"Lat\u00EAncia");
 
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 113, 226, 12, IDC_OV_CLICKTHRU, 0x0080, L"Click-through (cliques passam para janelas por baixo)");
 
