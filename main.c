@@ -17,6 +17,8 @@
  *   - exportar graficos diretamente para PNG via WIC.
  *   - permitir escolher o monitor do overlay e manter a escolha.
  *   - disponibilizar um modo compacto sempre visivel.
+ *   - aba Ligacoes: ligacoes TCP/UDP (IPv4/IPv6) com o processo dono;
+ *   - frequencia do CPU e memoria da GPU (cartoes do Resumo e overlay).
  *
  * Recomendações de compilação (MSVC x64):
  *   /O2 /W4 /WX /GS /sdl /guard:cf /DYNAMICBASE /NXCOMPAT
@@ -37,6 +39,7 @@
 #include <tlhelp32.h>
 #include <iphlpapi.h>
 #include <psapi.h>
+#include <dxgi.h>
 #include <shellapi.h>
 #include <richedit.h>
 #include <stdio.h>
@@ -135,9 +138,10 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_REDE 2006
 #define TAB_GPU 2007
 #define TAB_PROCESSOS 2008
-#define TAB_DEFINICOES 2009
+#define TAB_LIGACOES 2009
+#define TAB_DEFINICOES 2010
 #define NAV_LARGURA 188
-#define NUM_ABAS 9
+#define NUM_ABAS 10
 #define ALERT_HISTORY_MAX 100
 
 #define MAX_TEMP_ZONAS 16
@@ -219,6 +223,8 @@ typedef struct
     int mostrarNet;
     int mostrarGpu;
     int mostrarPing;
+    int mostrarVram; /* coluna VRAM (memoria da GPU) */
+    int mostrarFreq; /* coluna FREQ (frequencia do CPU) */
     int clickThrough;
 
     COLORREF corBg;
@@ -385,6 +391,13 @@ static int g_lvAgrupar = 0;    /* 1 = vista agrupada */
 static int g_lvAgruparUI = -1; /* ultimo estado refletido na UI */
 HWND hChkAgrupar = NULL;
 
+/* aba Ligacoes */
+HWND hPainelLig = NULL;     /* label "Filtrar" */
+HWND hEditLig = NULL;       /* caixa de filtro */
+HWND hChkLigAtivas = NULL;  /* "Apenas estabelecidas" */
+HWND hLabelLigCount = NULL; /* "N de M ligacoes" */
+HWND hListViewLig = NULL;   /* ListView virtual */
+
 /* snapshot filtrado para o ListView */
 static ProcessoInfo g_lvProcessos[MAX_PROCESSES];
 static int g_lvTotal = 0;
@@ -401,6 +414,20 @@ PDH_HCOUNTER hCounterDiskWrite = NULL;
 /* Contadores PDH separados por tipo de engine GPU */
 static PDH_HCOUNTER hCounterGpu[GPU_ENG_COUNT][MAX_GPU_COUNTERS];
 static int numGpuCounters[GPU_ENG_COUNT] = {0, 0, 0, 0};
+
+/* Frequencia do CPU (PDH) e memoria da GPU (PDH + DXGI) */
+#define MAX_VRAM_COUNTERS 8
+static PDH_HCOUNTER hCounterCpuFreq = NULL; /* \Processor Information(_Total)\Processor Frequency */
+static PDH_HCOUNTER hCounterCpuPerf = NULL; /* \Processor Information(_Total)\% Processor Performance */
+static PDH_HCOUNTER hCounterVram[MAX_VRAM_COUNTERS];
+static int numVramCounters = 0;
+static double g_cpuBaseMhzReg = 0.0;     /* ~MHz do registry (fallback da frequencia base) */
+static double ultimoCpuFreqMHz = 0.0;    /* 0 = indisponivel */
+static double ultimoCpuFreqBaseMHz = 0.0;
+static double ultimoCpuPerfPct = 0.0;    /* % Processor Performance (100 = frequencia base) */
+static double ultimaVramUsadaMB = -1.0;  /* < 0 = indisponivel */
+static double g_vramTotalMB = 0.0;       /* 0 = desconhecido */
+static int g_vramIntegrada = 0;          /* 1 = GPU integrada (memoria dedicada + partilhada) */
 
 HFONT hFontMonitor = NULL;
 HFONT hFontUI = NULL;
@@ -464,6 +491,8 @@ static OvPerfil ovPerfis[OV_MAX_PERFIS];
 #define OV_NET (ovPerfis[ovPerfilActivo].mostrarNet)
 #define OV_GPU (ovPerfis[ovPerfilActivo].mostrarGpu)
 #define OV_PING (ovPerfis[ovPerfilActivo].mostrarPing)
+#define OV_VRAM (ovPerfis[ovPerfilActivo].mostrarVram)
+#define OV_FREQ (ovPerfis[ovPerfilActivo].mostrarFreq)
 #define OV_CLICKTHRU (ovPerfis[ovPerfilActivo].clickThrough)
 
 static int ovColW = 120;
@@ -1546,6 +1575,243 @@ void MonitorarSistema(char *buffer, size_t size, size_t *offset)
     AppendFormat(buffer, size, offset, "\r\n");
 }
 
+/* =========================================================================
+ * Frequencia do CPU e memoria da GPU
+ * ========================================================================= */
+
+/* Frequencia atual = frequencia nominal x "% Processor Performance" / 100
+ * (e assim que o Gestor de Tarefas a calcula; passa de 100% em turbo). */
+static void CpuFreqInicializar(void)
+{
+    HKEY hk;
+
+    PdhAddEnglishCounterA(hQuery,
+                          "\\Processor Information(_Total)\\Processor Frequency",
+                          0, &hCounterCpuFreq);
+    PdhAddEnglishCounterA(hQuery,
+                          "\\Processor Information(_Total)\\% Processor Performance",
+                          0, &hCounterCpuPerf);
+
+    /* fallback para a frequencia base: valor ~MHz do registry */
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                      0, KEY_QUERY_VALUE, &hk) == ERROR_SUCCESS)
+    {
+        DWORD v = 0, sz = sizeof(v);
+        if (RegQueryValueExA(hk, "~MHz", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            g_cpuBaseMhzReg = (double)v;
+        RegCloseKey(hk);
+    }
+}
+
+static void CpuFreqAtualizar(void)
+{
+    PDH_FMT_COUNTERVALUE v;
+    double base = 0.0, perf = 0.0;
+    int temPerf = 0;
+
+    if (hCounterCpuFreq &&
+        PdhGetFormattedCounterValue(hCounterCpuFreq, PDH_FMT_DOUBLE, NULL, &v) == ERROR_SUCCESS &&
+        v.CStatus == ERROR_SUCCESS && v.doubleValue > 0.0)
+        base = v.doubleValue;
+    if (base <= 0.0)
+        base = g_cpuBaseMhzReg;
+
+    if (hCounterCpuPerf &&
+        PdhGetFormattedCounterValue(hCounterCpuPerf, PDH_FMT_DOUBLE, NULL, &v) == ERROR_SUCCESS &&
+        v.CStatus == ERROR_SUCCESS && v.doubleValue > 0.0)
+    {
+        perf = v.doubleValue;
+        temPerf = 1;
+    }
+
+    ultimoCpuFreqBaseMHz = base;
+    ultimoCpuPerfPct = temPerf ? perf : 0.0;
+    ultimoCpuFreqMHz = (base > 0.0 && temPerf) ? base * perf / 100.0 : 0.0;
+}
+
+/* Total de memoria da GPU: DXGI carregado dinamicamente (sem novas libs).
+ * Escolhe o adaptador fisico com mais memoria dedicada; em GPUs integradas
+ * (< 1 GB dedicado) o total passa a ser dedicada + partilhada. */
+static const GUID LOCAL_IID_IDXGIFactory1 =
+    {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
+typedef HRESULT(WINAPI *PFN_CreateDXGIFactory1)(REFIID, void **);
+
+static LUID g_vramLuid;
+static int g_vramLuidValido = 0;
+
+static void GpuMemDetetarAdaptador(void)
+{
+    HMODULE hDxgi;
+    PFN_CreateDXGIFactory1 fCreate;
+    IDXGIFactory1 *fac = NULL;
+    SIZE_T melhor = 0;
+    UINT i;
+
+    hDxgi = LoadLibraryExW(L"dxgi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!hDxgi)
+        return;
+
+    fCreate = (PFN_CreateDXGIFactory1)(void *)GetProcAddress(hDxgi, "CreateDXGIFactory1");
+    if (fCreate && SUCCEEDED(fCreate(&LOCAL_IID_IDXGIFactory1, (void **)&fac)) && fac)
+    {
+        for (i = 0;; i++)
+        {
+            IDXGIAdapter1 *ad = NULL;
+            DXGI_ADAPTER_DESC1 d;
+
+            if (fac->lpVtbl->EnumAdapters1(fac, i, &ad) != S_OK || !ad)
+                break;
+
+            if (SUCCEEDED(ad->lpVtbl->GetDesc1(ad, &d)) &&
+                !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+            {
+                SIZE_T ded = d.DedicatedVideoMemory;
+                if (!g_vramLuidValido || ded > melhor)
+                {
+                    melhor = ded;
+                    g_vramLuid = d.AdapterLuid;
+                    g_vramLuidValido = 1;
+                    if (ded < (SIZE_T)1024 * 1024 * 1024)
+                    {
+                        g_vramIntegrada = 1;
+                        g_vramTotalMB = ((double)ded + (double)d.SharedSystemMemory) / 1048576.0;
+                    }
+                    else
+                    {
+                        g_vramIntegrada = 0;
+                        g_vramTotalMB = (double)ded / 1048576.0;
+                    }
+                }
+            }
+            ad->lpVtbl->Release(ad);
+        }
+        fac->lpVtbl->Release(fac);
+    }
+    /* dxgi.dll fica carregada ate ao fim do processo (como no Gestor de Tarefas) */
+}
+
+/* Adiciona ao query os contadores que correspondem ao wildcard;
+ * se luidTag != NULL so os da GPU escolhida (comparacao sem maiusculas). */
+static void GpuMemAdicionarContadores(const char *wildcard, const char *luidTag)
+{
+    DWORD chars = 0;
+    PDH_STATUS st;
+    char *paths;
+
+    st = PdhExpandWildCardPathA(NULL, wildcard, NULL, &chars, 0);
+    if (!((st == ERROR_SUCCESS || st == PDH_MORE_DATA) &&
+          chars > 1 && chars <= (1024UL * 1024UL)))
+        return;
+
+    paths = (char *)malloc((size_t)chars);
+    if (!paths)
+        return;
+
+    st = PdhExpandWildCardPathA(NULL, wildcard, paths, &chars, 0);
+    if (st == ERROR_SUCCESS)
+    {
+        const char *p = paths;
+        while (*p && numVramCounters < MAX_VRAM_COUNTERS)
+        {
+            int ok = 1;
+
+            if (luidTag && *luidTag)
+            {
+                char low[512];
+                size_t k, n = strlen(p);
+                if (n >= sizeof(low))
+                    n = sizeof(low) - 1;
+                for (k = 0; k < n; k++)
+                    low[k] = (char)((p[k] >= 'A' && p[k] <= 'Z') ? p[k] + 32 : p[k]);
+                low[n] = '\0';
+                ok = strstr(low, luidTag) != NULL;
+            }
+
+            if (ok)
+            {
+                PDH_HCOUNTER c = NULL;
+                if (PdhAddEnglishCounterA(hQuery, p, 0, &c) == ERROR_SUCCESS && c)
+                    hCounterVram[numVramCounters++] = c;
+            }
+            p += strlen(p) + 1;
+        }
+    }
+    free(paths);
+}
+
+static void GpuMemInicializar(void)
+{
+    char tag[64];
+    const char *tagUsada = NULL;
+
+    tag[0] = '\0';
+    GpuMemDetetarAdaptador();
+
+    if (g_vramLuidValido)
+    {
+        snprintf(tag, sizeof(tag), "luid_0x%08lx_0x%08lx",
+                 (unsigned long)g_vramLuid.HighPart, (unsigned long)g_vramLuid.LowPart);
+        tagUsada = tag;
+    }
+
+    GpuMemAdicionarContadores("\\GPU Adapter Memory(*)\\Dedicated Usage", tagUsada);
+    if (numVramCounters == 0 && tagUsada)
+    {
+        /* nome da instancia diferente do esperado: usa todos os adaptadores */
+        tagUsada = NULL;
+        GpuMemAdicionarContadores("\\GPU Adapter Memory(*)\\Dedicated Usage", NULL);
+    }
+    if (g_vramIntegrada && numVramCounters > 0)
+        GpuMemAdicionarContadores("\\GPU Adapter Memory(*)\\Shared Usage", tagUsada);
+}
+
+static void GpuMemAtualizar(void)
+{
+    double soma = 0.0;
+    int ok = 0, i;
+
+    for (i = 0; i < numVramCounters; i++)
+    {
+        PDH_FMT_COUNTERVALUE v;
+        if (hCounterVram[i] &&
+            PdhGetFormattedCounterValue(hCounterVram[i], PDH_FMT_DOUBLE, NULL, &v) == ERROR_SUCCESS &&
+            v.CStatus == ERROR_SUCCESS && v.doubleValue >= 0.0)
+        {
+            soma += v.doubleValue;
+            ok = 1;
+        }
+    }
+
+    ultimaVramUsadaMB = ok ? soma / 1048576.0 : -1.0;
+    if (ok && g_vramTotalMB > 0.0 && ultimaVramUsadaMB > g_vramTotalMB)
+        ultimaVramUsadaMB = g_vramTotalMB;
+}
+
+static void FormatarMemMB(double mb, char *out, size_t n)
+{
+    if (mb >= 1024.0)
+        snprintf(out, n, "%.1f GB", mb / 1024.0);
+    else
+        snprintf(out, n, "%.0f MB", mb);
+}
+
+/* "5.2/8.0 GB", "5.2 GB" (total desconhecido) ou "N/A" */
+static void TextoVramCurto(char *out, size_t n)
+{
+    if (ultimaVramUsadaMB < 0.0)
+    {
+        snprintf(out, n, "N/A");
+        return;
+    }
+    if (g_vramTotalMB >= 1024.0)
+        snprintf(out, n, "%.1f/%.1f GB", ultimaVramUsadaMB / 1024.0, g_vramTotalMB / 1024.0);
+    else if (g_vramTotalMB > 0.0)
+        snprintf(out, n, "%.0f/%.0f MB", ultimaVramUsadaMB, g_vramTotalMB);
+    else
+        FormatarMemMB(ultimaVramUsadaMB, out, n);
+}
+
 void MonitorarCPU(char *buffer, size_t size, size_t *offset)
 {
     PDH_FMT_COUNTERVALUE counterVal;
@@ -1562,6 +1828,7 @@ void MonitorarCPU(char *buffer, size_t size, size_t *offset)
     }
 
     ultimoCpuPercent = cpuAtual;
+    CpuFreqAtualizar();
 
     {
         long inicioLinha = (long)*offset;
@@ -1571,6 +1838,12 @@ void MonitorarCPU(char *buffer, size_t size, size_t *offset)
         if (cpuAtual > limiteCpuPercent)
             RegistarAlerta(inicioLinha, (long)*offset);
     }
+
+    if (ultimoCpuFreqMHz > 0.0)
+        AppendFormat(buffer, size, offset,
+                     "Frequencia atual: %.2f GHz (base %.2f GHz, %.0f%%)\r\n",
+                     ultimoCpuFreqMHz / 1000.0, ultimoCpuFreqBaseMHz / 1000.0,
+                     ultimoCpuPerfPct);
 
     if (numNucleosMonitorizados > 0)
     {
@@ -1820,6 +2093,8 @@ void MonitorarGPU(char *buffer, size_t size, size_t *offset)
     int e, i;
     int algumValido = 0;
 
+    GpuMemAtualizar();
+
     /*
      * O Gestor de Tarefas soma a utilizacao de todos os engines
      * do mesmo tipo (3D, Copy, Encode, Decode) e limita a 100%.
@@ -1867,6 +2142,13 @@ void MonitorarGPU(char *buffer, size_t size, size_t *offset)
             else
                 AppendFormat(buffer, size, offset,
                              "GPU %s: N/A\r\n", nomeEng[e]);
+        }
+        if (ultimaVramUsadaMB >= 0.0)
+        {
+            char mem[40];
+            TextoVramCurto(mem, sizeof(mem));
+            AppendFormat(buffer, size, offset, "%s: %s\r\n",
+                         g_vramIntegrada ? "Memoria da GPU (dedicada+partilhada)" : "VRAM", mem);
         }
         AppendFormat(buffer, size, offset, "\r\n");
     }
@@ -2090,6 +2372,9 @@ static ProcessoSerieHistorico *EncontrarSerieProcesso(DWORD pid, int criar);
 static void AtivarAlertaOverlay(void);
 static void AplicarEstiloJanelaPrincipal(void);
 static void CriarPainelProcessos(HWND hwndPai);
+static void CriarPainelLigacoes(HWND hwndPai);
+static void AtualizarLigacoes(void);
+static void MostrarLigacoesDoProcesso(const char *exe);
 static void AtualizarListViewProcessos(void);
 static void RedimensionarPainelProcessos(HWND hwndPai);
 static void FiltrarListaProcessos(void);
@@ -2560,6 +2845,7 @@ static void DrawGraphLegend(HDC hdc, RECT *rc, const char *title,
 }
 
 static HFONT g_hValueFont = NULL;
+static char g_cardSubTxt[64]; /* sub-valor opcional (canto superior direito do cartao) */
 
 static void DrawDashboardCardLively(HDC hdc, RECT rc, const char *label, const char *value,
                                     COLORREF accentBase, const double *historyData, double maxLim)
@@ -2568,7 +2854,7 @@ static void DrawDashboardCardLively(HDC hdc, RECT rc, const char *label, const c
     if(historico.count>0&&historyData)v=historyData[HistoricoIndex(historico.count-1)];
     if(maxLim>0.0){if(v>=maxLim)markerColor=RGB(220,50,50);else if(v>=maxLim*.85)markerColor=RGB(220,150,20);}
     panel=CreateSolidBrush(RGB(255,255,255));marker=CreateSolidBrush(markerColor);markerRect=(RECT){rc.left,rc.top,rc.left+5,rc.bottom};labelRect=(RECT){rc.left+16,rc.top+7,rc.right-10,rc.top+24};valueRect=(RECT){rc.left+16,rc.top+23,rc.right-10,rc.bottom-6};FillRect(hdc,&rc,panel);FillRect(hdc,&markerRect,marker);{HPEN bp=CreatePen(PS_SOLID,1,RGB(224,228,233));HPEN op=(HPEN)SelectObject(hdc,bp);HBRUSH ob=(HBRUSH)SelectObject(hdc,GetStockObject(NULL_BRUSH));Rectangle(hdc,rc.left,rc.top,rc.right,rc.bottom);SelectObject(hdc,ob);SelectObject(hdc,op);DeleteObject(bp);}DeleteObject(panel);DeleteObject(marker);
-    SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,RGB(102,108,116));oldFont=(HFONT)SelectObject(hdc,GetStockObject(DEFAULT_GUI_FONT));DrawTextA(hdc,label,-1,&labelRect,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SelectObject(hdc,g_hValueFont);SetTextColor(hdc,RGB(32,38,45));DrawTextA(hdc,value,-1,&valueRect,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SelectObject(hdc,oldFont);
+    SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,RGB(102,108,116));oldFont=(HFONT)SelectObject(hdc,GetStockObject(DEFAULT_GUI_FONT));DrawTextA(hdc,label,-1,&labelRect,DT_LEFT|DT_SINGLELINE|DT_VCENTER);if(g_cardSubTxt[0]){RECT sr=labelRect;SetTextColor(hdc,RGB(120,126,134));DrawTextA(hdc,g_cardSubTxt,-1,&sr,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);SetTextColor(hdc,RGB(102,108,116));}SelectObject(hdc,g_hValueFont);SetTextColor(hdc,RGB(32,38,45));DrawTextA(hdc,value,-1,&valueRect,DT_LEFT|DT_SINGLELINE|DT_VCENTER);SelectObject(hdc,oldFont);
 }
 
 static LRESULT CALLBACK DashboardProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam)
@@ -2577,7 +2863,7 @@ static LRESULT CALLBACK DashboardProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lP
     switch(msg){
     case WM_ERASEBKGND:return 1;
     case WM_LBUTTONUP:{POINT pt={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};RECT rc;GetClientRect(hwnd,&rc);if(pt.y>=46&&pt.y<170){int gap=10,cw=(rc.right-32-gap*2)/3,col=(pt.x-16)/(cw+gap),row=(pt.y-46)/62;static const int targets[6]={TAB_CPU,TAB_MEMORIA,TAB_DISCO,TAB_REDE,TAB_GPU,TAB_TEMPERATURA};if(cw>100&&col>=0&&col<3&&row>=0&&row<2)SendMessageA(GetParent(hwnd),WM_COMMAND,MAKEWPARAM(targets[row*3+col],BN_CLICKED),0);}return 0;}
-    case WM_PAINT:{PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);RECT client;HDC mem=CreateCompatibleDC(dc);HBITMAP bmp,old;HBRUSH bg;int gap=10,cw,i;char value[64];GetClientRect(hwnd,&client);bmp=CreateCompatibleBitmap(dc,client.right,client.bottom);if(!mem||!bmp){if(mem)DeleteDC(mem);if(bmp)DeleteObject(bmp);EndPaint(hwnd,&ps);return 0;}old=(HBITMAP)SelectObject(mem,bmp);bg=CreateSolidBrush(RGB(241,244,247));FillRect(mem,&client,bg);DeleteObject(bg);SetBkMode(mem,TRANSPARENT);SetTextColor(mem,RGB(28,36,45));{RECT t={16,8,client.right-16,32};DrawTextA(mem,"Visao geral do sistema",-1,&t,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}cw=(client.right-32-gap*2)/3;if(cw<100)cw=100;for(i=0;i<6;i++){RECT card={16+(i%3)*(cw+gap),46+(i/3)*62,16+(i%3)*(cw+gap)+cw,102+(i/3)*62};switch(i){case 0:snprintf(value,sizeof(value),"%.1f%%",ultimoCpuPercent);DrawDashboardCardLively(mem,card,"CPU",value,g_mainConfig.corGraficoCpu,historico.cpu,limiteCpuPercent);break;case 1:snprintf(value,sizeof(value),"%.0f%%",ultimoRamPercent);DrawDashboardCardLively(mem,card,"Memoria",value,g_mainConfig.corGraficoRam,historico.ram,limiteRamPercent);break;case 2:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoDiskRead+ultimoDiskWrite)/1048576.0);DrawDashboardCardLively(mem,card,"Disco I/O",value,g_mainConfig.corGraficoDiscoRead,historico.diskRead,500.0*1048576.0);break;case 3:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoNetDown+ultimoNetUp)/1048576.0);DrawDashboardCardLively(mem,card,"Rede",value,g_mainConfig.corGraficoNetDown,historico.netDown,100.0*1048576.0);break;case 4:snprintf(value,sizeof(value),"%.1f%%",ultimoGpuPercent);DrawDashboardCardLively(mem,card,"GPU",value,g_mainConfig.corGraficoGpu,historico.gpu,100.0);break;default:snprintf(value,sizeof(value),"%.1f C",ObterTemperaturaMaxima());DrawDashboardCardLively(mem,card,"Temperatura",value,RGB(205,100,55),historico.temp,100.0);break;}}{RECT st={16,174,client.right-16,220};char txt[256];snprintf(txt,sizeof(txt),"Estado: %s | Processo lider: %.1f%% CPU | Historico: %d pontos | Clique num cartao para abrir o grafico",alertaGlobalAtivo?"ALERTA":"NORMAL",processoCpuAtual,historico.count);SetTextColor(mem,alertaGlobalAtivo?RGB(190,55,45):RGB(82,91,101));DrawTextA(mem,txt,-1,&st,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}BitBlt(dc,0,0,client.right,client.bottom,mem,0,0,SRCCOPY);SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);EndPaint(hwnd,&ps);return 0;}
+    case WM_PAINT:{PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);RECT client;HDC mem=CreateCompatibleDC(dc);HBITMAP bmp,old;HBRUSH bg;int gap=10,cw,i;char value[64];GetClientRect(hwnd,&client);bmp=CreateCompatibleBitmap(dc,client.right,client.bottom);if(!mem||!bmp){if(mem)DeleteDC(mem);if(bmp)DeleteObject(bmp);EndPaint(hwnd,&ps);return 0;}old=(HBITMAP)SelectObject(mem,bmp);bg=CreateSolidBrush(RGB(241,244,247));FillRect(mem,&client,bg);DeleteObject(bg);SetBkMode(mem,TRANSPARENT);SetTextColor(mem,RGB(28,36,45));{RECT t={16,8,client.right-16,32};DrawTextA(mem,"Visao geral do sistema",-1,&t,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}cw=(client.right-32-gap*2)/3;if(cw<100)cw=100;for(i=0;i<6;i++){g_cardSubTxt[0]=0;RECT card={16+(i%3)*(cw+gap),46+(i/3)*62,16+(i%3)*(cw+gap)+cw,102+(i/3)*62};switch(i){case 0:snprintf(value,sizeof(value),"%.1f%%",ultimoCpuPercent);if(ultimoCpuFreqMHz>0.0)snprintf(g_cardSubTxt,sizeof(g_cardSubTxt),"%.2f GHz",ultimoCpuFreqMHz/1000.0);DrawDashboardCardLively(mem,card,"CPU",value,g_mainConfig.corGraficoCpu,historico.cpu,limiteCpuPercent);break;case 1:snprintf(value,sizeof(value),"%.0f%%",ultimoRamPercent);DrawDashboardCardLively(mem,card,"Memoria",value,g_mainConfig.corGraficoRam,historico.ram,limiteRamPercent);break;case 2:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoDiskRead+ultimoDiskWrite)/1048576.0);DrawDashboardCardLively(mem,card,"Disco I/O",value,g_mainConfig.corGraficoDiscoRead,historico.diskRead,500.0*1048576.0);break;case 3:snprintf(value,sizeof(value),"%.1f MB/s",(ultimoNetDown+ultimoNetUp)/1048576.0);DrawDashboardCardLively(mem,card,"Rede",value,g_mainConfig.corGraficoNetDown,historico.netDown,100.0*1048576.0);break;case 4:snprintf(value,sizeof(value),"%.1f%%",ultimoGpuPercent);if(ultimaVramUsadaMB>=0.0){char vt[40];TextoVramCurto(vt,sizeof(vt));snprintf(g_cardSubTxt,sizeof(g_cardSubTxt),"%s%s",g_vramIntegrada?"Mem ":"VRAM ",vt);}DrawDashboardCardLively(mem,card,"GPU",value,g_mainConfig.corGraficoGpu,historico.gpu,100.0);break;default:snprintf(value,sizeof(value),"%.1f C",ObterTemperaturaMaxima());DrawDashboardCardLively(mem,card,"Temperatura",value,RGB(205,100,55),historico.temp,100.0);break;}}{RECT st={16,174,client.right-16,220};char txt[256];snprintf(txt,sizeof(txt),"Estado: %s | Processo lider: %.1f%% CPU | Historico: %d pontos | Clique num cartao para abrir o grafico",alertaGlobalAtivo?"ALERTA":"NORMAL",processoCpuAtual,historico.count);SetTextColor(mem,alertaGlobalAtivo?RGB(190,55,45):RGB(82,91,101));DrawTextA(mem,txt,-1,&st,DT_LEFT|DT_SINGLELINE|DT_VCENTER);}BitBlt(dc,0,0,client.right,client.bottom,mem,0,0,SRCCOPY);SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);EndPaint(hwnd,&ps);return 0;}
     case WM_SIZE:InvalidateRect(hwnd,NULL,FALSE);return 0;}
     return DefWindowProc(hwnd,msg,wParam,lParam);
 }
@@ -4151,8 +4437,26 @@ static void MostrarAba(int indice)
             ShowWindow(hListViewProc, visProc);
     }
 
+    /* painel de ligacoes (aba 8) */
+    {
+        int visLig = (indice == 8) ? SW_SHOW : SW_HIDE;
+        if (hPainelLig)
+            ShowWindow(hPainelLig, visLig);
+        if (hEditLig)
+            ShowWindow(hEditLig, visLig);
+        if (hChkLigAtivas)
+            ShowWindow(hChkLigAtivas, visLig);
+        if (hLabelLigCount)
+            ShowWindow(hLabelLigCount, visLig);
+        if (hListViewLig)
+            ShowWindow(hListViewLig, visLig);
+    }
+
     AtualizarDefinicoesVisibilidade();
     InvalidateRect(hMainWindow, NULL, TRUE);
+
+    if (indice == 8)
+        AtualizarLigacoes(); /* dados frescos ao abrir a aba */
 }
 
 
@@ -4291,6 +4595,41 @@ static void RedimensionarConteudo(HWND hwnd)
                 MoveWindow(hListViewProc,
                            cx, cy + barH,
                            cw, ch - barH, TRUE);
+        }
+
+        /* Barra de filtro + ListView de ligacoes */
+        {
+            int cx = rc.left;
+            int cy = rc.top;
+            int cw = rc.right - rc.left;
+            int ch = rc.bottom - rc.top;
+            int barH = 28;
+            int lblW = 74;
+            int editW = 240;
+            int chkW = 160;
+            int xChk, xCnt, wCnt;
+
+            if (editW > cw - lblW - 8)
+                editW = cw - lblW - 8;
+            if (editW < 60)
+                editW = 60;
+
+            xChk = cx + 4 + lblW + 4 + editW + 8;
+            xCnt = xChk + chkW + 4;
+            wCnt = cx + cw - xCnt - 4;
+            if (wCnt < 0)
+                wCnt = 0;
+
+            if (hPainelLig)
+                MoveWindow(hPainelLig, cx + 4, cy + 4, lblW, 22, TRUE);
+            if (hEditLig)
+                MoveWindow(hEditLig, cx + 4 + lblW + 4, cy + 3, editW, 22, TRUE);
+            if (hChkLigAtivas)
+                MoveWindow(hChkLigAtivas, xChk, cy + 4, chkW, 22, TRUE);
+            if (hLabelLigCount)
+                MoveWindow(hLabelLigCount, xCnt, cy + 4, wCnt, 22, TRUE);
+            if (hListViewLig && ch > barH)
+                MoveWindow(hListViewLig, cx, cy + barH, cw, ch - barH, TRUE);
         }
     }
 }
@@ -4534,6 +4873,7 @@ static void MenuContextoGrupo(HWND hwnd, const ProcessoInfo *grupo)
     AppendMenuA(hMenu, MF_STRING, 3, "Ver instancias individuais");
     AppendMenuA(hMenu, MF_STRING, 4, "Abrir Localizacao do Ficheiro");
     AppendMenuA(hMenu, MF_STRING, 5, "Copiar nome");
+    AppendMenuA(hMenu, MF_STRING, 6, "Ver ligacoes deste processo");
 
     GetCursorPos(&pt);
     cmd = (UINT)TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -4616,6 +4956,9 @@ static void MenuContextoGrupo(HWND hwnd, const ProcessoInfo *grupo)
     case 5:
         CopiarTextoClipboard(hwnd, nome);
         break;
+    case 6:
+        MostrarLigacoesDoProcesso(nome);
+        break;
     }
 }
 
@@ -4693,6 +5036,631 @@ static void LvProcColumnClick(int col)
         g_lvSortDesc = (col == 2 || col == 3); /* CPU/RAM desc por omissão */
     }
     AtualizarListViewProcessos();
+}
+
+/* =========================================================================
+ * Aba "Ligacoes" — ligacoes TCP/UDP (IPv4 e IPv6) com o processo dono,
+ * ao estilo de "netstat -ano". Usa GetExtendedTcpTable/GetExtendedUdpTable
+ * (iphlpapi, ja usada pelo resto do programa); sem novas dependencias.
+ * A tabela so e lida enquanto a aba esta aberta.
+ * ========================================================================= */
+#define IDC_EDIT_PESQUISA_CX 6010
+#define IDC_LISTVIEW_CX 6011
+#define IDC_LABEL_CX_COUNT 6012
+#define IDC_CHK_CX_ATIVAS 6013
+
+#define MAX_CONEXOES 6000
+#define CX_AF_INET 2
+#define CX_AF_INET6 23
+#define CX_TCP_LISTEN 2
+#define CX_TCP_ESTABLISHED 5
+
+typedef struct
+{
+    BYTE udp;          /* 0 = TCP, 1 = UDP */
+    BYTE v6;           /* 1 = IPv6 */
+    BYTE estabelecida; /* TCP ESTABLISHED */
+    DWORD estado;      /* MIB_TCP_STATE (0 em UDP) */
+    DWORD pid;
+    char proc[64];
+    char local[72];  /* "ip:porta" */
+    char remoto[72]; /* "ip:porta" ou "*" */
+} ConexaoInfo;
+
+static ConexaoInfo g_conexoes[MAX_CONEXOES];
+static int g_conexoesTotal = 0;
+static int g_cxTruncadas = 0;     /* linhas que nao couberam em g_conexoes */
+static int g_cxIdx[MAX_CONEXOES]; /* indices visiveis (apos filtro + ordenacao) */
+static int g_cxVisiveis = 0;
+static int g_cxSortCol = 0;
+static int g_cxSortDesc = 0;
+
+static WORD CxPorta(DWORD p)
+{
+    /* dwLocalPort/dwRemotePort: porta em ordem de rede nos 16 bits baixos */
+    return (WORD)(((p & 0xFFu) << 8) | ((p >> 8) & 0xFFu));
+}
+
+static void CxFormatarV4(DWORD addrRede, WORD porta, char *out, size_t n)
+{
+    const BYTE *b = (const BYTE *)&addrRede;
+    snprintf(out, n, "%u.%u.%u.%u:%u", b[0], b[1], b[2], b[3], (unsigned)porta);
+}
+
+static void CxFormatarV6(const BYTE a[16], WORD porta, char *out, size_t n)
+{
+    WORD g[8];
+    int i, melhorIni = -1, melhorLen = 0, ini = -1, len = 0;
+    char buf[48];
+    size_t pos = 0;
+
+    for (i = 0; i < 8; i++)
+        g[i] = (WORD)((a[i * 2] << 8) | a[i * 2 + 1]);
+
+    /* maior sequencia de grupos a zero (>= 2) vira "::" */
+    for (i = 0; i < 8; i++)
+    {
+        if (g[i] == 0)
+        {
+            if (ini < 0)
+            {
+                ini = i;
+                len = 0;
+            }
+            len++;
+            if (len > melhorLen)
+            {
+                melhorLen = len;
+                melhorIni = ini;
+            }
+        }
+        else
+            ini = -1;
+    }
+    if (melhorLen < 2)
+        melhorIni = -1;
+
+    buf[0] = '\0';
+    for (i = 0; i < 8; i++)
+    {
+        if (i == melhorIni)
+        {
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "::");
+            i += melhorLen - 1;
+            continue;
+        }
+        if (pos > 0 && buf[pos - 1] != ':')
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, ":");
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%x", (unsigned)g[i]);
+    }
+    snprintf(out, n, "[%s]:%u", buf, (unsigned)porta);
+}
+
+static void CxNomeProcesso(DWORD pid, char *out, size_t n)
+{
+    int i;
+
+    if (pid == 0)
+    {
+        strncpy_s(out, n, "(sistema)", _TRUNCATE);
+        return;
+    }
+    if (pid == 4)
+    {
+        strncpy_s(out, n, "System", _TRUNCATE);
+        return;
+    }
+    for (i = 0; i < totalListaProcessos; i++)
+    {
+        if (listaProcessos[i].pid == pid)
+        {
+            strncpy_s(out, n, listaProcessos[i].exeFile, _TRUNCATE);
+            return;
+        }
+    }
+    snprintf(out, n, "PID %lu", (unsigned long)pid);
+}
+
+static void CxAdicionar(int udp, int v6, DWORD estado, DWORD pid,
+                        const char *local, const char *remoto)
+{
+    ConexaoInfo *c;
+
+    if (g_conexoesTotal >= MAX_CONEXOES)
+    {
+        g_cxTruncadas++;
+        return;
+    }
+    c = &g_conexoes[g_conexoesTotal++];
+    c->udp = (BYTE)udp;
+    c->v6 = (BYTE)v6;
+    c->estado = estado;
+    c->pid = pid;
+    c->estabelecida = (BYTE)(!udp && estado == CX_TCP_ESTABLISHED);
+    CxNomeProcesso(pid, c->proc, sizeof(c->proc));
+    strncpy_s(c->local, sizeof(c->local), local, _TRUNCATE);
+    strncpy_s(c->remoto, sizeof(c->remoto), remoto, _TRUNCATE);
+}
+
+/* Le uma tabela do sistema; o tamanho pode crescer entre chamadas, por isso
+ * repete com folga. Devolve memoria (free) ou NULL. */
+static void *CxObterTabela(int tcp, ULONG af)
+{
+    DWORD sz = 0, r;
+    void *buf = NULL;
+    int t;
+
+    for (t = 0; t < 5; t++)
+    {
+        r = tcp ? GetExtendedTcpTable(buf, &sz, FALSE, af, TCP_TABLE_OWNER_PID_ALL, 0)
+                : GetExtendedUdpTable(buf, &sz, FALSE, af, UDP_TABLE_OWNER_PID, 0);
+        if (r == NO_ERROR)
+            return buf;
+
+        free(buf);
+        buf = NULL;
+        if (r != ERROR_INSUFFICIENT_BUFFER)
+            return NULL;
+
+        sz += sz / 8 + 1024;
+        buf = malloc(sz);
+        if (!buf)
+            return NULL;
+    }
+    free(buf);
+    return NULL;
+}
+
+static void ConexoesRecolher(void)
+{
+    char loc[72], rem[72];
+    DWORD i;
+    void *t;
+
+    g_conexoesTotal = 0;
+    g_cxTruncadas = 0;
+
+    t = CxObterTabela(1, CX_AF_INET);
+    if (t)
+    {
+        MIB_TCPTABLE_OWNER_PID *tb = (MIB_TCPTABLE_OWNER_PID *)t;
+        for (i = 0; i < tb->dwNumEntries; i++)
+        {
+            const MIB_TCPROW_OWNER_PID *r = &tb->table[i];
+            CxFormatarV4(r->dwLocalAddr, CxPorta(r->dwLocalPort), loc, sizeof(loc));
+            if (r->dwState == CX_TCP_LISTEN)
+                strncpy_s(rem, sizeof(rem), "*", _TRUNCATE);
+            else
+                CxFormatarV4(r->dwRemoteAddr, CxPorta(r->dwRemotePort), rem, sizeof(rem));
+            CxAdicionar(0, 0, r->dwState, r->dwOwningPid, loc, rem);
+        }
+        free(t);
+    }
+
+    t = CxObterTabela(1, CX_AF_INET6);
+    if (t)
+    {
+        MIB_TCP6TABLE_OWNER_PID *tb = (MIB_TCP6TABLE_OWNER_PID *)t;
+        for (i = 0; i < tb->dwNumEntries; i++)
+        {
+            const MIB_TCP6ROW_OWNER_PID *r = &tb->table[i];
+            CxFormatarV6(r->ucLocalAddr, CxPorta(r->dwLocalPort), loc, sizeof(loc));
+            if (r->dwState == CX_TCP_LISTEN)
+                strncpy_s(rem, sizeof(rem), "*", _TRUNCATE);
+            else
+                CxFormatarV6(r->ucRemoteAddr, CxPorta(r->dwRemotePort), rem, sizeof(rem));
+            CxAdicionar(0, 1, r->dwState, r->dwOwningPid, loc, rem);
+        }
+        free(t);
+    }
+
+    t = CxObterTabela(0, CX_AF_INET);
+    if (t)
+    {
+        MIB_UDPTABLE_OWNER_PID *tb = (MIB_UDPTABLE_OWNER_PID *)t;
+        for (i = 0; i < tb->dwNumEntries; i++)
+        {
+            const MIB_UDPROW_OWNER_PID *r = &tb->table[i];
+            CxFormatarV4(r->dwLocalAddr, CxPorta(r->dwLocalPort), loc, sizeof(loc));
+            CxAdicionar(1, 0, 0, r->dwOwningPid, loc, "*");
+        }
+        free(t);
+    }
+
+    t = CxObterTabela(0, CX_AF_INET6);
+    if (t)
+    {
+        MIB_UDP6TABLE_OWNER_PID *tb = (MIB_UDP6TABLE_OWNER_PID *)t;
+        for (i = 0; i < tb->dwNumEntries; i++)
+        {
+            const MIB_UDP6ROW_OWNER_PID *r = &tb->table[i];
+            CxFormatarV6(r->ucLocalAddr, CxPorta(r->dwLocalPort), loc, sizeof(loc));
+            CxAdicionar(1, 1, 0, r->dwOwningPid, loc, "*");
+        }
+        free(t);
+    }
+}
+
+static const char *CxProtoTxt(const ConexaoInfo *c)
+{
+    if (c->udp)
+        return c->v6 ? "UDP6" : "UDP";
+    return c->v6 ? "TCP6" : "TCP";
+}
+
+static const char *CxEstadoTxt(const ConexaoInfo *c)
+{
+    if (c->udp)
+        return "-";
+    switch (c->estado)
+    {
+    case 1:
+        return "Fechada";
+    case 2:
+        return "A escutar";
+    case 3:
+        return "SYN enviado";
+    case 4:
+        return "SYN recebido";
+    case 5:
+        return "Estabelecida";
+    case 6:
+        return "FIN_WAIT_1";
+    case 7:
+        return "FIN_WAIT_2";
+    case 8:
+        return "CLOSE_WAIT";
+    case 9:
+        return "CLOSING";
+    case 10:
+        return "LAST_ACK";
+    case 11:
+        return "TIME_WAIT";
+    case 12:
+        return "A eliminar";
+    default:
+        return "?";
+    }
+}
+
+static int CxComparar(const void *a, const void *b)
+{
+    int ia = *(const int *)a, ib = *(const int *)b;
+    const ConexaoInfo *x = &g_conexoes[ia];
+    const ConexaoInfo *y = &g_conexoes[ib];
+    int r = 0;
+
+    switch (g_cxSortCol)
+    {
+    case 0:
+        r = _stricmp(x->proc, y->proc);
+        break;
+    case 1:
+        r = (x->pid > y->pid) - (x->pid < y->pid);
+        break;
+    case 2:
+        r = strcmp(CxProtoTxt(x), CxProtoTxt(y));
+        break;
+    case 3:
+        r = strcmp(x->local, y->local);
+        break;
+    case 4:
+        r = strcmp(x->remoto, y->remoto);
+        break;
+    case 5:
+        r = strcmp(CxEstadoTxt(x), CxEstadoTxt(y));
+        break;
+    }
+    if (g_cxSortDesc)
+        r = -r;
+    if (r == 0) /* desempate estavel: ordem original da tabela */
+        r = (ia > ib) - (ia < ib);
+    return r;
+}
+
+static int CxPassaFiltro(const ConexaoInfo *c, const char *filtroLow, int soEstabelecidas)
+{
+    char tmp[320], low[320];
+
+    if (soEstabelecidas && !c->estabelecida)
+        return 0;
+    if (!filtroLow[0])
+        return 1;
+
+    snprintf(tmp, sizeof(tmp), "%s %lu %s %s %s %s",
+             c->proc, (unsigned long)c->pid, CxProtoTxt(c),
+             c->local, c->remoto, CxEstadoTxt(c));
+    ParaMinusculas(low, sizeof(low), tmp);
+    return strstr(low, filtroLow) != NULL;
+}
+
+/* Chave da linha selecionada, para a manter selecionada entre refrescos */
+static int CxMesmaLinha(const ConexaoInfo *c, const ConexaoInfo *k)
+{
+    return c->udp == k->udp && c->v6 == k->v6 && c->pid == k->pid &&
+           strcmp(c->local, k->local) == 0 && strcmp(c->remoto, k->remoto) == 0;
+}
+
+static void AtualizarLigacoes(void)
+{
+    char filtro[128], filtroLow[128];
+    int soEstab, i, estab = 0, haSel = 0;
+    ConexaoInfo selChave;
+    int selIdx;
+
+    if (!hListViewLig)
+        return;
+
+    /* linha selecionada antes de reconstruir a lista */
+    selIdx = ListView_GetNextItem(hListViewLig, -1, LVNI_SELECTED);
+    if (selIdx >= 0 && selIdx < g_cxVisiveis)
+    {
+        selChave = g_conexoes[g_cxIdx[selIdx]];
+        haSel = 1;
+    }
+
+    ConexoesRecolher();
+
+    filtro[0] = '\0';
+    if (hEditLig)
+        GetWindowTextA(hEditLig, filtro, sizeof(filtro));
+    ParaMinusculas(filtroLow, sizeof(filtroLow), filtro);
+    soEstab = hChkLigAtivas && Button_GetCheck(hChkLigAtivas) == BST_CHECKED;
+
+    g_cxVisiveis = 0;
+    for (i = 0; i < g_conexoesTotal; i++)
+    {
+        if (g_conexoes[i].estabelecida)
+            estab++;
+        if (CxPassaFiltro(&g_conexoes[i], filtroLow, soEstab))
+            g_cxIdx[g_cxVisiveis++] = i;
+    }
+    qsort(g_cxIdx, (size_t)g_cxVisiveis, sizeof(int), CxComparar);
+
+    SendMessage(hListViewLig, WM_SETREDRAW, FALSE, 0);
+    ListView_SetItemCountEx(hListViewLig, g_cxVisiveis,
+                            LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+
+    if (haSel)
+    {
+        int novo = -1;
+        for (i = 0; i < g_cxVisiveis; i++)
+        {
+            if (CxMesmaLinha(&g_conexoes[g_cxIdx[i]], &selChave))
+            {
+                novo = i;
+                break;
+            }
+        }
+        if (novo != selIdx)
+        {
+            if (selIdx >= 0)
+                ListView_SetItemState(hListViewLig, selIdx, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            if (novo >= 0)
+                ListView_SetItemState(hListViewLig, novo,
+                                      LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        }
+    }
+
+    SendMessage(hListViewLig, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hListViewLig, NULL, FALSE);
+
+    if (hLabelLigCount)
+    {
+        char txt[160];
+        snprintf(txt, sizeof(txt), "%d de %d ligacoes (%d estabelecidas)%s",
+                 g_cxVisiveis, g_conexoesTotal, estab,
+                 g_cxTruncadas ? "  [lista truncada]" : "");
+        SetWindowTextA(hLabelLigCount, txt);
+    }
+}
+
+static void LvLigGetDispInfo(NMLVDISPINFOA *pdi)
+{
+    const ConexaoInfo *c;
+    int idx;
+    char *dst;
+    size_t n;
+
+    if (!(pdi->item.mask & LVIF_TEXT))
+        return;
+
+    idx = pdi->item.iItem;
+    if (idx < 0 || idx >= g_cxVisiveis)
+        return;
+
+    c = &g_conexoes[g_cxIdx[idx]];
+    dst = pdi->item.pszText;
+    n = (size_t)pdi->item.cchTextMax;
+
+    switch (pdi->item.iSubItem)
+    {
+    case 0:
+        strncpy_s(dst, n, c->proc, _TRUNCATE);
+        break;
+    case 1:
+        snprintf(dst, n, "%lu", (unsigned long)c->pid);
+        break;
+    case 2:
+        strncpy_s(dst, n, CxProtoTxt(c), _TRUNCATE);
+        break;
+    case 3:
+        strncpy_s(dst, n, c->local, _TRUNCATE);
+        break;
+    case 4:
+        strncpy_s(dst, n, c->remoto, _TRUNCATE);
+        break;
+    case 5:
+        strncpy_s(dst, n, CxEstadoTxt(c), _TRUNCATE);
+        break;
+    }
+}
+
+static void LvLigColumnClick(int col)
+{
+    if (g_cxSortCol == col)
+        g_cxSortDesc = !g_cxSortDesc;
+    else
+    {
+        g_cxSortCol = col;
+        g_cxSortDesc = 0;
+    }
+    AtualizarLigacoes();
+}
+
+/* Filtra a lista pelo nome do processo e passa para a aba Ligacoes */
+static void MostrarLigacoesDoProcesso(const char *exe)
+{
+    if (hEditLig)
+        SetWindowTextA(hEditLig, exe);
+    if (hChkLigAtivas)
+        Button_SetCheck(hChkLigAtivas, BST_UNCHECKED);
+    TabCtrl_SetCurSel(hTab, 8);
+    MostrarAba(8);
+}
+
+static void AbrirDetalheLigacao(int visIdx)
+{
+    DWORD pid;
+    char proc[64];
+
+    if (visIdx < 0 || visIdx >= g_cxVisiveis)
+        return;
+    pid = g_conexoes[g_cxIdx[visIdx]].pid;
+    strncpy_s(proc, sizeof(proc), g_conexoes[g_cxIdx[visIdx]].proc, _TRUNCATE);
+    if (pid > 4)
+        AbrirDetalheProcesso(pid, proc);
+}
+
+static void MenuContextoLigacao(HWND hwnd, int visIdx)
+{
+    const ConexaoInfo *c;
+    DWORD pid;
+    char proc[64], local[72], remoto[72], txt[160];
+    HMENU hMenu;
+    POINT pt;
+    UINT cmd;
+
+    if (visIdx < 0 || visIdx >= g_cxVisiveis)
+        return;
+
+    /* copia os dados: o refresco pode reconstruir a tabela com o menu aberto */
+    c = &g_conexoes[g_cxIdx[visIdx]];
+    pid = c->pid;
+    strncpy_s(proc, sizeof(proc), c->proc, _TRUNCATE);
+    strncpy_s(local, sizeof(local), c->local, _TRUNCATE);
+    strncpy_s(remoto, sizeof(remoto), c->remoto, _TRUNCATE);
+
+    hMenu = CreatePopupMenu();
+    if (!hMenu)
+        return;
+
+    snprintf(txt, sizeof(txt), "Filtrar por %s", proc);
+    AppendMenuA(hMenu, MF_STRING, 1, txt);
+    AppendMenuA(hMenu, MF_STRING | (strcmp(remoto, "*") == 0 ? MF_GRAYED : 0), 2,
+                "Copiar endereco remoto");
+    AppendMenuA(hMenu, MF_STRING, 3, "Copiar endereco local");
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hMenu, MF_STRING | (pid <= 4 ? MF_GRAYED : 0), 4, "Abrir historico do processo");
+    AppendMenuA(hMenu, MF_STRING | (pid <= 4 ? MF_GRAYED : 0), 5, "Terminar processo");
+
+    GetCursorPos(&pt);
+    cmd = (UINT)TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                               pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
+
+    switch (cmd)
+    {
+    case 1:
+        if (hEditLig)
+            SetWindowTextA(hEditLig, proc); /* EN_CHANGE atualiza a lista */
+        break;
+    case 2:
+        CopiarTextoClipboard(hwnd, remoto);
+        break;
+    case 3:
+        CopiarTextoClipboard(hwnd, local);
+        break;
+    case 4:
+        AbrirDetalheProcesso(pid, proc);
+        break;
+    case 5:
+        if (MessageBoxA(hwnd, "Terminar este processo pode causar instabilidade. Deseja continuar?",
+                        "Aviso", MB_YESNO | MB_ICONWARNING) == IDYES)
+        {
+            HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+            if (hProc)
+            {
+                TerminateProcess(hProc, 0);
+                CloseHandle(hProc);
+            }
+        }
+        break;
+    }
+}
+
+static void CriarPainelLigacoes(HWND hwndPai)
+{
+    LVCOLUMNA lvc;
+    HINSTANCE hInst = GetModuleHandle(NULL);
+    static const struct
+    {
+        const char *nome;
+        int larg;
+        int fmt;
+    } cols[] = {
+        {"Processo", 170, LVCFMT_LEFT},
+        {"PID", 60, LVCFMT_RIGHT},
+        {"Proto", 56, LVCFMT_LEFT},
+        {"Endereco local", 220, LVCFMT_LEFT},
+        {"Endereco remoto", 220, LVCFMT_LEFT},
+        {"Estado", 110, LVCFMT_LEFT}};
+    int i;
+
+    hPainelLig = CreateWindowExA(0, "STATIC", "Filtrar ligacoes",
+                                 WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
+                                 0, 0, 74, 22, hwndPai, NULL, hInst, NULL);
+
+    hEditLig = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                               WS_CHILD | ES_AUTOHSCROLL,
+                               0, 0, 220, 22, hwndPai,
+                               (HMENU)(UINT_PTR)IDC_EDIT_PESQUISA_CX, hInst, NULL);
+
+    hChkLigAtivas = CreateWindowExA(0, "BUTTON", "Apenas estabelecidas",
+                                    WS_CHILD | BS_AUTOCHECKBOX,
+                                    0, 0, 160, 22, hwndPai,
+                                    (HMENU)(UINT_PTR)IDC_CHK_CX_ATIVAS, hInst, NULL);
+
+    hLabelLigCount = CreateWindowExA(0, "STATIC", "0 ligacoes",
+                                     WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
+                                     0, 0, 260, 22, hwndPai,
+                                     (HMENU)(UINT_PTR)IDC_LABEL_CX_COUNT, hInst, NULL);
+
+    /* sem LVS_NOSORTHEADER: os cabecalhos tem de ser clicaveis para ordenar */
+    hListViewLig = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
+                                   WS_CHILD | WS_VSCROLL |
+                                       LVS_REPORT | LVS_SINGLESEL | LVS_OWNERDATA |
+                                       LVS_SHOWSELALWAYS,
+                                   0, 0, 100, 100, hwndPai,
+                                   (HMENU)(UINT_PTR)IDC_LISTVIEW_CX, hInst, NULL);
+    if (!hListViewLig)
+        return;
+
+    ListView_SetExtendedListViewStyle(hListViewLig,
+                                      LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    ListView_SetBkColor(hListViewLig, RGB(255, 255, 255));
+    ListView_SetTextBkColor(hListViewLig, RGB(255, 255, 255));
+    ListView_SetTextColor(hListViewLig, RGB(42, 48, 56));
+
+    ZeroMemory(&lvc, sizeof(lvc));
+    lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+    for (i = 0; i < (int)(sizeof(cols) / sizeof(cols[0])); i++)
+    {
+        lvc.pszText = (LPSTR)cols[i].nome;
+        lvc.cx = cols[i].larg;
+        lvc.fmt = cols[i].fmt;
+        ListView_InsertColumn(hListViewLig, i, &lvc);
+    }
 }
 
 /* Cria o painel de processos.
@@ -4805,7 +5773,7 @@ static void AtualizarDefinicoesVisibilidade(void)
     int i, j;
 
     if (hSettingsTitle)
-        ShowWindow(hSettingsTitle, abaAtual == 8 ? SW_SHOW : SW_HIDE);
+        ShowWindow(hSettingsTitle, abaAtual == 9 ? SW_SHOW : SW_HIDE);
 
     for (i = 0; i < SETTINGS_SECTIONS; i++)
     {
@@ -4834,14 +5802,14 @@ static void AtualizarDefinicoesVisibilidade(void)
             snprintf(texto, sizeof(texto), "%s %s",
                      g_settingsOpen[i] ? "[-]" : "[+]", nome);
             SetWindowTextA(hSettingsHeaders[i], texto);
-            ShowWindow(hSettingsHeaders[i], abaAtual == 8 ? SW_SHOW : SW_HIDE);
+            ShowWindow(hSettingsHeaders[i], abaAtual == 9 ? SW_SHOW : SW_HIDE);
         }
 
         for (j = 0; j < 4; j++)
         {
             if (hSettingsActions[i][j])
                 ShowWindow(hSettingsActions[i][j],
-                           (abaAtual == 8 && g_settingsOpen[i] && j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 4 : 1))))
+                           (abaAtual == 9 && g_settingsOpen[i] && j < (i == 0 ? 2 : (i == 2 ? 3 : (i == 4 ? 4 : 1))))
                                ? SW_SHOW
                                : SW_HIDE);
         }
@@ -4945,7 +5913,7 @@ static void CriarAbas(HWND hwnd)
 {
     TCITEMA item;
     const char *nomes[] = {
-        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Definicoes"};
+        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes"};
     int i;
 
     hTab = CreateWindowExA(
@@ -4965,7 +5933,7 @@ static void CriarAbas(HWND hwnd)
 
     {
         const char *navNomes[] = {
-            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Definicoes"};
+            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes"};
 
         for (i = 0; i < NUM_ABAS; i++)
         {
@@ -5034,6 +6002,7 @@ static void CriarAbas(HWND hwnd)
     hGraphProcesses = CriarGrafico(hwnd, GRAPH_PROCESS);
 
     CriarPainelProcessos(hwnd);
+    CriarPainelLigacoes(hwnd);
     CriarPainelDefinicoes(hwnd);
 
     hCompact = CreateWindowExA(
@@ -5090,7 +6059,7 @@ static void SessaoIniciar(void){ZeroMemory(&g_session,sizeof(g_session));g_sessi
 static void SessaoAdicionarAmostra(double cpu,double ram,double temp){g_session.amostras++;g_session.somaCpu+=cpu;g_session.somaRam+=ram;g_session.somaTemp+=temp;if(g_session.amostras==1||cpu>g_session.maxCpu)g_session.maxCpu=cpu;if(g_session.amostras==1||ram>g_session.maxRam)g_session.maxRam=ram;if(g_session.amostras==1||temp>g_session.maxTemp)g_session.maxTemp=temp;}
 static void SessaoResetar(void){SessaoIniciar();AtualizarDefinicoesVisibilidade();InvalidateRect(hDashboard,NULL,FALSE);}
 static void SessaoExportarRelatorio(void){char caminho[MAX_PATH],nome[96],msg[MAX_PATH+80];FILE*f;SYSTEMTIME st;double dur=(GetTickCount64()-g_session.inicioTickMs)/1000.0;GetLocalTime(&st);snprintf(nome,sizeof(nome),"winmon_sessao_%04d%02d%02d_%02d%02d%02d.csv",st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);CaminhoDados(nome,caminho,sizeof(caminho));if(fopen_s(&f,caminho,"w")!=0||!f){MessageBoxA(hMainWindow,"Nao foi possivel exportar a sessao.","WinMon",MB_OK|MB_ICONERROR);return;}fprintf(f,"metrica,valor\n");fprintf(f,"duracao_segundos,%.0f\n",dur);fprintf(f,"amostras,%lu\n",g_session.amostras);fprintf(f,"cpu_media_pct,%.2f\n",g_session.amostras?g_session.somaCpu/g_session.amostras:0.0);fprintf(f,"cpu_max_pct,%.2f\n",g_session.maxCpu);fprintf(f,"ram_media_pct,%.2f\n",g_session.amostras?g_session.somaRam/g_session.amostras:0.0);fprintf(f,"ram_max_pct,%.2f\n",g_session.maxRam);fprintf(f,"temperatura_media_c,%.2f\n",g_session.amostras?g_session.somaTemp/g_session.amostras:0.0);fprintf(f,"temperatura_max_c,%.2f\n",g_session.maxTemp);fprintf(f,"alertas,%lu\n",g_session.alertas);fclose(f);snprintf(msg,sizeof(msg),"Relatorio exportado para:\n%s",caminho);MessageBoxA(hMainWindow,msg,"WinMon",MB_OK|MB_ICONINFORMATION);}
-static void MostrarAjudaAtalhos(HWND hwndPai){MessageBoxA(hwndPai,"Ctrl+S  Exportar snapshot\nCtrl+L  Ligar/desligar log CSV\nCtrl+A  Alertas\nCtrl+E  Aparencia\nCtrl+O  Overlay\nCtrl+D  Definicoes\nCtrl+Shift+O  Overlay rapido\nCtrl+Shift+C  Modo compacto\n\nDashboard: clique num cartao para abrir o grafico.\nProcessos: duplo clique abre o historico do processo.","Atalhos e ajuda do WinMon",MB_OK|MB_ICONINFORMATION);}
+static void MostrarAjudaAtalhos(HWND hwndPai){MessageBoxA(hwndPai,"Ctrl+S  Exportar snapshot\nCtrl+L  Ligar/desligar log CSV\nCtrl+A  Alertas\nCtrl+E  Aparencia\nCtrl+O  Overlay\nCtrl+D  Definicoes\nCtrl+Shift+O  Overlay rapido\nCtrl+Shift+C  Modo compacto\n\nDashboard: clique num cartao para abrir o grafico.\nProcessos: duplo clique abre o historico do processo.\nLigacoes: clique direito numa linha para filtrar, copiar o endereco ou terminar o processo.","Atalhos e ajuda do WinMon",MB_OK|MB_ICONINFORMATION);}
 
 /* ------------------------------------------------------------------------- */
 /* Logging CSV Contínuo                                                      */
@@ -6213,6 +7182,8 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[0].mostrarNet = 1;
     ovPerfis[0].mostrarGpu = 0;
     ovPerfis[0].mostrarPing = 0;
+    ovPerfis[0].mostrarVram = 0;
+    ovPerfis[0].mostrarFreq = 0;
     ovPerfis[0].clickThrough = 1;
     ovPerfis[0].corBg = RGB(14, 14, 16);
     ovPerfis[0].corBorda = RGB(60, 63, 70);
@@ -6237,6 +7208,8 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[1].mostrarNet = 1;
     ovPerfis[1].mostrarGpu = 0;
     ovPerfis[1].mostrarPing = 0;
+    ovPerfis[1].mostrarVram = 0;
+    ovPerfis[1].mostrarFreq = 0;
     ovPerfis[1].clickThrough = 0;
     ovPerfis[1].corBg = RGB(20, 22, 26);
     ovPerfis[1].corBorda = RGB(70, 75, 85);
@@ -6261,6 +7234,8 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[2].mostrarNet = 1;
     ovPerfis[2].mostrarGpu = 0;
     ovPerfis[2].mostrarPing = 0;
+    ovPerfis[2].mostrarVram = 0;
+    ovPerfis[2].mostrarFreq = 0;
     ovPerfis[2].clickThrough = 0;
     ovPerfis[2].corBg = RGB(14, 14, 16);
     ovPerfis[2].corBorda = RGB(60, 63, 70);
@@ -6328,6 +7303,10 @@ static void GravarPerfisOverlay(void)
         RegSetValueExA(hk, "MostrarGpu", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
         v = (DWORD)ovPerfis[i].mostrarPing;
         RegSetValueExA(hk, "MostrarPing", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarVram;
+        RegSetValueExA(hk, "MostrarVram", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].mostrarFreq;
+        RegSetValueExA(hk, "MostrarFreq", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
         v = (DWORD)ovPerfis[i].clickThrough;
         RegSetValueExA(hk, "ClickThrough", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
 
@@ -6422,6 +7401,10 @@ static void CarregarPerfisOverlay(void)
             ovPerfis[i].mostrarGpu = (int)v;
         if (RegQueryValueExA(hk, "MostrarPing", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].mostrarPing = (int)v;
+        if (RegQueryValueExA(hk, "MostrarVram", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarVram = (int)v;
+        if (RegQueryValueExA(hk, "MostrarFreq", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].mostrarFreq = (int)v;
         if (RegQueryValueExA(hk, "ClickThrough", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].clickThrough = (int)v;
 
@@ -6656,6 +7639,10 @@ static void RecalcOverlaySize(void)
         ncols++;
     if (OV_PING)
         ncols++;
+    if (OV_VRAM)
+        ncols++;
+    if (OV_FREQ)
+        ncols++;
     if (OV_TEMP)
         ncols++;
     if (OV_DISCO)
@@ -6838,6 +7825,31 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
         DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
         cx += ovColW;
 
+        if (OV_FREQ)
+        {
+            if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
+            {
+                SelectObject(hdc, penSep);
+                MoveToEx(hdc, cx, cy, NULL);
+                LineTo(hdc, cx, rc.bottom - OV_PAD);
+            }
+
+            if (ultimoCpuFreqMHz > 0.0)
+            {
+                snprintf(vBuf, sizeof(vBuf), "%.2f GHz", ultimoCpuFreqMHz / 1000.0);
+                snprintf(sBuf, sizeof(sBuf), "%.0f%% base", ultimoCpuPerfPct);
+            }
+            else
+            {
+                snprintf(vBuf, sizeof(vBuf), "N/A");
+                snprintf(sBuf, sizeof(sBuf), "sem contador");
+            }
+            col = (OvColuna){"FREQ", ovPerfis[ovPerfilActivo].corTextoLabel, vBuf, sBuf,
+                             -1.0, ovPerfis[ovPerfilActivo].corBarraCpu};
+            DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+            cx += ovColW;
+        }
+
         SelectObject(hdc, penSep);
         MoveToEx(hdc, cx, cy, NULL);
         LineTo(hdc, cx, rc.bottom - OV_PAD);
@@ -6892,6 +7904,43 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
                 col = (OvColuna){"GPU", ovPerfis[ovPerfilActivo].corTextoLabel, "N/A",
                                  "WDDM indisponivel", -1.0, 0};
             }
+            DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
+            cx += ovColW;
+        }
+
+        if (OV_VRAM)
+        {
+            double pct = -1.0;
+            char usada[24];
+
+            if (ovPerfis[ovPerfilActivo].mostrarSeparadores)
+            {
+                SelectObject(hdc, penSep);
+                MoveToEx(hdc, cx, cy, NULL);
+                LineTo(hdc, cx, rc.bottom - OV_PAD);
+            }
+
+            if (ultimaVramUsadaMB >= 0.0)
+            {
+                FormatarMemMB(ultimaVramUsadaMB, usada, sizeof(usada));
+                snprintf(vBuf, sizeof(vBuf), "%s", usada);
+                if (g_vramTotalMB > 0.0)
+                {
+                    char tot[24];
+                    FormatarMemMB(g_vramTotalMB, tot, sizeof(tot));
+                    snprintf(sBuf, sizeof(sBuf), "de %s", tot);
+                    pct = ultimaVramUsadaMB / g_vramTotalMB * 100.0;
+                }
+                else
+                    snprintf(sBuf, sizeof(sBuf), "em uso");
+            }
+            else
+            {
+                snprintf(vBuf, sizeof(vBuf), "N/A");
+                snprintf(sBuf, sizeof(sBuf), "sem contador");
+            }
+            col = (OvColuna){g_vramIntegrada ? "GMEM" : "VRAM", ovPerfis[ovPerfilActivo].corTextoLabel,
+                             vBuf, sBuf, pct, RGB(170, 120, 220)};
             DrawOvColuna(hdc, cx, cy, fLabel, fValor, fSub, &col);
             cx += ovColW;
         }
@@ -7129,6 +8178,8 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 #define IDC_OV_NET 4008
 #define IDC_OV_GPU 4026
 #define IDC_OV_PING 4027
+#define IDC_OV_VRAM 4028
+#define IDC_OV_FREQ 4029
 #define IDC_OV_CLICKTHRU 4009
 #define IDC_OV_BTN_NOVO 4010
 #define IDC_OV_BTN_APAGAR 4011
@@ -7192,6 +8243,8 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
         CheckDlgButton(hDlg, IDC_OV_NET, OV_NET ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_GPU, OV_GPU ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_PING, OV_PING ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_VRAM, OV_VRAM ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_FREQ, OV_FREQ ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, OV_CLICKTHRU ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[ovPerfilActivo].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[ovPerfilActivo].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
@@ -7225,6 +8278,8 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
                 CheckDlgButton(hDlg, IDC_OV_NET, ovPerfis[sel].mostrarNet ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_GPU, ovPerfis[sel].mostrarGpu ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_PING, ovPerfis[sel].mostrarPing ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_VRAM, ovPerfis[sel].mostrarVram ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_FREQ, ovPerfis[sel].mostrarFreq ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, ovPerfis[sel].clickThrough ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[sel].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[sel].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
@@ -7371,6 +8426,8 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
             ovPerfis[sel].mostrarNet = (IsDlgButtonChecked(hDlg, IDC_OV_NET) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarGpu = (IsDlgButtonChecked(hDlg, IDC_OV_GPU) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarPing = (IsDlgButtonChecked(hDlg, IDC_OV_PING) == BST_CHECKED) ? 1 : 0;
+            ovPerfis[sel].mostrarVram = (IsDlgButtonChecked(hDlg, IDC_OV_VRAM) == BST_CHECKED) ? 1 : 0;
+            ovPerfis[sel].mostrarFreq = (IsDlgButtonChecked(hDlg, IDC_OV_FREQ) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].clickThrough = (IsDlgButtonChecked(hDlg, IDC_OV_CLICKTHRU) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarBarras = (IsDlgButtonChecked(hDlg, IDC_OV_BARRAS) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarSeparadores = (IsDlgButtonChecked(hDlg, IDC_OV_SEPARADORES) == BST_CHECKED) ? 1 : 0;
@@ -7454,11 +8511,11 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     DLGTEMPLATE *dt = (DLGTEMPLATE *)p;
     dt->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT;
     dt->dwExtendedStyle = 0;
-    dt->cdit = 37;
+    dt->cdit = 39;
     dt->x = 0;
     dt->y = 0;
     dt->cx = 280;
-    dt->cy = 244;
+    dt->cy = 259;
     p += sizeof(DLGTEMPLATE) / sizeof(WORD);
     *p++ = 0;
     *p++ = 0;
@@ -7490,28 +8547,30 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 108, 96, 52, 12, IDC_OV_DISCO, 0x0080, L"Disco I/O");
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 161, 96, 34, 12, IDC_OV_GPU, 0x0080, L"GPU");
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 197, 96, 55, 12, IDC_OV_PING, 0x0080, L"Lat\u00EAncia");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 113, 40, 12, IDC_OV_VRAM, 0x0080, L"VRAM");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 47, 113, 85, 12, IDC_OV_FREQ, 0x0080, L"Frequ\u00EAncia CPU");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 113, 226, 12, IDC_OV_CLICKTHRU, 0x0080, L"Click-through (cliques passam para janelas por baixo)");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 128, 226, 12, IDC_OV_CLICKTHRU, 0x0080, L"Click-through (cliques passam para janelas por baixo)");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 132, 70, 13, IDC_OV_BTN_COR_BG, 0x0080, L"Cor Fundo");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 82, 132, 70, 13, IDC_OV_BTN_COR_BORDA, 0x0080, L"Cor Borda");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 157, 132, 75, 13, IDC_OV_BTN_COR_LABEL, 0x0080, L"Cor Labels");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 148, 70, 13, IDC_OV_BTN_COR_VALOR, 0x0080, L"Cor Valores");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 82, 148, 70, 13, IDC_OV_BTN_COR_CPU, 0x0080, L"Cor Barra CPU");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 157, 148, 75, 13, IDC_OV_BTN_COR_RAM, 0x0080, L"Cor Barra RAM");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 164, 85, 13, IDC_OV_BTN_COR_TEMP, 0x0080, L"Cor Temp");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 97, 164, 85, 13, IDC_OV_BTN_COR_DISCO, 0x0080, L"Cor Disco");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 187, 164, 45, 13, IDC_OV_BTN_COR_NET, 0x0080, L"Cor Net");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 181, 85, 13, IDC_OV_BTN_COR_SEP, 0x0080, L"Cor Separador");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 97, 181, 75, 13, IDC_OV_BARRAS, 0x0080, L"Mostrar barras");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 174, 181, 80, 13, IDC_OV_SEPARADORES, 0x0080, L"Separadores");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 199, 95, 10, -1, 0x0082, L"Espessura borda:");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 0, 105, 197, 28, 12, IDC_OV_BORDERW, 0x0081, L"1");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 147, 70, 13, IDC_OV_BTN_COR_BG, 0x0080, L"Cor Fundo");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 82, 147, 70, 13, IDC_OV_BTN_COR_BORDA, 0x0080, L"Cor Borda");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 157, 147, 75, 13, IDC_OV_BTN_COR_LABEL, 0x0080, L"Cor Labels");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 163, 70, 13, IDC_OV_BTN_COR_VALOR, 0x0080, L"Cor Valores");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 82, 163, 70, 13, IDC_OV_BTN_COR_CPU, 0x0080, L"Cor Barra CPU");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 157, 163, 75, 13, IDC_OV_BTN_COR_RAM, 0x0080, L"Cor Barra RAM");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 179, 85, 13, IDC_OV_BTN_COR_TEMP, 0x0080, L"Cor Temp");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 97, 179, 85, 13, IDC_OV_BTN_COR_DISCO, 0x0080, L"Cor Disco");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 187, 179, 45, 13, IDC_OV_BTN_COR_NET, 0x0080, L"Cor Net");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 196, 85, 13, IDC_OV_BTN_COR_SEP, 0x0080, L"Cor Separador");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 97, 196, 75, 13, IDC_OV_BARRAS, 0x0080, L"Mostrar barras");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 174, 196, 80, 13, IDC_OV_SEPARADORES, 0x0080, L"Separadores");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 214, 95, 10, -1, 0x0082, L"Espessura borda:");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 0, 105, 212, 28, 12, IDC_OV_BORDERW, 0x0081, L"1");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 215, 260, 10, -1, 0x0082, L"Scroll no overlay altera o tamanho da fonte.");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 230, 260, 10, -1, 0x0082, L"Scroll no overlay altera o tamanho da fonte.");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 70, 228, 60, 14, IDOK, 0x0080, L"OK");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 145, 228, 60, 14, IDCANCEL, 0x0080, L"Cancelar");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 70, 243, 60, 14, IDOK, 0x0080, L"OK");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 145, 243, 60, 14, IDCANCEL, 0x0080, L"Cancelar");
 
     DialogBoxIndirectA(GetModuleHandle(NULL), (LPDLGTEMPLATE)dlgBuf, hwndPai, DialogoConfigOverlayProc);
 
@@ -7694,6 +8753,9 @@ void AtualizarMonitor()
         AtualizarLabelContagemProc();
     }
 
+    if (abaAtual == 8 && !g_compactMode)
+        AtualizarLigacoes();
+
     AtualizarOverlay();
     AtualizarCompacto();
 }
@@ -7840,6 +8902,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                 }
             }
 
+            CpuFreqInicializar();
+            GpuMemInicializar();
+
             PdhCollectQueryData(hQuery);
         }
 
@@ -7952,6 +9017,35 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             return 0;
         }
 
+        /* Notificacoes do ListView de ligacoes */
+        if (hListViewLig && hdr->hwndFrom == hListViewLig)
+        {
+            if (hdr->code == LVN_GETDISPINFOA)
+            {
+                LvLigGetDispInfo((NMLVDISPINFOA *)lParam);
+                return 0;
+            }
+            if (hdr->code == LVN_COLUMNCLICK)
+            {
+                NMLISTVIEW *pnm = (NMLISTVIEW *)lParam;
+                LvLigColumnClick(pnm->iSubItem);
+                return 0;
+            }
+            if (hdr->code == NM_RCLICK)
+            {
+                NMITEMACTIVATE *pnm = (NMITEMACTIVATE *)lParam;
+                if (pnm->iItem >= 0)
+                    MenuContextoLigacao(hwnd, pnm->iItem);
+                return 0;
+            }
+            if (hdr->code == NM_DBLCLK)
+            {
+                NMITEMACTIVATE *pnm = (NMITEMACTIVATE *)lParam;
+                AbrirDetalheLigacao(pnm->iItem);
+                return 0;
+            }
+        }
+
         /* Notificações do ListView de processos */
         if (hListViewProc && hdr->hwndFrom == hListViewProc)
         {
@@ -7995,12 +9089,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                     DWORD pid = g_lvProcessos[pnm->iItem].pid;
                     char pidStr[16];
                     snprintf(pidStr, sizeof(pidStr), "%u", pid);
+                    char exeNome[MAX_PATH];
+                    strncpy_s(exeNome, sizeof(exeNome), g_lvProcessos[pnm->iItem].exeFile, _TRUNCATE);
 
                     HMENU hMenu = CreatePopupMenu();
                     AppendMenuA(hMenu, MF_STRING, 1, "Terminar Processo");
                     AppendMenuA(hMenu, MF_STRING, 2, "Definir Prioridade Alta");
                     AppendMenuA(hMenu, MF_STRING, 3, "Abrir Localizacao do Ficheiro");
                     AppendMenuA(hMenu, MF_STRING, 4, "Copiar PID");
+                    AppendMenuA(hMenu, MF_STRING, 5, "Ver ligacoes deste processo");
 
                     POINT pt;
                     GetCursorPos(&pt);
@@ -8057,6 +9154,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                             }
                             CloseClipboard();
                         }
+                        break;
+                    case 5:
+                        MostrarLigacoesDoProcesso(exeNome);
                         break;
                     }
                 }
@@ -8159,6 +9259,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             int indice = LOWORD(wParam) - TAB_RESUMO;
             TabCtrl_SetCurSel(hTab, indice);
             MostrarAba(indice);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_CHK_CX_ATIVAS &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            AtualizarLigacoes();
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_EDIT_PESQUISA_CX &&
+            HIWORD(wParam) == EN_CHANGE)
+        {
+            AtualizarLigacoes();
             return 0;
         }
         if (LOWORD(wParam) == IDC_CHK_AGRUPAR &&
@@ -8313,8 +9425,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         }
         if (LOWORD(wParam) == ID_CONFIG_SETTINGS)
         {
-            TabCtrl_SetCurSel(hTab, 7);
-            MostrarAba(7);
+            /* aba Definicoes (antes abria por engano a aba Processos) */
+            TabCtrl_SetCurSel(hTab, 9);
+            MostrarAba(9);
             return 0;
         }
         if (LOWORD(wParam) == ID_CONFIG_ALERTAS)
@@ -8566,6 +9679,16 @@ static void ToggleCompactMode(void)
             ShowWindow(hChkAgrupar, SW_HIDE);
         if (hListViewProc)
             ShowWindow(hListViewProc, SW_HIDE);
+        if (hPainelLig)
+            ShowWindow(hPainelLig, SW_HIDE);
+        if (hEditLig)
+            ShowWindow(hEditLig, SW_HIDE);
+        if (hChkLigAtivas)
+            ShowWindow(hChkLigAtivas, SW_HIDE);
+        if (hLabelLigCount)
+            ShowWindow(hLabelLigCount, SW_HIDE);
+        if (hListViewLig)
+            ShowWindow(hListViewLig, SW_HIDE);
         if (hSettingsTitle)
             ShowWindow(hSettingsTitle, SW_HIDE);
         for (int i = 0; i < SETTINGS_SECTIONS; i++)
