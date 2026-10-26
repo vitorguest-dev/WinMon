@@ -25,6 +25,8 @@
  *   Linker: /GUARD:CF /CETCOMPAT /DYNAMICBASE /NXCOMPAT
  */
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 
 /* MinGW-w64/ucrt64 compatibility: some PDH headers do not expose
@@ -53,6 +55,7 @@
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -123,6 +126,11 @@ static const IID LOCAL_IID_IWbemLocator =
 #define HOTKEY_VK_OVERLAY 'O'
 #define HOTKEY_MOD_COMPACT (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT)
 #define HOTKEY_VK_COMPACT 'C'
+#define HOTKEY_ID_MARKER 3
+#define HOTKEY_MOD_MARKER (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT)
+#define HOTKEY_VK_MARKER 'M'
+#define SESSION_MAX_SAMPLES 100000
+#define SESSION_MAX_MARKERS 256
 
 #define OV_FONT_MIN 8
 #define OV_FONT_MAX 32
@@ -159,6 +167,8 @@ typedef struct
     double cpuPercent;
     char exeFile[MAX_PATH];
     int instancias; /* >1 apenas em linhas agrupadas (aba Processos) */
+    double netDownBps; /* bytes/s recebidos pelo processo (TCP EStats) */
+    double netUpBps;   /* bytes/s enviados pelo processo (TCP EStats) */
 } ProcessoInfo;
 
 typedef struct
@@ -382,7 +392,7 @@ static HWND hSettingsActions[SETTINGS_SECTIONS][4] = {{NULL}};
 static int g_settingsOpen[SETTINGS_SECTIONS] = {1, 1, 1, 1, 1};
 
 /* estado de ordenação do ListView */
-static int g_lvSortCol = 1;  /* coluna activa (0=Nome,1=PID,2=CPU,3=RAM) */
+static int g_lvSortCol = 1;  /* 0=Nome,1=PID,2=CPU,3=RAM,4=Download,5=Upload */
 static int g_lvSortDesc = 1; /* 1=descendente, 0=ascendente */
 
 /* agrupamento de processos pelo nome (ex.: 30x chrome.exe -> 1 linha) */
@@ -1108,14 +1118,35 @@ static RECT g_normalRect = {0};
 
 typedef struct
 {
+    ULONGLONG tickMs;
+    SYSTEMTIME timestamp;
+    double cpu, ram, temp;
+} WinMonSample;
+
+typedef struct
+{
+    ULONGLONG tickMs;
+    SYSTEMTIME timestamp;
+    char texto[128];
+} WinMonMarker;
+
+typedef struct
+{
     ULONGLONG inicioTickMs;
     unsigned long amostras;
     double somaCpu, somaRam, somaTemp;
     double maxCpu, maxRam, maxTemp;
+    double minCpu, minRam, minTemp;
     unsigned long alertas;
 } WinMonSessionStats;
 
 static WinMonSessionStats g_session = {0};
+static WinMonSample *g_sessionSamples = NULL;
+static size_t g_sessionSampleCount = 0;
+static WinMonMarker g_sessionMarkers[SESSION_MAX_MARKERS];
+static size_t g_sessionMarkerCount = 0;
+static CRITICAL_SECTION g_sessionLock;
+static int g_sessionLockReady = 0;
 
 #define PROCESS_HISTORY_INVALID (NAN)
 static int g_processHistoryPos = -1;
@@ -2157,6 +2188,90 @@ void MonitorarGPU(char *buffer, size_t size, size_t *offset)
                      "=== [ GPU ] ===\r\nUso Atual da GPU: N/A (contador GPU Engine indisponivel)\r\n\r\n");
 }
 
+/* Trafego por processo: TCP ESTATS (contadores cumulativos do Windows).
+ * EStats e obtido dinamicamente para manter compatibilidade com sistemas/SDKs
+ * onde as APIs nao estejam presentes. UDP nao e contabilizado por este metodo. */
+typedef struct { BOOLEAN EnableCollection; } WM_TCP_ESTATS_DATA_RW_V0;
+typedef struct {
+    ULONGLONG DataBytesOut, DataSegsOut, DataBytesIn, DataSegsIn, SegsOut, SegsIn;
+    ULONG SoftErrors, SoftErrorReason, SndUna, SndNxt, SndMax;
+    ULONGLONG ThruBytesAcked;
+    ULONG RcvNxt;
+    ULONGLONG ThruBytesReceived;
+} WM_TCP_ESTATS_DATA_ROD_V0;
+typedef DWORD (WINAPI *WM_SET_TCP_ESTATS)(PMIB_TCPROW, int, PUCHAR, ULONG, ULONG, PUCHAR, ULONG, ULONG, PUCHAR, ULONG, ULONG);
+typedef DWORD (WINAPI *WM_GET_TCP_ESTATS)(PMIB_TCPROW, int, PUCHAR, ULONG, ULONG, PUCHAR, ULONG, ULONG, PUCHAR, ULONG, ULONG);
+typedef struct { DWORD pid; ULONGLONG inBytes, outBytes; } WM_PID_TRAFFIC;
+static WM_PID_TRAFFIC g_trafficPrev[MAX_PROCESSES];
+static int g_trafficPrevCount = 0;
+static ULONGLONG g_trafficPrevTick = 0;
+static int g_estatsTried = 0;
+static WM_SET_TCP_ESTATS g_setEstats = NULL;
+static WM_GET_TCP_ESTATS g_getEstats = NULL;
+
+static void AtualizarTrafegoProcessos(void)
+{
+    HMODULE iphlp = NULL;
+    DWORD sz = 0, rc;
+    MIB_TCPTABLE_OWNER_PID *tb = NULL;
+    WM_PID_TRAFFIC now[MAX_PROCESSES];
+    int n = 0, i, j;
+    ULONGLONG tick = GetTickCount64(), elapsed = g_trafficPrevTick ? tick-g_trafficPrevTick : 0;
+    if (!g_estatsTried) {
+        g_estatsTried = 1;
+        iphlp = GetModuleHandleA("iphlpapi.dll");
+        if (!iphlp) iphlp = LoadLibraryA("iphlpapi.dll");
+        if (iphlp) {
+            g_setEstats = (WM_SET_TCP_ESTATS)GetProcAddress(iphlp, "SetPerTcpConnectionEStats");
+            g_getEstats = (WM_GET_TCP_ESTATS)GetProcAddress(iphlp, "GetPerTcpConnectionEStats");
+        }
+    }
+    if (!g_setEstats || !g_getEstats || elapsed == 0) { g_trafficPrevTick=tick; return; }
+    rc = GetExtendedTcpTable(NULL, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (rc != ERROR_INSUFFICIENT_BUFFER || !sz) { g_trafficPrevTick=tick; return; }
+    tb = (MIB_TCPTABLE_OWNER_PID*)malloc(sz);
+    if (!tb) { g_trafficPrevTick=tick; return; }
+    rc = GetExtendedTcpTable(tb, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (rc == NO_ERROR) {
+        DWORD k;
+        for (k=0; k<tb->dwNumEntries; k++) {
+            MIB_TCPROW row;
+            WM_TCP_ESTATS_DATA_RW_V0 rw;
+            WM_TCP_ESTATS_DATA_ROD_V0 rod;
+            ULONGLONG inB, outB;
+            DWORD pid=tb->table[k].dwOwningPid;
+            if (tb->table[k].dwState != MIB_TCP_STATE_ESTAB || pid==0) continue;
+            row.dwState=tb->table[k].dwState; row.dwLocalAddr=tb->table[k].dwLocalAddr;
+            row.dwLocalPort=tb->table[k].dwLocalPort; row.dwRemoteAddr=tb->table[k].dwRemoteAddr;
+            row.dwRemotePort=tb->table[k].dwRemotePort;
+            ZeroMemory(&rw,sizeof(rw)); ZeroMemory(&rod,sizeof(rod));
+            /* Primeiro consulta o estado; só tenta ativar uma vez por ligacao
+               enquanto o Windows mantiver a recolha desativada. */
+            if (g_getEstats(&row, 1, (PUCHAR)&rw, 0, sizeof(rw), NULL, 0, 0,
+                            (PUCHAR)&rod, 0, sizeof(rod)) != NO_ERROR || !rw.EnableCollection) {
+                rw.EnableCollection=TRUE;
+                if (g_setEstats(&row, 1, (PUCHAR)&rw, 0, sizeof(rw), NULL, 0, 0, NULL, 0, 0) != NO_ERROR) continue;
+                ZeroMemory(&rw,sizeof(rw)); ZeroMemory(&rod,sizeof(rod));
+                if (g_getEstats(&row, 1, (PUCHAR)&rw, 0, sizeof(rw), NULL, 0, 0,
+                                (PUCHAR)&rod, 0, sizeof(rod)) != NO_ERROR || !rw.EnableCollection) continue;
+            }
+            inB=rod.DataBytesIn; outB=rod.DataBytesOut;
+            for (j=0; j<n; j++) if (now[j].pid==pid) break;
+            if (j==n && n<MAX_PROCESSES) { now[n].pid=pid; now[n].inBytes=0; now[n].outBytes=0; n++; }
+            if (j<n) { now[j].inBytes += inB; now[j].outBytes += outB; }
+        }
+    }
+    free(tb);
+    for (i=0; i<totalListaProcessos; i++) {
+        DWORD pid=listaProcessos[i].pid; ULONGLONG inB=0,outB=0; int a,b;
+        for (a=0;a<n;a++) if(now[a].pid==pid){inB=now[a].inBytes;outB=now[a].outBytes;break;}
+        for (b=0;b<g_trafficPrevCount;b++) if(g_trafficPrev[b].pid==pid) break;
+        listaProcessos[i].netDownBps=(b<g_trafficPrevCount && inB>=g_trafficPrev[b].inBytes)?(double)(inB-g_trafficPrev[b].inBytes)*1000.0/(double)elapsed:0.0;
+        listaProcessos[i].netUpBps=(b<g_trafficPrevCount && outB>=g_trafficPrev[b].outBytes)?(double)(outB-g_trafficPrev[b].outBytes)*1000.0/(double)elapsed:0.0;
+    }
+    memcpy(g_trafficPrev,now,(size_t)n*sizeof(now[0])); g_trafficPrevCount=n; g_trafficPrevTick=tick;
+}
+
 void MonitorarProcessos(char *buffer, size_t size, size_t *offset)
 {
     FILETIME ftIdle, ftKernelSys, ftUserSys;
@@ -2268,6 +2383,8 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset)
                 listaProcessos[totalProcessos].pid = pe32.th32ProcessID;
                 listaProcessos[totalProcessos].memUsageMB = memUsageMB;
                 listaProcessos[totalProcessos].cpuPercent = cpuPercent;
+                listaProcessos[totalProcessos].netDownBps = 0.0;
+                listaProcessos[totalProcessos].netUpBps = 0.0;
 
                 strncpy_s(listaProcessos[totalProcessos].exeFile, MAX_PATH,
                           pe32.szExeFile, _TRUNCATE);
@@ -2279,6 +2396,7 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset)
 
     CloseHandle(hProcessSnap);
     totalListaProcessos = totalProcessos;
+    AtualizarTrafegoProcessos();
 
     memcpy(historicoCpu, novoHistorico,
            sizeof(ProcessoCpuHistorico) * totalNovoHistorico);
@@ -2449,6 +2567,7 @@ static void SessaoIniciar(void);
 static void SessaoAdicionarAmostra(double cpu, double ram, double temp);
 static void SessaoExportarRelatorio(void);
 static void SessaoResetar(void);
+static void SessaoAdicionarMarcador(const char *texto);
 static void MostrarAjudaAtalhos(HWND hwndPai);
 
 /* ------------------------------------------------------------------------- */
@@ -4664,6 +4783,12 @@ static int CompararLvProc(const void *a, const void *b)
     case 3: /* RAM */
         r = (p1->memUsageMB > p2->memUsageMB) - (p1->memUsageMB < p2->memUsageMB);
         break;
+    case 4: /* Download TCP */
+        r = (p1->netDownBps > p2->netDownBps) - (p1->netDownBps < p2->netDownBps);
+        break;
+    case 5: /* Upload TCP */
+        r = (p1->netUpBps > p2->netUpBps) - (p1->netUpBps < p2->netUpBps);
+        break;
     }
     if (r != 0)
         return g_lvSortDesc ? -r : r;
@@ -4756,6 +4881,8 @@ static void FiltrarListaProcessos(void)
 
             grp->cpuPercent += p->cpuPercent;
             grp->memUsageMB += p->memUsageMB;
+            grp->netDownBps += p->netDownBps;
+            grp->netUpBps += p->netUpBps;
             grp->instancias++;
 
             if (p->cpuPercent > g_grpMelhorCpu[g] ||
@@ -5019,8 +5146,13 @@ static void LvProcGetDispInfo(NMLVDISPINFOA *pdi)
         break;
     case 3: /* RAM */
         snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
-                 "%lu MB",
-                 (unsigned long)g_lvProcessos[idx].memUsageMB);
+                 "%lu MB", (unsigned long)g_lvProcessos[idx].memUsageMB);
+        break;
+    case 4: /* Download */
+        snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax, "%.1f KB/s", g_lvProcessos[idx].netDownBps/1024.0);
+        break;
+    case 5: /* Upload */
+        snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax, "%.1f KB/s", g_lvProcessos[idx].netUpBps/1024.0);
         break;
     }
 }
@@ -5033,7 +5165,7 @@ static void LvProcColumnClick(int col)
     else
     {
         g_lvSortCol = col;
-        g_lvSortDesc = (col == 2 || col == 3); /* CPU/RAM desc por omissão */
+        g_lvSortDesc = (col >= 2); /* CPU/RAM/rede descendente por omissao */
     }
     AtualizarListViewProcessos();
 }
@@ -5065,6 +5197,8 @@ typedef struct
     char proc[64];
     char local[72];  /* "ip:porta" */
     char remoto[72]; /* "ip:porta" ou "*" */
+    char dns[256];
+    BYTE portaIncomum;
 } ConexaoInfo;
 
 static ConexaoInfo g_conexoes[MAX_CONEXOES];
@@ -5161,6 +5295,83 @@ static void CxNomeProcesso(DWORD pid, char *out, size_t n)
     snprintf(out, n, "PID %lu", (unsigned long)pid);
 }
 
+#define CX_DNS_CACHE 256
+#define CX_CONHECIDAS_MAX 6000
+typedef struct { volatile LONG state; char ip[64]; char name[256]; } CxDnsEntry;
+static CxDnsEntry g_cxDns[CX_DNS_CACHE];
+static CRITICAL_SECTION g_cxDnsLock;
+static int g_cxDnsLockReady=0;
+static volatile LONG g_cxDnsThreads=0;
+typedef struct { DWORD pid; BYTE udp,v6; char local[72],remoto[72]; } CxConhecida;
+static CxConhecida g_cxConhecidas[CX_CONHECIDAS_MAX];
+static int g_cxConhecidasN=0, g_cxConhecidasInit=0;
+static ULONGLONG g_cxUltimoAlerta=0;
+static int CxPortaIncomum(WORD p)
+{
+    /* Portas conhecidas sao neutras; realca portas de servidor/administracao
+       comuns em maquinas pessoais e portas efemeras nao sao classificadas. */
+    switch(p) { case 21: case 23: case 445: case 1433: case 1521: case 2375:
+    case 3306: case 3389: case 4444: case 5432: case 5900: case 6379:
+    case 8080: case 8443: case 9200: case 27017: return 1; default: return 0; }
+}
+static int CxExtrairIP(const char *endpoint, char *ip, size_t n)
+{
+    const char *start=endpoint, *end=NULL; size_t len;
+    if(!endpoint || !endpoint[0] || strcmp(endpoint,"*")==0) return 0;
+    if(endpoint[0]=='[') { start=endpoint+1; end=strchr(start,']'); }
+    else { end=strrchr(endpoint,':'); }
+    if(!end || end<=start) return 0;
+    len=(size_t)(end-start); if(len>=n) return 0;
+    memcpy(ip,start,len); ip[len]='\0'; return 1;
+}
+static DWORD WINAPI CxResolverThread(LPVOID arg)
+{
+    int idx=(int)(INT_PTR)arg; struct sockaddr_storage ss; int rc=-1; char host[NI_MAXHOST];
+    char ip[64]; struct sockaddr_in *a4; struct sockaddr_in6 *a6;
+    if(idx<0 || idx>=CX_DNS_CACHE) return 0;
+    strncpy_s(ip,sizeof(ip),g_cxDns[idx].ip,_TRUNCATE); ZeroMemory(&ss,sizeof(ss));
+    if(strchr(ip,':')) { a6=(struct sockaddr_in6*)&ss; a6->sin6_family=AF_INET6; if(InetPtonA(AF_INET6,ip,&a6->sin6_addr)==1) rc=getnameinfo((struct sockaddr*)a6,sizeof(*a6),host,sizeof(host),NULL,0,NI_NAMEREQD); }
+    else { a4=(struct sockaddr_in*)&ss; a4->sin_family=AF_INET; if(InetPtonA(AF_INET,ip,&a4->sin_addr)==1) rc=getnameinfo((struct sockaddr*)a4,sizeof(*a4),host,sizeof(host),NULL,0,NI_NAMEREQD); }
+    EnterCriticalSection(&g_cxDnsLock);
+    if(rc==0) strncpy_s(g_cxDns[idx].name,sizeof(g_cxDns[idx].name),host,_TRUNCATE);
+    else strncpy_s(g_cxDns[idx].name,sizeof(g_cxDns[idx].name),"(sem DNS inverso)",_TRUNCATE);
+    InterlockedExchange(&g_cxDns[idx].state,2);
+    LeaveCriticalSection(&g_cxDnsLock); InterlockedDecrement(&g_cxDnsThreads); return 0;
+}
+static const char *CxDnsNome(const char *endpoint)
+{
+    char ip[64]; int i,freeIdx=-1; static char pending[]="a resolver...";
+    if(!g_cxDnsLockReady) return "(DNS indisponivel)";
+    if(!CxExtrairIP(endpoint,ip,sizeof(ip))) return "-";
+    /* Evita resolver enderecos privados/loopback, onde DNS inverso raramente ajuda. */
+    if(strcmp(ip,"127.0.0.1")==0 || strcmp(ip,"::1")==0 || strncmp(ip,"10.",3)==0 || strncmp(ip,"192.168.",8)==0 || strncmp(ip,"172.16.",7)==0) return "(privado)";
+    EnterCriticalSection(&g_cxDnsLock);
+    for(i=0;i<CX_DNS_CACHE;i++) { if(g_cxDns[i].state && strcmp(g_cxDns[i].ip,ip)==0) { const char *r=(g_cxDns[i].state==2)?g_cxDns[i].name:pending; LeaveCriticalSection(&g_cxDnsLock); return r; } if(!g_cxDns[i].state && freeIdx<0) freeIdx=i; }
+    if(freeIdx>=0) { strncpy_s(g_cxDns[freeIdx].ip,sizeof(g_cxDns[freeIdx].ip),ip,_TRUNCATE); g_cxDns[freeIdx].name[0]=0; InterlockedExchange(&g_cxDns[freeIdx].state,1); }
+    LeaveCriticalSection(&g_cxDnsLock);
+    if(freeIdx>=0) { HANDLE th; InterlockedIncrement(&g_cxDnsThreads); th=CreateThread(NULL,0,CxResolverThread,(LPVOID)(INT_PTR)freeIdx,0,NULL); if(th) CloseHandle(th); else { InterlockedDecrement(&g_cxDnsThreads); InterlockedExchange(&g_cxDns[freeIdx].state,2); } }
+    return pending;
+}
+static int CxEhConhecida(const ConexaoInfo *c)
+{
+    int i; for(i=0;i<g_cxConhecidasN;i++) if(g_cxConhecidas[i].pid==c->pid && g_cxConhecidas[i].udp==c->udp && g_cxConhecidas[i].v6==c->v6 && strcmp(g_cxConhecidas[i].local,c->local)==0 && strcmp(g_cxConhecidas[i].remoto,c->remoto)==0) return 1;
+    return 0;
+}
+static void CxVerificarNovasLigacoes(void)
+{
+    int i, alertou=0; ULONGLONG now=GetTickCount64();
+    if(!g_cxConhecidasInit || g_cxConhecidasN + g_conexoesTotal >= CX_CONHECIDAS_MAX) {
+        g_cxConhecidasN=0;
+        for(i=0;i<g_conexoesTotal && g_cxConhecidasN<CX_CONHECIDAS_MAX;i++){ ConexaoInfo*c=&g_conexoes[i]; CxConhecida*k=&g_cxConhecidas[g_cxConhecidasN++]; k->pid=c->pid;k->udp=c->udp;k->v6=c->v6;strncpy_s(k->local,sizeof(k->local),c->local,_TRUNCATE);strncpy_s(k->remoto,sizeof(k->remoto),c->remoto,_TRUNCATE);}
+        g_cxConhecidasInit=1; return;
+    }
+    for(i=0;i<g_conexoesTotal;i++) { ConexaoInfo*c=&g_conexoes[i]; if(CxEhConhecida(c)) continue;
+        if(g_cxConhecidasN>=CX_CONHECIDAS_MAX) { g_cxConhecidasN=0; break; }
+        { CxConhecida*k=&g_cxConhecidas[g_cxConhecidasN++];k->pid=c->pid;k->udp=c->udp;k->v6=c->v6;strncpy_s(k->local,sizeof(k->local),c->local,_TRUNCATE);strncpy_s(k->remoto,sizeof(k->remoto),c->remoto,_TRUNCATE); }
+        if(!alertou && !c->udp && c->estabelecida && strcmp(c->remoto,"*")!=0 && now-g_cxUltimoAlerta>15000) { char msg[180]; snprintf(msg,sizeof(msg),"Nova ligacao de %s (PID %lu): %s",c->proc,(unsigned long)c->pid,c->remoto); EnviarBalloon("WinMon — nova ligacao",msg); g_cxUltimoAlerta=now; alertou=1; }
+    }
+}
+
 static void CxAdicionar(int udp, int v6, DWORD estado, DWORD pid,
                         const char *local, const char *remoto)
 {
@@ -5180,6 +5391,8 @@ static void CxAdicionar(int udp, int v6, DWORD estado, DWORD pid,
     CxNomeProcesso(pid, c->proc, sizeof(c->proc));
     strncpy_s(c->local, sizeof(c->local), local, _TRUNCATE);
     strncpy_s(c->remoto, sizeof(c->remoto), remoto, _TRUNCATE);
+    { char *colon=strrchr(c->local,':'); WORD lp=colon?(WORD)atoi(colon+1):0; colon=strrchr(c->remoto,':'); WORD rp=colon?(WORD)atoi(colon+1):0; c->portaIncomum=(BYTE)(CxPortaIncomum(lp)||CxPortaIncomum(rp)); }
+    strncpy_s(c->dns, sizeof(c->dns), "", _TRUNCATE);
 }
 
 /* Le uma tabela do sistema; o tamanho pode crescer entre chamadas, por isso
@@ -5400,6 +5613,7 @@ static void AtualizarLigacoes(void)
     }
 
     ConexoesRecolher();
+    CxVerificarNovasLigacoes();
 
     filtro[0] = '\0';
     if (hEditLig)
@@ -5448,9 +5662,9 @@ static void AtualizarLigacoes(void)
     if (hLabelLigCount)
     {
         char txt[160];
-        snprintf(txt, sizeof(txt), "%d de %d ligacoes (%d estabelecidas)%s",
+        snprintf(txt, sizeof(txt), "%d/%d ligacoes (%d estabelecidas) | vermelho = porta de risco%s",
                  g_cxVisiveis, g_conexoesTotal, estab,
-                 g_cxTruncadas ? "  [lista truncada]" : "");
+                 g_cxTruncadas ? " [lista truncada]" : "");
         SetWindowTextA(hLabelLigCount, txt);
     }
 }
@@ -5492,6 +5706,9 @@ static void LvLigGetDispInfo(NMLVDISPINFOA *pdi)
         break;
     case 5:
         strncpy_s(dst, n, CxEstadoTxt(c), _TRUNCATE);
+        break;
+    case 6:
+        strncpy_s(dst, n, CxDnsNome(c->remoto), _TRUNCATE);
         break;
     }
 }
@@ -5560,6 +5777,7 @@ static void MenuContextoLigacao(HWND hwnd, int visIdx)
     AppendMenuA(hMenu, MF_STRING | (strcmp(remoto, "*") == 0 ? MF_GRAYED : 0), 2,
                 "Copiar endereco remoto");
     AppendMenuA(hMenu, MF_STRING, 3, "Copiar endereco local");
+    AppendMenuA(hMenu, MF_STRING | (strcmp(remoto, "*")==0 ? MF_GRAYED : 0), 6, "Geolocalizar IP remoto no browser");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING | (pid <= 4 ? MF_GRAYED : 0), 4, "Abrir historico do processo");
     AppendMenuA(hMenu, MF_STRING | (pid <= 4 ? MF_GRAYED : 0), 5, "Terminar processo");
@@ -5580,6 +5798,9 @@ static void MenuContextoLigacao(HWND hwnd, int visIdx)
         break;
     case 3:
         CopiarTextoClipboard(hwnd, local);
+        break;
+    case 6:
+        { char ip[64], url[160]; if(CxExtrairIP(remoto,ip,sizeof(ip)) && !(strncmp(ip,"10.",3)==0 || strncmp(ip,"192.168.",8)==0 || strncmp(ip,"127.",4)==0 || strcmp(ip,"::1")==0)) { snprintf(url,sizeof(url),"https://ipinfo.io/%s",ip); ShellExecuteA(NULL,"open",url,NULL,NULL,SW_SHOWNORMAL); } else MessageBoxA(hwnd,"O endereco e local/privado ou nao pode ser interpretado.","WinMon",MB_OK|MB_ICONINFORMATION); }
         break;
     case 4:
         AbrirDetalheProcesso(pid, proc);
@@ -5614,7 +5835,8 @@ static void CriarPainelLigacoes(HWND hwndPai)
         {"Proto", 56, LVCFMT_LEFT},
         {"Endereco local", 220, LVCFMT_LEFT},
         {"Endereco remoto", 220, LVCFMT_LEFT},
-        {"Estado", 110, LVCFMT_LEFT}};
+        {"Estado", 110, LVCFMT_LEFT},
+        {"DNS inverso", 210, LVCFMT_LEFT}};
     int i;
 
     hPainelLig = CreateWindowExA(0, "STATIC", "Filtrar ligacoes",
@@ -5757,9 +5979,13 @@ static void CriarPainelProcessos(HWND hwndPai)
     ListView_InsertColumn(hListViewProc, 2, &lvc);
 
     lvc.pszText = "RAM (MB)";
-    lvc.cx = 90;
-    lvc.fmt = LVCFMT_RIGHT;
+    lvc.cx = 90; lvc.fmt = LVCFMT_RIGHT;
     ListView_InsertColumn(hListViewProc, 3, &lvc);
+
+    lvc.pszText = "Download TCP"; lvc.cx = 105; lvc.fmt = LVCFMT_RIGHT;
+    ListView_InsertColumn(hListViewProc, 4, &lvc);
+    lvc.pszText = "Upload TCP"; lvc.cx = 105; lvc.fmt = LVCFMT_RIGHT;
+    ListView_InsertColumn(hListViewProc, 5, &lvc);
 }
 
 /* Stub mantido para compatibilidade — posicionamento é feito em RedimensionarConteudo */
@@ -6055,11 +6281,113 @@ static void CriarAbas(HWND hwnd)
 /* ------------------------------------------------------------------------- */
 /* Sessao de monitorizacao                                                   */
 /* ------------------------------------------------------------------------- */
-static void SessaoIniciar(void){ZeroMemory(&g_session,sizeof(g_session));g_session.inicioTickMs=GetTickCount64();}
-static void SessaoAdicionarAmostra(double cpu,double ram,double temp){g_session.amostras++;g_session.somaCpu+=cpu;g_session.somaRam+=ram;g_session.somaTemp+=temp;if(g_session.amostras==1||cpu>g_session.maxCpu)g_session.maxCpu=cpu;if(g_session.amostras==1||ram>g_session.maxRam)g_session.maxRam=ram;if(g_session.amostras==1||temp>g_session.maxTemp)g_session.maxTemp=temp;}
-static void SessaoResetar(void){SessaoIniciar();AtualizarDefinicoesVisibilidade();InvalidateRect(hDashboard,NULL,FALSE);}
-static void SessaoExportarRelatorio(void){char caminho[MAX_PATH],nome[96],msg[MAX_PATH+80];FILE*f;SYSTEMTIME st;double dur=(GetTickCount64()-g_session.inicioTickMs)/1000.0;GetLocalTime(&st);snprintf(nome,sizeof(nome),"winmon_sessao_%04d%02d%02d_%02d%02d%02d.csv",st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);CaminhoDados(nome,caminho,sizeof(caminho));if(fopen_s(&f,caminho,"w")!=0||!f){MessageBoxA(hMainWindow,"Nao foi possivel exportar a sessao.","WinMon",MB_OK|MB_ICONERROR);return;}fprintf(f,"metrica,valor\n");fprintf(f,"duracao_segundos,%.0f\n",dur);fprintf(f,"amostras,%lu\n",g_session.amostras);fprintf(f,"cpu_media_pct,%.2f\n",g_session.amostras?g_session.somaCpu/g_session.amostras:0.0);fprintf(f,"cpu_max_pct,%.2f\n",g_session.maxCpu);fprintf(f,"ram_media_pct,%.2f\n",g_session.amostras?g_session.somaRam/g_session.amostras:0.0);fprintf(f,"ram_max_pct,%.2f\n",g_session.maxRam);fprintf(f,"temperatura_media_c,%.2f\n",g_session.amostras?g_session.somaTemp/g_session.amostras:0.0);fprintf(f,"temperatura_max_c,%.2f\n",g_session.maxTemp);fprintf(f,"alertas,%lu\n",g_session.alertas);fclose(f);snprintf(msg,sizeof(msg),"Relatorio exportado para:\n%s",caminho);MessageBoxA(hMainWindow,msg,"WinMon",MB_OK|MB_ICONINFORMATION);}
-static void MostrarAjudaAtalhos(HWND hwndPai){MessageBoxA(hwndPai,"Ctrl+S  Exportar snapshot\nCtrl+L  Ligar/desligar log CSV\nCtrl+A  Alertas\nCtrl+E  Aparencia\nCtrl+O  Overlay\nCtrl+D  Definicoes\nCtrl+Shift+O  Overlay rapido\nCtrl+Shift+C  Modo compacto\n\nDashboard: clique num cartao para abrir o grafico.\nProcessos: duplo clique abre o historico do processo.\nLigacoes: clique direito numa linha para filtrar, copiar o endereco ou terminar o processo.","Atalhos e ajuda do WinMon",MB_OK|MB_ICONINFORMATION);}
+static int CompararDoubleSessao(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+static void SessaoIniciar(void)
+{
+    if (!g_sessionLockReady)
+    {
+        InitializeCriticalSection(&g_sessionLock);
+        g_sessionLockReady = 1;
+    }
+    EnterCriticalSection(&g_sessionLock);
+    ZeroMemory(&g_session, sizeof(g_session));
+    g_session.inicioTickMs = GetTickCount64();
+    g_sessionSampleCount = 0;
+    g_sessionMarkerCount = 0;
+    free(g_sessionSamples);
+    g_sessionSamples = (WinMonSample *)malloc(SESSION_MAX_SAMPLES * sizeof(WinMonSample));
+    LeaveCriticalSection(&g_sessionLock);
+}
+
+static void SessaoAdicionarAmostra(double cpu, double ram, double temp)
+{
+    WinMonSample *novo;
+    SYSTEMTIME st;
+    if (!g_sessionLockReady) SessaoIniciar();
+    EnterCriticalSection(&g_sessionLock);
+    g_session.amostras++;
+    g_session.somaCpu += cpu; g_session.somaRam += ram; g_session.somaTemp += temp;
+    if (g_session.amostras == 1 || cpu > g_session.maxCpu) g_session.maxCpu = cpu;
+    if (g_session.amostras == 1 || ram > g_session.maxRam) g_session.maxRam = ram;
+    if (g_session.amostras == 1 || temp > g_session.maxTemp) g_session.maxTemp = temp;
+    if (g_session.amostras == 1 || cpu < g_session.minCpu) g_session.minCpu = cpu;
+    if (g_session.amostras == 1 || ram < g_session.minRam) g_session.minRam = ram;
+    if (g_session.amostras == 1 || temp < g_session.minTemp) g_session.minTemp = temp;
+    if (g_sessionSamples && g_sessionSampleCount < SESSION_MAX_SAMPLES)
+    {
+        novo = &g_sessionSamples[g_sessionSampleCount++];
+        novo->tickMs = GetTickCount64(); GetLocalTime(&st); novo->timestamp = st;
+        novo->cpu = cpu; novo->ram = ram; novo->temp = temp;
+    }
+    LeaveCriticalSection(&g_sessionLock);
+}
+
+static void SessaoAdicionarMarcador(const char *texto)
+{
+    WinMonMarker *m;
+    if (!g_sessionLockReady) SessaoIniciar();
+    EnterCriticalSection(&g_sessionLock);
+    if (g_sessionMarkerCount < SESSION_MAX_MARKERS)
+    {
+        m = &g_sessionMarkers[g_sessionMarkerCount++];
+        m->tickMs = GetTickCount64(); GetLocalTime(&m->timestamp);
+        strncpy_s(m->texto, sizeof(m->texto), (texto && texto[0]) ? texto : "Marcador", _TRUNCATE);
+    }
+    LeaveCriticalSection(&g_sessionLock);
+    if (logAtivo && hLogCSV)
+    {
+        SYSTEMTIME st; GetLocalTime(&st);
+        fprintf(hLogCSV, "#MARCADOR,%04u-%02u-%02u %02u:%02u:%02u,%s\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                (texto && texto[0]) ? texto : "Marcador");
+        fflush(hLogCSV);
+    }
+}
+
+static void SessaoExportarRelatorio(void)
+{
+    char caminho[MAX_PATH], nome[128], msg[MAX_PATH+96], csvNome[128], csvPath[MAX_PATH];
+    FILE *f = NULL; SYSTEMTIME st; size_t i; double dur;
+    double *cpu = NULL, *ram = NULL, *temp = NULL;
+    double p95cpu = 0, p95ram = 0, p95temp = 0;
+    if (!g_sessionLockReady) SessaoIniciar();
+    EnterCriticalSection(&g_sessionLock);
+    dur = (GetTickCount64() - g_session.inicioTickMs) / 1000.0;
+    GetLocalTime(&st);
+    snprintf(nome, sizeof(nome), "winmon_sessao_%04d%02d%02d_%02d%02d%02d.html", st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+    CaminhoDados(nome, caminho, sizeof(caminho));
+    if (fopen_s(&f, caminho, "w") != 0 || !f) { LeaveCriticalSection(&g_sessionLock); MessageBoxA(hMainWindow,"Nao foi possivel exportar o relatorio HTML.","WinMon",MB_OK|MB_ICONERROR); return; }
+    if (g_sessionSampleCount)
+    {
+        cpu=(double*)malloc(g_sessionSampleCount*sizeof(double)); ram=(double*)malloc(g_sessionSampleCount*sizeof(double)); temp=(double*)malloc(g_sessionSampleCount*sizeof(double));
+        if (cpu && ram && temp)
+        {
+            for(i=0;i<g_sessionSampleCount;i++){cpu[i]=g_sessionSamples[i].cpu;ram[i]=g_sessionSamples[i].ram;temp[i]=g_sessionSamples[i].temp;}
+            qsort(cpu,g_sessionSampleCount,sizeof(double),CompararDoubleSessao); qsort(ram,g_sessionSampleCount,sizeof(double),CompararDoubleSessao); qsort(temp,g_sessionSampleCount,sizeof(double),CompararDoubleSessao);
+            { size_t ix=(size_t)ceil(0.95*(double)g_sessionSampleCount); if(ix>0)ix--; p95cpu=cpu[ix];p95ram=ram[ix];p95temp=temp[ix]; }
+        }
+    }
+    fprintf(f,"<!doctype html><html lang=\"pt\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Relatorio WinMon</title><style>body{font:16px Segoe UI,Arial,sans-serif;max-width:1000px;margin:32px auto;padding:0 18px;color:#17212b;background:#f4f7fa}h1{color:#12304a}.card{background:white;border-radius:12px;padding:18px;margin:14px 0;box-shadow:0 2px 10px #0001}table{width:100%%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #e4e9ef}th{background:#edf2f7}.muted{color:#64748b}</style></head><body><h1>WinMon — Relatorio da sessao</h1><p class=\"muted\">Gerado em %04u-%02u-%02u %02u:%02u:%02u</p><div class=\"card\"><b>Duracao:</b> %.1f s &nbsp; <b>Amostras:</b> %lu &nbsp; <b>Alertas:</b> %lu</div><div class=\"card\"><h2>Estatisticas</h2><table><tr><th>Metrica</th><th>Minimo</th><th>Media</th><th>Maximo</th><th>P95</th></tr>",st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond,dur,g_session.amostras,g_session.alertas);
+    fprintf(f,"<tr><td>CPU (%%)</td><td>%.2f</td><td>%.2f</td><td>%.2f</td><td>%.2f</td></tr>",g_session.minCpu,g_session.amostras?g_session.somaCpu/g_session.amostras:0,g_session.maxCpu,p95cpu);
+    fprintf(f,"<tr><td>RAM (%%)</td><td>%.2f</td><td>%.2f</td><td>%.2f</td><td>%.2f</td></tr>",g_session.minRam,g_session.amostras?g_session.somaRam/g_session.amostras:0,g_session.maxRam,p95ram);
+    fprintf(f,"<tr><td>Temperatura (C)</td><td>%.2f</td><td>%.2f</td><td>%.2f</td><td>%.2f</td></tr>",g_session.minTemp,g_session.amostras?g_session.somaTemp/g_session.amostras:0,g_session.maxTemp,p95temp);
+    fprintf(f,"</table></div><div class=\"card\"><h2>Marcadores</h2><table><tr><th>Hora</th><th>Tempo desde o inicio (s)</th><th>Descricao</th></tr>");
+    for(i=0;i<g_sessionMarkerCount;i++) fprintf(f,"<tr><td>%02u:%02u:%02u</td><td>%.1f</td><td>%s</td></tr>",g_sessionMarkers[i].timestamp.wHour,g_sessionMarkers[i].timestamp.wMinute,g_sessionMarkers[i].timestamp.wSecond,(g_sessionMarkers[i].tickMs-g_session.inicioTickMs)/1000.0,g_sessionMarkers[i].texto);
+    fprintf(f,"</table><p class=\"muted\">P95 calculado sobre as amostras registadas em memoria. O limite de armazenamento e %u amostras; graficos PNG nao estao incorporados nesta versao.</p></div></body></html>",SESSION_MAX_SAMPLES);
+    fclose(f); free(cpu);free(ram);free(temp);
+    snprintf(csvNome,sizeof(csvNome),"winmon_marcadores_%04d%02d%02d_%02d%02d%02d.csv",st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+    CaminhoDados(csvNome,csvPath,sizeof(csvPath));
+    { FILE *mf=NULL; if(fopen_s(&mf,csvPath,"w")==0 && mf){fprintf(mf,"hora,segundos_desde_inicio,marcador\n");for(i=0;i<g_sessionMarkerCount;i++)fprintf(mf,"%02u:%02u:%02u,%.1f,\"%s\"\n",g_sessionMarkers[i].timestamp.wHour,g_sessionMarkers[i].timestamp.wMinute,g_sessionMarkers[i].timestamp.wSecond,(g_sessionMarkers[i].tickMs-g_session.inicioTickMs)/1000.0,g_sessionMarkers[i].texto);fclose(mf);} }
+    LeaveCriticalSection(&g_sessionLock);
+    snprintf(msg,sizeof(msg),"Relatorio HTML exportado para:\n%s",caminho); MessageBoxA(hMainWindow,msg,"WinMon",MB_OK|MB_ICONINFORMATION);
+}
+
+static void SessaoResetar(void){SessaoIniciar();AtualizarDefinicoesVisibilidade();InvalidateRect(hDashboard,NULL,FALSE);}static void MostrarAjudaAtalhos(HWND hwndPai){MessageBoxA(hwndPai,"Ctrl+S  Exportar snapshot\nCtrl+L  Ligar/desligar log CSV\nCtrl+A  Alertas\nCtrl+E  Aparencia\nCtrl+O  Overlay\nCtrl+D  Definicoes\nCtrl+Shift+O  Overlay rapido\nCtrl+Shift+C  Modo compacto\n\nDashboard: clique num cartao para abrir o grafico.\nProcessos: duplo clique abre o historico do processo.\nLigacoes: clique direito numa linha para filtrar, copiar o endereco ou terminar o processo.","Atalhos e ajuda do WinMon",MB_OK|MB_ICONINFORMATION);}
 
 /* ------------------------------------------------------------------------- */
 /* Logging CSV Contínuo                                                      */
@@ -8755,6 +9083,10 @@ void AtualizarMonitor()
 
     if (abaAtual == 8 && !g_compactMode)
         AtualizarLigacoes();
+    else { /* deteccao de novas ligacoes continua ativa fora da aba */
+        ConexoesRecolher();
+        CxVerificarNovasLigacoes();
+    }
 
     AtualizarOverlay();
     AtualizarCompacto();
@@ -8925,6 +9257,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         strncpy_s(nid.szTip, sizeof(nid.szTip),
                   "Monitor de Hardware", _TRUNCATE);
 
+        { WSADATA wd; if (WSAStartup(MAKEWORD(2,2),&wd)==0) { InitializeCriticalSection(&g_cxDnsLock); g_cxDnsLockReady=1; } }
+        SessaoIniciar();
         SetTimer(hwnd, TIMER_ID, intervaloAtualizacaoMs, NULL);
 
         /* Registar hotkey global Ctrl+Shift+O para toggle overlay */
@@ -8936,6 +9270,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                             HOTKEY_MOD_COMPACT, HOTKEY_VK_COMPACT))
         {
         }
+        /* Ctrl+Shift+M cria um marcador temporal na sessao. */
+        RegisterHotKey(hwnd, HOTKEY_ID_MARKER, HOTKEY_MOD_MARKER, HOTKEY_VK_MARKER);
 
         return 0;
     }
@@ -9020,6 +9356,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         /* Notificacoes do ListView de ligacoes */
         if (hListViewLig && hdr->hwndFrom == hListViewLig)
         {
+            if (hdr->code == NM_CUSTOMDRAW)
+            {
+                NMLVCUSTOMDRAW *cd=(NMLVCUSTOMDRAW*)lParam;
+                if(cd->nmcd.dwDrawStage==CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if(cd->nmcd.dwDrawStage==CDDS_ITEMPREPAINT) {
+                    int vi=(int)cd->nmcd.dwItemSpec;
+                    if(vi>=0 && vi<g_cxVisiveis && g_conexoes[g_cxIdx[vi]].portaIncomum) { cd->clrText=RGB(180,55,35); cd->clrTextBk=RGB(255,238,232); }
+                    return CDRF_DODEFAULT;
+                }
+            }
             if (hdr->code == LVN_GETDISPINFOA)
             {
                 LvLigGetDispInfo((NMLVDISPINFOA *)lParam);
@@ -9490,6 +9836,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             ToggleCompactMode();
             AtualizarDefinicoesVisibilidade();
         }
+        else if ((int)wParam == HOTKEY_ID_MARKER)
+        {
+            SessaoAdicionarMarcador("Marcador manual");
+            EnviarBalloon("WinMon", "Marcador de sessao registado (Ctrl+Shift+M).");
+        }
         return 0;
 
     case WM_TIMER:
@@ -9500,8 +9851,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
     case WM_DESTROY:
         UnregisterHotKey(hwnd, HOTKEY_ID_OVERLAY);
         UnregisterHotKey(hwnd, HOTKEY_ID_COMPACT);
+        UnregisterHotKey(hwnd, HOTKEY_ID_MARKER);
         KillTimer(hwnd, TIMER_ID);
+        /* Nao destruir a lock nem finalizar Winsock enquanto um DNS inverso
+           assíncrono ainda estiver em curso. */
+        { int espera=0; while(InterlockedCompareExchange(&g_cxDnsThreads,0,0)>0 && espera<200) { Sleep(10); espera++; } }
+        if(g_cxDnsLockReady && InterlockedCompareExchange(&g_cxDnsThreads,0,0)==0) { DeleteCriticalSection(&g_cxDnsLock); g_cxDnsLockReady=0; WSACleanup(); }
         PingWifiParar();
+        free(g_sessionSamples); g_sessionSamples = NULL; g_sessionSampleCount = 0;
+        if (g_sessionLockReady) { DeleteCriticalSection(&g_sessionLock); g_sessionLockReady = 0; }
 
         FecharOverlay();
         if (hProcessDetail && IsWindow(hProcessDetail))
