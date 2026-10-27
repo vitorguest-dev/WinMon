@@ -52,6 +52,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <wincodec.h>
+#include <icmpapi.h>
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -148,8 +149,9 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_PROCESSOS 2008
 #define TAB_LIGACOES 2009
 #define TAB_DEFINICOES 2010
+#define TAB_REDE_LOCAL 2011
 #define NAV_LARGURA 188
-#define NUM_ABAS 10
+#define NUM_ABAS 11
 #define ALERT_HISTORY_MAX 100
 
 #define MAX_TEMP_ZONAS 16
@@ -407,6 +409,29 @@ HWND hEditLig = NULL;       /* caixa de filtro */
 HWND hChkLigAtivas = NULL;  /* "Apenas estabelecidas" */
 HWND hLabelLigCount = NULL; /* "N de M ligacoes" */
 HWND hListViewLig = NULL;   /* ListView virtual */
+
+/* --- Painel Rede Local: descoberta IPv4 assíncrona --- */
+#define IDC_LAN_SCAN 6020
+#define IDC_LAN_STATUS 6021
+#define IDC_LAN_LIST 6022
+#define WM_LAN_SCAN_DONE (WM_APP + 12)
+#define LAN_MAX_DEVICES 512
+#define LAN_MAX_SCAN_IPS 256
+typedef struct
+{
+    DWORD ip; /* endereço IPv4 em ordem de rede */
+    char ipText[16];
+    char macText[24];
+    char tipoText[24];
+} LanDevice;
+static HWND hLanScan = NULL;
+static HWND hLanStatus = NULL;
+static HWND hLanList = NULL;
+static HANDLE g_lanThread = NULL;
+static volatile LONG g_lanScanRunning = 0;
+static LanDevice g_lanDevices[LAN_MAX_DEVICES];
+static int g_lanDeviceCount = 0;
+
 
 /* snapshot filtrado para o ListView */
 static ProcessoInfo g_lvProcessos[MAX_PROCESSES];
@@ -2491,6 +2516,10 @@ static void AtivarAlertaOverlay(void);
 static void AplicarEstiloJanelaPrincipal(void);
 static void CriarPainelProcessos(HWND hwndPai);
 static void CriarPainelLigacoes(HWND hwndPai);
+static void CriarPainelRedeLocal(HWND hwndPai);
+static void LanIniciarPesquisa(HWND hwndPai);
+static DWORD WINAPI LanScanThread(LPVOID arg);
+static void LanPreencherLista(void);
 static void AtualizarLigacoes(void);
 static void MostrarLigacoesDoProcesso(const char *exe);
 static void AtualizarListViewProcessos(void);
@@ -4571,6 +4600,14 @@ static void MostrarAba(int indice)
             ShowWindow(hListViewLig, visLig);
     }
 
+    /* painel Rede Local (aba 10) */
+    {
+        int visLan = (indice == 10) ? SW_SHOW : SW_HIDE;
+        if (hLanScan) ShowWindow(hLanScan, visLan);
+        if (hLanStatus) ShowWindow(hLanStatus, visLan);
+        if (hLanList) ShowWindow(hLanList, visLan);
+    }
+
     AtualizarDefinicoesVisibilidade();
     InvalidateRect(hMainWindow, NULL, TRUE);
 
@@ -4749,6 +4786,15 @@ static void RedimensionarConteudo(HWND hwnd)
                 MoveWindow(hLabelLigCount, xCnt, cy + 4, wCnt, 22, TRUE);
             if (hListViewLig && ch > barH)
                 MoveWindow(hListViewLig, cx, cy + barH, cw, ch - barH, TRUE);
+        }
+
+        /* Painel de descoberta da LAN */
+        {
+            int cx = rc.left, cy = rc.top;
+            int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+            if (hLanScan) MoveWindow(hLanScan, cx + 4, cy + 3, 150, 25, TRUE);
+            if (hLanStatus) MoveWindow(hLanStatus, cx + 164, cy + 4, cw - 170, 23, TRUE);
+            if (hLanList && ch > 32) MoveWindow(hLanList, cx, cy + 32, cw, ch - 32, TRUE);
         }
     }
 }
@@ -5820,6 +5866,215 @@ static void MenuContextoLigacao(HWND hwnd, int visIdx)
     }
 }
 
+/* Descobre hosts IPv4 na sub-rede local. A pesquisa corre numa thread
+ * separada; limita-se a 256 endereços para evitar varrimentos amplos. */
+static DWORD WINAPI LanScanThread(LPVOID arg)
+{
+    HWND hwndPai = (HWND)arg;
+    IP_ADAPTER_INFO *adapters = NULL, *ad = NULL;
+    ULONG bytes = 0;
+    DWORD rc;
+    DWORD found[LAN_MAX_SCAN_IPS];
+    int foundCount = 0;
+    HANDLE icmp = INVALID_HANDLE_VALUE;
+    const char payload[] = "WinMon LAN discovery";
+    int i;
+
+    rc = GetAdaptersInfo(NULL, &bytes);
+    if (rc != ERROR_BUFFER_OVERFLOW || bytes == 0 || bytes > 1024 * 1024)
+        goto finish;
+    adapters = (IP_ADAPTER_INFO *)malloc(bytes);
+    if (!adapters) goto finish;
+    rc = GetAdaptersInfo(adapters, &bytes);
+    if (rc != NO_ERROR) goto finish;
+
+    icmp = IcmpCreateFile();
+    if (icmp == INVALID_HANDLE_VALUE) goto finish;
+
+    /* Usa o primeiro adaptador IPv4 ligado e com gateway. */
+    for (ad = adapters; ad; ad = ad->Next)
+    {
+        IP_ADDR_STRING *ipEntry;
+        if (ad->Type == MIB_IF_TYPE_LOOPBACK || ad->IpAddressList.IpAddress.String[0] == '\0')
+            continue;
+        if (ad->GatewayList.IpAddress.String[0] == '\0')
+            continue;
+        for (ipEntry = &ad->IpAddressList; ipEntry; ipEntry = ipEntry->Next)
+        {
+            DWORD ip = ntohl(inet_addr(ipEntry->IpAddress.String));
+            DWORD mask = ntohl(inet_addr(ipEntry->IpMask.String));
+            DWORD base, count, k;
+            unsigned prefix = 0;
+            DWORD m = mask;
+            if (ip == INADDR_NONE || mask == 0 || ip == 0) continue;
+            while (m & 0x80000000UL) { prefix++; m <<= 1; }
+            if (prefix < 24) { base = ip & 0xFFFFFF00UL; count = 256; }
+            else { base = ip & mask; count = (prefix >= 32) ? 1 : (1UL << (32 - prefix)); }
+            if (count > LAN_MAX_SCAN_IPS) { base = ip & 0xFFFFFF00UL; count = 256; }
+            for (k = 1; k + 1 < count && foundCount < LAN_MAX_SCAN_IPS; k++)
+            {
+                DWORD target = base + k;
+                struct in_addr addr;
+                union { ICMP_ECHO_REPLY reply; BYTE bytes[sizeof(ICMP_ECHO_REPLY) + 64]; } replyBuf;
+                PICMP_ECHO_REPLY rep = &replyBuf.reply;
+                DWORD n;
+                if (target == ip || target == base || target == base + count - 1) continue;
+                addr.s_addr = htonl(target);
+                memset(&replyBuf, 0, sizeof(replyBuf));
+                n = IcmpSendEcho(icmp, addr.s_addr, (LPVOID)payload, (WORD)sizeof(payload),
+                                 NULL, replyBuf.bytes, (DWORD)sizeof(replyBuf.bytes), 70);
+                if (n > 0 && rep->Status == IP_SUCCESS && foundCount < LAN_MAX_SCAN_IPS)
+                {
+                    DWORD raw = rep->Address;
+                    int duplicate = 0, z;
+                    for (z = 0; z < foundCount; z++) if (found[z] == raw) { duplicate = 1; break; }
+                    if (!duplicate) found[foundCount++] = raw;
+                }
+            }
+            /* Apenas uma sub-rede por pesquisa, para limitar carga e duração. */
+            goto scan_done;
+        }
+    }
+scan_done:
+    if (icmp != INVALID_HANDLE_VALUE) { IcmpCloseHandle(icmp); icmp = INVALID_HANDLE_VALUE; }
+
+    g_lanDeviceCount = 0;
+    if (foundCount > 0)
+    {
+        ULONG tableBytes = 0;
+        MIB_IPNETTABLE *table = NULL;
+        GetIpNetTable(NULL, &tableBytes, FALSE);
+        if (tableBytes > 0 && tableBytes < 4 * 1024 * 1024)
+        {
+            table = (MIB_IPNETTABLE *)malloc(tableBytes);
+            if (table && GetIpNetTable(table, &tableBytes, FALSE) == NO_ERROR)
+            {
+                for (i = 0; i < foundCount && g_lanDeviceCount < LAN_MAX_DEVICES; i++)
+                {
+                    LanDevice *d = &g_lanDevices[g_lanDeviceCount];
+                    DWORD raw = found[i];
+                    int j, z;
+                    memset(d, 0, sizeof(*d));
+                    snprintf(d->ipText, sizeof(d->ipText), "%u.%u.%u.%u",
+                             (unsigned)(raw & 0xff), (unsigned)((raw >> 8) & 0xff),
+                             (unsigned)((raw >> 16) & 0xff), (unsigned)((raw >> 24) & 0xff));
+                    strcpy_s(d->macText, sizeof(d->macText), "Indisponivel");
+                    strcpy_s(d->tipoText, sizeof(d->tipoText), "Respondeu ao ping");
+                    for (j = 0; j < (int)table->dwNumEntries; j++)
+                    {
+                        if (table->table[j].dwAddr == raw && table->table[j].dwPhysAddrLen > 0)
+                        {
+                            char mac[24] = {0};
+                            size_t off = 0;
+                            for (z = 0; z < (int)table->table[j].dwPhysAddrLen && z < 8; z++)
+                                off += (size_t)snprintf(mac + off, sizeof(mac) - off,
+                                    z ? "-%02X" : "%02X", table->table[j].bPhysAddr[z]);
+                            if (off > 0) strcpy_s(d->macText, sizeof(d->macText), mac);
+                            break;
+                        }
+                    }
+                    d->ip = raw;
+                    g_lanDeviceCount++;
+                }
+            }
+            if (table) free(table);
+        }
+        else
+        {
+            for (i = 0; i < foundCount && g_lanDeviceCount < LAN_MAX_DEVICES; i++)
+            {
+                DWORD raw = found[i];
+                LanDevice *d = &g_lanDevices[g_lanDeviceCount++];
+                memset(d, 0, sizeof(*d));
+                d->ip = raw;
+                snprintf(d->ipText, sizeof(d->ipText), "%u.%u.%u.%u",
+                         (unsigned)(raw & 0xff), (unsigned)((raw >> 8) & 0xff),
+                         (unsigned)((raw >> 16) & 0xff), (unsigned)((raw >> 24) & 0xff));
+                strcpy_s(d->macText, sizeof(d->macText), "Indisponivel");
+                strcpy_s(d->tipoText, sizeof(d->tipoText), "Respondeu ao ping");
+            }
+        }
+    }
+finish:
+    if (icmp != INVALID_HANDLE_VALUE) IcmpCloseHandle(icmp);
+    if (adapters) free(adapters);
+    InterlockedExchange(&g_lanScanRunning, 0);
+    if (hwndPai) PostMessage(hwndPai, WM_LAN_SCAN_DONE, 0, 0);
+    return 0;
+}
+
+static void LanPreencherLista(void)
+{
+    int i;
+    if (!hLanList) return;
+    ListView_DeleteAllItems(hLanList);
+    for (i = 0; i < g_lanDeviceCount; i++)
+    {
+        LVITEMA it;
+        int row;
+        ZeroMemory(&it, sizeof(it));
+        it.mask = LVIF_TEXT;
+        it.iItem = i;
+        it.pszText = g_lanDevices[i].ipText;
+        row = ListView_InsertItem(hLanList, &it);
+        if (row >= 0)
+        {
+            ListView_SetItemText(hLanList, row, 1, g_lanDevices[i].macText);
+            ListView_SetItemText(hLanList, row, 2, g_lanDevices[i].tipoText);
+        }
+    }
+    if (hLanStatus)
+    {
+        char status[160];
+        snprintf(status, sizeof(status), "Concluido: %d dispositivo(s) responderam. Alguns equipamentos podem bloquear ICMP.", g_lanDeviceCount);
+        SetWindowTextA(hLanStatus, status);
+    }
+}
+
+static void LanIniciarPesquisa(HWND hwndPai)
+{
+    DWORD tid;
+    if (InterlockedCompareExchange(&g_lanScanRunning, 1, 0) != 0) return;
+    if (hLanScan) { EnableWindow(hLanScan, FALSE); SetWindowTextA(hLanScan, "A procurar..."); }
+    if (hLanStatus) SetWindowTextA(hLanStatus, "A testar enderecos IPv4 da sub-rede local (maximo 256)...");
+    g_lanDeviceCount = 0;
+    if (hLanList) ListView_DeleteAllItems(hLanList);
+    g_lanThread = CreateThread(NULL, 0, LanScanThread, hwndPai, 0, &tid);
+    if (!g_lanThread)
+    {
+        InterlockedExchange(&g_lanScanRunning, 0);
+        if (hLanScan) { EnableWindow(hLanScan, TRUE); SetWindowTextA(hLanScan, "Procurar dispositivos"); }
+        if (hLanStatus) SetWindowTextA(hLanStatus, "Nao foi possivel iniciar a pesquisa.");
+    }
+    else CloseHandle(g_lanThread);
+    g_lanThread = NULL;
+}
+
+static void CriarPainelRedeLocal(HWND hwndPai)
+{
+    HINSTANCE hInst = GetModuleHandle(NULL);
+    LVCOLUMNA col;
+    hLanScan = CreateWindowExA(0, "BUTTON", "Procurar dispositivos",
+        WS_CHILD | BS_PUSHBUTTON, 0, 0, 150, 25, hwndPai,
+        (HMENU)(UINT_PTR)IDC_LAN_SCAN, hInst, NULL);
+    hLanStatus = CreateWindowExA(0, "STATIC", "Pesquisa IPv4 da rede local; a deteccao depende de respostas ICMP.",
+        WS_CHILD | SS_LEFT | SS_CENTERIMAGE, 0, 0, 400, 24, hwndPai,
+        (HMENU)(UINT_PTR)IDC_LAN_STATUS, hInst, NULL);
+    hLanList = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
+        WS_CHILD | WS_VSCROLL | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        0, 0, 100, 100, hwndPai, (HMENU)(UINT_PTR)IDC_LAN_LIST, hInst, NULL);
+    if (!hLanList) return;
+    ListView_SetExtendedListViewStyle(hLanList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    ListView_SetBkColor(hLanList, RGB(255,255,255));
+    ListView_SetTextBkColor(hLanList, RGB(255,255,255));
+    ListView_SetTextColor(hLanList, RGB(42,48,56));
+    ZeroMemory(&col, sizeof(col)); col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT; col.fmt = LVCFMT_LEFT;
+    col.pszText = "Endereco IPv4"; col.cx = 180; ListView_InsertColumn(hLanList, 0, &col);
+    col.pszText = "Endereco MAC"; col.cx = 200; ListView_InsertColumn(hLanList, 1, &col);
+    col.pszText = "Deteccao"; col.cx = 240; ListView_InsertColumn(hLanList, 2, &col);
+    ShowWindow(hLanScan, SW_HIDE); ShowWindow(hLanStatus, SW_HIDE); ShowWindow(hLanList, SW_HIDE);
+}
+
 static void CriarPainelLigacoes(HWND hwndPai)
 {
     LVCOLUMNA lvc;
@@ -6139,7 +6394,7 @@ static void CriarAbas(HWND hwnd)
 {
     TCITEMA item;
     const char *nomes[] = {
-        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes"};
+        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local"};
     int i;
 
     hTab = CreateWindowExA(
@@ -6159,7 +6414,7 @@ static void CriarAbas(HWND hwnd)
 
     {
         const char *navNomes[] = {
-            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes"};
+            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local"};
 
         for (i = 0; i < NUM_ABAS; i++)
         {
@@ -6229,6 +6484,7 @@ static void CriarAbas(HWND hwnd)
 
     CriarPainelProcessos(hwnd);
     CriarPainelLigacoes(hwnd);
+    CriarPainelRedeLocal(hwnd);
     CriarPainelDefinicoes(hwnd);
 
     hCompact = CreateWindowExA(
@@ -9331,7 +9587,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lParam;
 
         if (dis && dis->CtlType == ODT_BUTTON &&
-            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_DEFINICOES)
+            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_REDE_LOCAL)
         {
             DesenharBotaoNavegacao(dis);
             return TRUE;
@@ -9597,9 +9853,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         }
         return 0;
 
+    case WM_LAN_SCAN_DONE:
+        if (hLanScan) { EnableWindow(hLanScan, TRUE); SetWindowTextA(hLanScan, "Procurar dispositivos"); }
+        LanPreencherLista();
+        return 0;
+
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_LAN_SCAN && HIWORD(wParam) == BN_CLICKED)
+        {
+            LanIniciarPesquisa(hwnd);
+            return 0;
+        }
         if (LOWORD(wParam) >= TAB_RESUMO &&
-            LOWORD(wParam) <= TAB_DEFINICOES &&
+            LOWORD(wParam) <= TAB_REDE_LOCAL &&
             HIWORD(wParam) == BN_CLICKED)
         {
             int indice = LOWORD(wParam) - TAB_RESUMO;
