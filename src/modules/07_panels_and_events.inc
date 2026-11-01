@@ -3,6 +3,8 @@
 /* Painel: criacao, visibilidade, layout e despacho de eventos               */
 /* ------------------------------------------------------------------------- */
 
+static HWND hRedeExtras = NULL; /* botao que abre as ferramentas de rede (12_network_extras.inc) */
+
 static void RedeLocalMostrar(int visivel)
 {
     int m = g_redeModo;
@@ -11,6 +13,7 @@ static void RedeLocalMostrar(int visivel)
     g_redeVisivel = visivel;
     for (i = 0; i < 3; i++)
         RedeMostrarCtl(hRedeModo[i], visivel);
+    RedeMostrarCtl(hRedeExtras, visivel);
     RedeMostrarCtl(hLanScan, visivel && m == REDE_MODO_LAN);
     RedeMostrarCtl(hLanAceitar, visivel && m == REDE_MODO_LAN);
     RedeMostrarCtl(hLanStatus, visivel && m == REDE_MODO_LAN);
@@ -53,6 +56,8 @@ static void RedeLocalRedimensionar(int x, int y, int w, int h)
         MoveWindow(hRedeModo[1], x + 160, y + 3, 150, 26, TRUE);
     if (hRedeModo[2])
         MoveWindow(hRedeModo[2], x + 316, y + 3, 150, 26, TRUE);
+    if (hRedeExtras)
+        MoveWindow(hRedeExtras, x + 472, y + 3, 190, 26, TRUE);
 
     /* Dispositivos */
     if (hLanScan)
@@ -96,6 +101,7 @@ static void CriarPainelRedeLocal(HWND pai)
     hRedeModo[0] = RedeCriarCtl(pai, "BUTTON", "Dispositivos", BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP, 0, IDC_REDE_MODO_LAN);
     hRedeModo[1] = RedeCriarCtl(pai, "BUTTON", "Traceroute", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, IDC_REDE_MODO_TRACE);
     hRedeModo[2] = RedeCriarCtl(pai, "BUTTON", "Teste de DNS", BS_AUTORADIOBUTTON | BS_PUSHLIKE, 0, IDC_REDE_MODO_DNS);
+    hRedeExtras = RedeCriarCtl(pai, "BUTTON", "Ferramentas de rede...", BS_PUSHBUTTON, 0, ID_NET_EXTRAS);
 
     /* --- Dispositivos --- */
     hLanScan = RedeCriarCtl(pai, "BUTTON", "Procurar dispositivos", BS_PUSHBUTTON, 0, IDC_LAN_SCAN);
@@ -159,6 +165,7 @@ static void CriarPainelRedeLocal(HWND pai)
     if (hRedeModo[0])
         Button_SetCheck(hRedeModo[0], BST_CHECKED);
     RedeLocalMostrar(0);
+    NetExtras_Tick(); /* regista o consumo de dados desde a ultima execucao */
 }
 
 /* Devolve 1 se o comando pertencia ao painel. */
@@ -188,6 +195,9 @@ static int RedeLocalComando(HWND hwnd, UINT id, UINT codigo)
         return 1;
     case IDC_DNS_GO:
         DnsIniciar(hwnd);
+        return 1;
+    case ID_NET_EXTRAS:
+        NetExtras_Open(hwnd);
         return 1;
     }
     return 0;

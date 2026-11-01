@@ -119,6 +119,7 @@ static const IID LOCAL_IID_IWbemLocator =
 #define ID_SESSION_EXPORT 1014
 #define ID_SESSION_RESET 1015
 #define ID_SETTINGS_HELP 8021
+#define ID_NET_EXTRAS 1016 /* abre as ferramentas de rede (12_network_extras.inc) */
 
 #define OVERLAY_CLASS_NAME "WinMonOverlayClass"
 
@@ -581,6 +582,7 @@ static HistoricoMonitor historico;
 #include "modules/04_ui_and_tabs.inc"
 #include "modules/05_processes_and_connections.inc"
 #include "modules/06_local_network.inc"
+#include "modules/12_network_extras.inc" /* antes do 07: o painel chama NetExtras_* */
 #include "modules/07_panels_and_events.inc"
 #include "modules/08_sessions_logging_alerts.inc"
 #include "modules/09_style_dialogs.inc"
