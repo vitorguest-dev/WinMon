@@ -337,8 +337,6 @@ cleanup:
 /* Abas                                                                      */
 /* ------------------------------------------------------------------------- */
 
-static void RedimensionarConteudo(HWND hwnd);
-
 static void MostrarAba(int indice)
 {
     int i;
@@ -376,29 +374,19 @@ static void MostrarAba(int indice)
     if (hBtnGraphPNG)
         ShowWindow(hBtnGraphPNG, (indice >= 1 && indice <= 6) ? SW_SHOW : SW_HIDE);
 
-        /* Cartoes de memoria detalhada: visiveis apenas na aba Memoria */
+    /* painel de lista de processos: mostrar/esconder cada controlo */
     {
-        int visMem = (indice == 2) ? SW_SHOW : SW_HIDE;
-
-        if (hMemCommitted)
-            ShowWindow(hMemCommitted, visMem);
-        if (hMemCommitLimit)
-            ShowWindow(hMemCommitLimit, visMem);
-        if (hMemPageFile)
-            ShowWindow(hMemPageFile, visMem);
-        if (hMemCache)
-            ShowWindow(hMemCache, visMem);
-        if (hMemPagedPool)
-            ShowWindow(hMemPagedPool, visMem);
-        if (hMemNonPagedPool)
-            ShowWindow(hMemNonPagedPool, visMem);
-        if (hMemPageFaults)
-            ShowWindow(hMemPageFaults, visMem);
-
-        if (indice == 2) {
-            MemoriaDetalhadaAtualizar();
-            AtualizarPainelMemoria();
-        }    
+        int visProc = (indice == 7) ? SW_SHOW : SW_HIDE;
+        if (hPainelProcessos)
+            ShowWindow(hPainelProcessos, visProc);
+        if (hEditPesquisaProc)
+            ShowWindow(hEditPesquisaProc, visProc);
+        if (hLabelProcCount)
+            ShowWindow(hLabelProcCount, visProc);
+        if (hChkAgrupar)
+            ShowWindow(hChkAgrupar, visProc);
+        if (hListViewProc)
+            ShowWindow(hListViewProc, visProc);
     }
 
     /* painel de ligacoes (aba 8) */
@@ -422,7 +410,6 @@ static void MostrarAba(int indice)
     }
 
     AtualizarDefinicoesVisibilidade();
-    RedimensionarConteudo(hMainWindow);
     InvalidateRect(hMainWindow, NULL, TRUE);
 
     if (indice == 8)
@@ -500,75 +487,8 @@ static void RedimensionarConteudo(HWND hwnd)
                        rc.right - rc.left, rc.bottom - rc.top, TRUE);
 
         if (hGraphRAM)
-        {
-            int cx = rc.left;
-            int cy = rc.top;
-            int cw = rc.right - rc.left;
-            int ch = rc.bottom - rc.top;
-
-            if (abaAtual == 2)
-            {
-                int margem = 16;
-                int espacamento = 12;
-                int largura = (cw - 2 * margem - 2 * espacamento) / 3;
-
-                int x1 = cx + margem;
-                int x2 = x1 + largura + espacamento;
-                int x3 = x2 + largura + espacamento;
-
-                int y1 = cy + 16;
-                int y2 = cy + 76;
-
-                int alturaIndicador = 24;
-                int topoGrafico = cy + 140;
-                int alturaGrafico = ch - 140;
-
-                if (largura < 50)
-                    largura = 50;
-
-                if (alturaGrafico < 80)
-                    alturaGrafico = 80;
-
-                /* Commit Charge */
-                if (hMemCommitted)
-                    MoveWindow(hMemCommitted, x1, y1,
-                               largura, alturaIndicador, TRUE);
-
-                if (hMemCommitLimit)
-                    MoveWindow(hMemCommitLimit, x1, y1 + 27,
-                               largura, alturaIndicador, TRUE);
-
-                /* Page File e Cache */
-                if (hMemPageFile)
-                    MoveWindow(hMemPageFile, x2, y1 + 13,
-                               largura, alturaIndicador, TRUE);
-
-                if (hMemCache)
-                    MoveWindow(hMemCache, x3, y1 + 13,
-                               largura, alturaIndicador, TRUE);
-
-                /* Pools e Page Faults */
-                if (hMemPagedPool)
-                    MoveWindow(hMemPagedPool, x1, y2,
-                               largura, alturaIndicador, TRUE);
-
-                if (hMemNonPagedPool)
-                    MoveWindow(hMemNonPagedPool, x2, y2,
-                               largura, alturaIndicador, TRUE);
-
-                if (hMemPageFaults)
-                    MoveWindow(hMemPageFaults, x3, y2,
-                               largura, alturaIndicador, TRUE);
-
-                /* Gráfico RAM */
-                MoveWindow(hGraphRAM, cx, topoGrafico,
-                           cw, alturaGrafico, TRUE);
-            }
-            else
-            {
-                MoveWindow(hGraphRAM, cx, cy, cw, ch, TRUE);
-            }
-        }
+            MoveWindow(hGraphRAM, rc.left, rc.top,
+                       rc.right - rc.left, rc.bottom - rc.top, TRUE);
 
         if (hGraphTemp)
             MoveWindow(hGraphTemp, rc.left, rc.top,

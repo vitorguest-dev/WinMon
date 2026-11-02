@@ -541,114 +541,6 @@ static void CriarPainelDefinicoes(HWND hwndPai)
     }
 }
 
-/* Cria os controlos da aba de memoria detalhada */
-static void CriarPainelMemoria(HWND hwndPai)
-{
-    HINSTANCE hInst = GetModuleHandle(NULL);
-
-    /* Commit Charge: valor utilizado e limite */
-    hMemCommitted = CreateWindowExA(
-        0, "STATIC", "Commit Charge: -- MB",
-        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 250, 24,
-        hwndPai, NULL, hInst, NULL);
-
-    hMemCommitLimit = CreateWindowExA(
-        0, "STATIC", "Commit Limit: -- MB",
-        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 250, 24,
-        hwndPai, NULL, hInst, NULL);
-
-    /* Page File */
-    hMemPageFile = CreateWindowExA(
-        0, "STATIC", "Page File: -- %",
-        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 250, 24,
-        hwndPai, NULL, hInst, NULL);
-
-    /* Cache */
-    hMemCache = CreateWindowExA(
-        0, "STATIC", "Cache: -- MB",
-        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 250, 24,
-        hwndPai, NULL, hInst, NULL);
-
-    /* Paged Pool */
-    hMemPagedPool = CreateWindowExA(
-        0, "STATIC", "Paged Pool: -- MB",
-        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 250, 24,
-        hwndPai, NULL, hInst, NULL);
-
-    /* Non-Paged Pool */
-    hMemNonPagedPool = CreateWindowExA(
-        0, "STATIC", "Non-Paged Pool: -- MB",
-        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 250, 24,
-        hwndPai, NULL, hInst, NULL);
-
-    /* Page Faults */
-    hMemPageFaults = CreateWindowExA(
-        0, "STATIC", "Page Faults: -- /s",
-        WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 250, 24,
-        hwndPai, NULL, hInst, NULL);
-
-    /* Aplicar a fonte da interface */
-    if (hFontUI)
-    {
-        SendMessage(hMemCommitted, WM_SETFONT, (WPARAM)hFontUI, TRUE);
-        SendMessage(hMemCommitLimit, WM_SETFONT, (WPARAM)hFontUI, TRUE);
-        SendMessage(hMemPageFile, WM_SETFONT, (WPARAM)hFontUI, TRUE);
-        SendMessage(hMemCache, WM_SETFONT, (WPARAM)hFontUI, TRUE);
-        SendMessage(hMemPagedPool, WM_SETFONT, (WPARAM)hFontUI, TRUE);
-        SendMessage(hMemNonPagedPool, WM_SETFONT, (WPARAM)hFontUI, TRUE);
-        SendMessage(hMemPageFaults, WM_SETFONT, (WPARAM)hFontUI, TRUE);
-    }
-
-    /* Comecam escondidos; a aba Memoria controla a visibilidade */
-    ShowWindow(hMemCommitted, SW_HIDE);
-    ShowWindow(hMemCommitLimit, SW_HIDE);
-    ShowWindow(hMemPageFile, SW_HIDE);
-    ShowWindow(hMemCache, SW_HIDE);
-    ShowWindow(hMemPagedPool, SW_HIDE);
-    ShowWindow(hMemNonPagedPool, SW_HIDE);
-    ShowWindow(hMemPageFaults, SW_HIDE);
-}
-
-static void AtualizarPainelMemoria(void)
-{
-    char texto[128];
-
-    snprintf(texto, sizeof(texto),
-        "Commit Charge: %.2f MB", memCommittedMB);
-    SetWindowTextA(hMemCommitted, memCommittedMB >= 0.0 ? texto : "Commit Charge: -- MB");
-
-    snprintf(texto, sizeof(texto),
-        "Commit Limit: %.2f MB", memCommitLimitMB);
-    SetWindowTextA(hMemCommitLimit, memCommitLimitMB >= 0.0 ? texto : "Commit Limit: -- MB");
-
-    snprintf(texto, sizeof(texto),
-        "Page File: %.2f %%", pageFileUsagePercent);
-    SetWindowTextA(hMemPageFile, pageFileUsagePercent >= 0.0 ? texto : "Page File: -- %");
-
-    snprintf(texto, sizeof(texto),
-        "Cache: %.2f MB", memCacheMB);
-    SetWindowTextA(hMemCache, memCacheMB >= 0.0 ? texto : "Cache: -- MB");
-
-    snprintf(texto, sizeof(texto),
-        "Paged Pool: %.2f MB", memPagedPoolMB);
-    SetWindowTextA(hMemPagedPool, memPagedPoolMB >= 0.0 ? texto : "Paged Pool: -- MB");
-
-    snprintf(texto, sizeof(texto),
-        "Non-Paged Pool: %.2f MB", memNonPagedPoolMB);
-    SetWindowTextA(hMemNonPagedPool, memNonPagedPoolMB >= 0.0 ? texto : "Non-Paged Pool: -- MB");
-
-    snprintf(texto, sizeof(texto),
-        "Page Faults: %.2f /s", memPageFaultsPerSec);
-    SetWindowTextA(hMemPageFaults, memPageFaultsPerSec >= 0.0 ? texto : "Page Faults: -- /s");
-}
-
 static void CriarAbas(HWND hwnd)
 {
     TCITEMA item;
@@ -745,7 +637,6 @@ static void CriarAbas(HWND hwnd)
     CriarPainelLigacoes(hwnd);
     CriarPainelRedeLocal(hwnd);
     CriarPainelDefinicoes(hwnd);
-    CriarPainelMemoria(hwnd);
 
     hCompact = CreateWindowExA(
         0, "WinMonCompactClass", "",
