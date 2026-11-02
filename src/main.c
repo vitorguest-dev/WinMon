@@ -356,6 +356,13 @@ HWND hBtnInterval = NULL;
 HWND hBtnEstiloMain = NULL;
 HWND hGraphCPU = NULL;
 HWND hGraphRAM = NULL;
+HWND hMemCommitted = NULL;
+HWND hMemCommitLimit = NULL;
+HWND hMemPageFile = NULL;
+HWND hMemCache = NULL;
+HWND hMemPagedPool = NULL;
+HWND hMemNonPagedPool = NULL;
+HWND hMemPageFaults = NULL;
 HWND hGraphTemp = NULL;
 HWND hGraphDisk = NULL;
 HWND hGraphNet = NULL;
@@ -491,6 +498,23 @@ static int numGpuCounters[GPU_ENG_COUNT] = {0, 0, 0, 0};
 static PDH_HCOUNTER hCounterCpuFreq = NULL; /* \Processor Information(_Total)\Processor Frequency */
 static PDH_HCOUNTER hCounterCpuPerf = NULL; /* \Processor Information(_Total)\% Processor Performance */
 static PDH_HCOUNTER hCounterVram[MAX_VRAM_COUNTERS];
+/* Memoria detalhada — contadores PDH */
+static PDH_HCOUNTER hCounterMemCommitted = NULL;
+static PDH_HCOUNTER hCounterMemCommitLimit = NULL;
+static PDH_HCOUNTER hCounterPageFileUsage = NULL;
+static PDH_HCOUNTER hCounterMemCache = NULL;
+static PDH_HCOUNTER hCounterMemPagedPool = NULL;
+static PDH_HCOUNTER hCounterMemNonPagedPool = NULL;
+static PDH_HCOUNTER hCounterPageFaults = NULL;
+
+/* Valores atuais da memoria detalhada */
+static double memCommittedMB = 0.0;
+static double memCommitLimitMB = 0.0;
+static double pageFileUsagePercent = 0.0;
+static double memCacheMB = 0.0;
+static double memPagedPoolMB = 0.0;
+static double memNonPagedPoolMB = 0.0;
+static double memPageFaultsPerSec = 0.0;
 static int numVramCounters = 0;
 static double g_cpuBaseMhzReg = 0.0;     /* ~MHz do registry (fallback da frequencia base) */
 static double ultimoCpuFreqMHz = 0.0;    /* 0 = indisponivel */

@@ -143,6 +143,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
 
             CpuFreqInicializar();
             GpuMemInicializar();
+            MemoriaDetalhadaInicializar();
 
             PdhCollectQueryData(hQuery);
         }

@@ -199,6 +199,115 @@ void MonitorarSistema(char *buffer, size_t size, size_t *offset)
 }
 
 /* =========================================================================
+ * Memoria detalhada — inicializacao e recolha PDH
+ * ========================================================================= */
+
+static void MemoriaDetalhadaInicializar(void)
+{
+    PDH_STATUS status;
+
+    status = PdhAddEnglishCounterA(
+        hQuery, "\\Memory\\Committed Bytes",
+        0, &hCounterMemCommitted);
+    printf("Committed Bytes: 0x%lx\n", (unsigned long)status);
+
+    status = PdhAddEnglishCounterA(
+        hQuery, "\\Memory\\Commit Limit",
+        0, &hCounterMemCommitLimit);
+    printf("Commit Limit: 0x%lx\n", (unsigned long)status);
+
+    status = PdhAddEnglishCounterA(
+        hQuery, "\\Paging File(_Total)\\% Usage",
+        0, &hCounterPageFileUsage);
+    printf("Page File: 0x%lx\n", (unsigned long)status);
+
+    status = PdhAddEnglishCounterA(
+        hQuery, "\\Memory\\Cache Bytes",
+        0, &hCounterMemCache);
+    printf("Cache: 0x%lx\n", (unsigned long)status);
+
+    status = PdhAddEnglishCounterA(
+        hQuery, "\\Memory\\Pool Paged Bytes",
+        0, &hCounterMemPagedPool);
+    printf("Paged Pool: 0x%lx\n", (unsigned long)status);
+
+    status = PdhAddEnglishCounterA(
+        hQuery, "\\Memory\\Pool Nonpaged Bytes",
+        0, &hCounterMemNonPagedPool);
+    printf("Non-Paged Pool: 0x%lx\n", (unsigned long)status);
+
+    status = PdhAddEnglishCounterA(
+        hQuery, "\\Memory\\Page Faults/sec",
+        0, &hCounterPageFaults);
+    printf("Page Faults: 0x%lx\n", (unsigned long)status);
+}
+
+static double MemoriaLerContadorMB(PDH_HCOUNTER counter)
+{
+    PDH_FMT_COUNTERVALUE value;
+
+    if (!counter)
+        return -1.0;
+
+    if (PdhGetFormattedCounterValue(
+            counter, PDH_FMT_DOUBLE, NULL, &value) != ERROR_SUCCESS)
+        return -1.0;
+
+    if (value.CStatus != 0 &&
+    value.CStatus != 1)
+    return -1.0;
+
+if (!isfinite(value.doubleValue) ||
+    value.doubleValue < 0.0)
+    return -1.0;
+
+    return value.doubleValue / (1024.0 * 1024.0);
+}
+
+static double MemoriaLerContadorPercent(PDH_HCOUNTER counter)
+{
+    PDH_FMT_COUNTERVALUE value;
+
+    if (!counter)
+        return -1.0;
+
+    if (PdhGetFormattedCounterValue(
+            counter, PDH_FMT_DOUBLE, NULL, &value) != ERROR_SUCCESS)
+        return -1.0;
+
+    if (value.CStatus != 0 &&
+    value.CStatus != 1)
+    return -1.0;
+
+if (!isfinite(value.doubleValue) ||
+    value.doubleValue < 0.0)
+    return -1.0;
+
+    return value.doubleValue;
+}
+
+static void MemoriaDetalhadaAtualizar(void)
+{
+    memCommittedMB = MemoriaLerContadorMB(hCounterMemCommitted);
+    memCommitLimitMB = MemoriaLerContadorMB(hCounterMemCommitLimit);
+    pageFileUsagePercent = MemoriaLerContadorPercent(hCounterPageFileUsage);
+    memCacheMB = MemoriaLerContadorMB(hCounterMemCache);
+    memPagedPoolMB = MemoriaLerContadorMB(hCounterMemPagedPool);
+    memNonPagedPoolMB = MemoriaLerContadorMB(hCounterMemNonPagedPool);
+    memPageFaultsPerSec = MemoriaLerContadorPercent(hCounterPageFaults);
+    printf(
+    "Memoria: Commit=%.2f MB | Limit=%.2f MB | PageFile=%.2f%% | Cache=%.2f MB | Paged=%.2f MB | NonPaged=%.2f MB | Faults=%.2f/s\n",
+    memCommittedMB,
+    memCommitLimitMB,
+    pageFileUsagePercent,
+    memCacheMB,
+    memPagedPoolMB,
+    memNonPagedPoolMB,
+    memPageFaultsPerSec
+);
+}
+
+/* =========================================================================
  * Frequencia do CPU e memoria da GPU
  * ========================================================================= */
 
@@ -435,6 +544,8 @@ static void TextoVramCurto(char *out, size_t n)
         FormatarMemMB(ultimaVramUsadaMB, out, n);
 }
 
+static void AtualizarPainelMemoria(void);
+
 void MonitorarCPU(char *buffer, size_t size, size_t *offset)
 {
     PDH_FMT_COUNTERVALUE counterVal;
@@ -442,6 +553,9 @@ void MonitorarCPU(char *buffer, size_t size, size_t *offset)
     int i;
 
     PdhCollectQueryData(hQuery);
+    MemoriaDetalhadaAtualizar();
+
+    AtualizarPainelMemoria();
 
     if (hCounterCPU &&
         PdhGetFormattedCounterValue(hCounterCPU, PDH_FMT_DOUBLE, NULL, &counterVal) == ERROR_SUCCESS &&
