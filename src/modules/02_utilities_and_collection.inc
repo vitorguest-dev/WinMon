@@ -435,6 +435,101 @@ static void TextoVramCurto(char *out, size_t n)
         FormatarMemMB(ultimaVramUsadaMB, out, n);
 }
 
+/* Topologia do CPU (cores, threads, caches L1/L2/L3) - lida uma so vez via
+ * GetLogicalProcessorInformationEx. Os caches sao somados por nivel (1 entrada
+ * por instancia de cache), tal como o Gestor de Tarefas apresenta. */
+typedef struct
+{
+    int ok;
+    int sockets, cores, threads;
+    double l1KB, l2KB, l3KB;
+    char nome[128];
+} CpuTopologia;
+
+static CpuTopologia g_cpuTopo;
+
+static void CpuTopologiaCarregar(void)
+{
+    static int feito = 0;
+    DWORD len = 0;
+    BYTE *buf, *p;
+    HKEY hk;
+
+    if (feito)
+        return;
+    feito = 1;
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                      0, KEY_QUERY_VALUE, &hk) == ERROR_SUCCESS)
+    {
+        DWORD sz = sizeof(g_cpuTopo.nome) - 1;
+        if (RegQueryValueExA(hk, "ProcessorNameString", NULL, NULL,
+                             (BYTE *)g_cpuTopo.nome, &sz) != ERROR_SUCCESS)
+            g_cpuTopo.nome[0] = 0;
+        RegCloseKey(hk);
+    }
+
+    GetLogicalProcessorInformationEx(RelationAll, NULL, &len);
+    if (len == 0)
+        return;
+    buf = (BYTE *)malloc(len);
+    if (!buf)
+        return;
+    if (!GetLogicalProcessorInformationEx(RelationAll,
+                                          (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &len))
+    {
+        free(buf);
+        return;
+    }
+
+    for (p = buf; p < buf + len;)
+    {
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)p;
+
+        if (e->Relationship == RelationProcessorPackage)
+            g_cpuTopo.sockets++;
+        else if (e->Relationship == RelationProcessorCore)
+        {
+            WORD g;
+            g_cpuTopo.cores++;
+            for (g = 0; g < e->Processor.GroupCount; g++)
+            {
+                KAFFINITY m = e->Processor.GroupMask[g].Mask;
+                while (m)
+                {
+                    g_cpuTopo.threads += (int)(m & 1);
+                    m >>= 1;
+                }
+            }
+        }
+        else if (e->Relationship == RelationCache &&
+                 e->Cache.Type != CacheTrace)
+        {
+            double kb = (double)e->Cache.CacheSize / 1024.0;
+            if (e->Cache.Level == 1)
+                g_cpuTopo.l1KB += kb;
+            else if (e->Cache.Level == 2)
+                g_cpuTopo.l2KB += kb;
+            else if (e->Cache.Level == 3)
+                g_cpuTopo.l3KB += kb;
+        }
+        p += e->Size;
+    }
+    free(buf);
+    g_cpuTopo.ok = (g_cpuTopo.cores > 0);
+}
+
+static void FormatarCacheKB(double kb, char *out, size_t n)
+{
+    if (kb <= 0.0)
+        snprintf(out, n, "N/D");
+    else if (kb >= 1024.0)
+        snprintf(out, n, "%.1f MB", kb / 1024.0);
+    else
+        snprintf(out, n, "%.0f KB", kb);
+}
+
 void MonitorarCPU(char *buffer, size_t size, size_t *offset)
 {
     PDH_FMT_COUNTERVALUE counterVal;
@@ -467,6 +562,23 @@ void MonitorarCPU(char *buffer, size_t size, size_t *offset)
                      "Frequencia atual: %.2f GHz (base %.2f GHz, %.0f%%)\r\n",
                      ultimoCpuFreqMHz / 1000.0, ultimoCpuFreqBaseMHz / 1000.0,
                      ultimoCpuPerfPct);
+
+
+    CpuTopologiaCarregar();
+    if (g_cpuTopo.nome[0])
+        AppendFormat(buffer, size, offset, "Modelo: %s\r\n", g_cpuTopo.nome);
+    if (g_cpuTopo.ok)
+    {
+        char l1[32], l2[32], l3[32];
+        FormatarCacheKB(g_cpuTopo.l1KB, l1, sizeof(l1));
+        FormatarCacheKB(g_cpuTopo.l2KB, l2, sizeof(l2));
+        FormatarCacheKB(g_cpuTopo.l3KB, l3, sizeof(l3));
+        AppendFormat(buffer, size, offset,
+                     "Cores: %d | Threads: %d | Sockets: %d\r\n"
+                     "Cache: L1 %s | L2 %s | L3 %s\r\n",
+                     g_cpuTopo.cores, g_cpuTopo.threads, g_cpuTopo.sockets,
+                     l1, l2, l3);
+    }
 
     if (numNucleosMonitorizados > 0)
     {
@@ -550,12 +662,28 @@ void MonitorarRAM(char *buffer, size_t size, size_t *offset)
             long inicioLinha = (long)*offset;
 
             AppendFormat(buffer, size, offset, "=== [ MEMORIA RAM GERAL ] ===\r\n"
-                                               "Uso: %ld%% | Usada: %llu MB | Livre: %llu MB (Total: %llu MB)\r\n\r\n",
+                                               "Uso: %ld%% | Usada: %llu MB | Livre: %llu MB (Total: %llu MB)\r\n",
                          memInfo.dwMemoryLoad, usadaRAM, livreRAM, totalRAM);
 
             if ((double)memInfo.dwMemoryLoad > limiteRamPercent)
                 RegistarAlerta(inicioLinha, (long)*offset);
         }
+
+        {
+            PERFORMANCE_INFORMATION pi;
+            ZeroMemory(&pi, sizeof(pi));
+            pi.cb = sizeof(pi);
+            if (GetPerformanceInfo(&pi, sizeof(pi)))
+            {
+                double mb = (double)pi.PageSize / (1024.0 * 1024.0);
+                AppendFormat(buffer, size, offset,
+                             "Em cache: %.0f MB | Paginada (kernel): %.0f MB | Nao paginada (kernel): %.0f MB\r\n",
+                             (double)pi.SystemCache * mb,
+                             (double)pi.KernelPaged * mb,
+                             (double)pi.KernelNonpaged * mb);
+            }
+        }
+        AppendFormat(buffer, size, offset, "\r\n");
     }
 }
 
