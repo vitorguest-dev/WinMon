@@ -207,6 +207,7 @@ typedef struct
 typedef struct
 {
     double cpu[HISTORICO_PONTOS];
+    double cpuFreqMHz[HISTORICO_PONTOS]; /* frequencia efetiva do CPU */
     double ram[HISTORICO_PONTOS];
     double temp[HISTORICO_PONTOS];
     double diskRead[HISTORICO_PONTOS];

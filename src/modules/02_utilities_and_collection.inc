@@ -136,6 +136,7 @@ static void AdicionarHistorico(double cpu, double ram, double temp,
 
     historico.pos = (historico.pos + 1) % HISTORICO_PONTOS;
     historico.cpu[historico.pos] = cpu;
+    historico.cpuFreqMHz[historico.pos] = ultimoCpuFreqMHz > 0.0 ? ultimoCpuFreqMHz : NAN;
     historico.ram[historico.pos] = ram;
     historico.temp[historico.pos] = temp;
     historico.diskRead[historico.pos] = diskRead;

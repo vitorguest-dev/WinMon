@@ -709,6 +709,74 @@ static void DesenharPainelLatenciaWifi(HDC hdc, RECT client, RECT upper,
     SelectObject(hdc, oldFont);
 }
 
+
+/* Frequencia do CPU: escala independente no eixo direito (GHz). */
+static double CpuFreqMaxView(int start, int count)
+{
+    double maxMHz = 1000.0;
+    int i;
+    for (i = 0; i < count; i++)
+    {
+        double v = historico.cpuFreqMHz[HistoricoIndex(start + i)];
+        if (!isnan(v) && v > maxMHz)
+            maxMHz = v;
+    }
+    return ceil((maxMHz * 1.10) / 500.0) * 500.0;
+}
+
+static void DrawCpuFreqSeries(HDC hdc, RECT rc, int start, int count,
+                              double maxMHz, COLORREF color)
+{
+    HPEN pen, oldPen;
+    int i;
+    BOOL havePoint = FALSE;
+
+    if (count <= 0 || maxMHz <= 0.0)
+        return;
+
+    pen = CreatePen(PS_SOLID, 2, color);
+    if (!pen)
+        return;
+    oldPen = (HPEN)SelectObject(hdc, pen);
+
+    for (i = 0; i < count; i++)
+    {
+        double value = historico.cpuFreqMHz[HistoricoIndex(start + i)];
+        int x, y;
+        if (isnan(value) || value <= 0.0)
+        {
+            havePoint = FALSE;
+            continue;
+        }
+        if (value > maxMHz)
+            value = maxMHz;
+        x = rc.left + (count == 1 ? 0 :
+            (int)(((double)i / (double)(count - 1)) * (rc.right - rc.left)));
+        y = rc.bottom - (int)((value / maxMHz) * (rc.bottom - rc.top));
+        if (!havePoint)
+            MoveToEx(hdc, x, y, NULL);
+        else
+            LineTo(hdc, x, y);
+        havePoint = TRUE;
+    }
+
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+
+    /* Marcas do eixo secundario, em GHz. */
+    for (i = 0; i <= 4; i++)
+    {
+        char label[24];
+        double ghz = (maxMHz / 1000.0) * (1.0 - (double)i / 4.0);
+        RECT lr = {rc.right + 4, rc.top + ((rc.bottom - rc.top) * i) / 4 - 8,
+                   rc.right + 48, rc.top + ((rc.bottom - rc.top) * i) / 4 + 8};
+        snprintf(label, sizeof(label), "%.1f", ghz);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, color);
+        DrawTextA(hdc, label, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
 static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
 {
     RECT client;
@@ -742,19 +810,31 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
     {
     case GRAPH_CPU:
     {
-        names[0] = "CPU total";
+        double freqMaxMHz = CpuFreqMaxView(viewStart, viewCount);
+        names[0] = "Utilizacao (%)";
+        names[1] = "Clock (GHz)";
         colors[0] = g_mainConfig.corGraficoCpu;
-        n = 1;
+        colors[1] = RGB(220, 125, 35);
+        n = 2;
+        graph.right -= 46;
 
-        snprintf(currentText, sizeof(currentText),
-                 "Atual: %.1f%%", ultimoCpuPercent);
+        if (ultimoCpuFreqMHz > 0.0)
+            snprintf(currentText, sizeof(currentText),
+                     "Uso: %.1f%% | Clock: %.2f GHz",
+                     ultimoCpuPercent, ultimoCpuFreqMHz / 1000.0);
+        else
+            snprintf(currentText, sizeof(currentText),
+                     "Uso: %.1f%% | Clock: N/D", ultimoCpuPercent);
 
-        DrawGraphLegend(hdc, &client, "CPU", names, colors, n, currentText);
+        DrawGraphLegend(hdc, &client, "CPU — utilizacao e frequencia",
+                        names, colors, n, currentText);
         DrawAlertRegionsView(hdc, graph, historico.cpu, viewStart, viewCount,
                              100.0, limiteCpuPercent);
         DrawGraphGrid(hdc, graph, 100.0);
         DrawSeriesView(hdc, graph, historico.cpu, viewStart, viewCount,
                        100.0, colors[0], g_mainConfig.espessuraLinhas);
+        DrawCpuFreqSeries(hdc, graph, viewStart, viewCount,
+                          freqMaxMHz, colors[1]);
 
         if (numNucleosMonitorizados > 0 && client.bottom > 430)
         {
@@ -1038,13 +1118,20 @@ static void PaintGraph(HWND hwnd, HDC hdc, GraphType type)
                 break;
             }
 
-            snprintf(tip, sizeof(tip), "%02d:%02d:%02d | %.1f", st.wHour, st.wMinute, st.wSecond, val);
+            if (type == GRAPH_CPU && !isnan(historico.cpuFreqMHz[idx]) &&
+                historico.cpuFreqMHz[idx] > 0.0)
+                snprintf(tip, sizeof(tip), "%02d:%02d:%02d | %.1f%% | %.2f GHz",
+                         st.wHour, st.wMinute, st.wSecond, val,
+                         historico.cpuFreqMHz[idx] / 1000.0);
+            else
+                snprintf(tip, sizeof(tip), "%02d:%02d:%02d | %.1f",
+                         st.wHour, st.wMinute, st.wSecond, val);
 
-            RECT tipRect = {view->hoverX + 10, graph.top + 10, view->hoverX + 140, graph.top + 30};
+            RECT tipRect = {view->hoverX + 10, graph.top + 10, view->hoverX + 220, graph.top + 30};
             /* Prevenir que a tooltip saia pelo limite direito do ecrã */
             if (tipRect.right > client.right)
             {
-                tipRect.left = view->hoverX - 140;
+                tipRect.left = view->hoverX - 220;
                 tipRect.right = view->hoverX - 10;
             }
             FillRect(hdc, &tipRect, (HBRUSH)GetStockObject(WHITE_BRUSH));
