@@ -751,6 +751,138 @@ static void nx_tool_usage(HWND w)
 }
 
 /* ------------------------------------------------------------------ */
+/* Ferramenta 4: estatisticas de protocolo (TCP/UDP/IP, IPv4 e IPv6)  */
+/* ------------------------------------------------------------------ */
+
+static void nx_tool_protostats(HWND w)
+{
+    static const ULONG fam[2] = {AF_INET, AF_INET6};
+    static const char *nome[2] = {"IPv4", "IPv6"};
+    int i;
+
+    nx_post(w, "Contadores acumulados desde o arranque do Windows");
+    for (i = 0; i < 2; i++)
+    {
+        MIB_TCPSTATS ts;
+        MIB_UDPSTATS us;
+        MIB_IPSTATS ips;
+        double ret = 0.0;
+
+        nx_post(w, "");
+        nx_post(w, "=== %s ===", nome[i]);
+        if (GetTcpStatisticsEx(&ts, fam[i]) == NO_ERROR)
+        {
+            if (ts.dwOutSegs)
+                ret = 100.0 * (double)ts.dwRetransSegs / (double)ts.dwOutSegs;
+            nx_post(w, "TCP  ligacoes ativas: %lu   abertas (ativas/passivas): %lu / %lu",
+                    (unsigned long)ts.dwCurrEstab, (unsigned long)ts.dwActiveOpens, (unsigned long)ts.dwPassiveOpens);
+            nx_post(w, "TCP  segmentos recebidos/enviados: %lu / %lu   retransmitidos: %lu (%.2f%%)",
+                    (unsigned long)ts.dwInSegs, (unsigned long)ts.dwOutSegs, (unsigned long)ts.dwRetransSegs, ret);
+            nx_post(w, "TCP  falhas de ligacao: %lu   resets: %lu   erros de entrada: %lu",
+                    (unsigned long)ts.dwAttemptFails, (unsigned long)ts.dwEstabResets, (unsigned long)ts.dwInErrs);
+        }
+        if (GetUdpStatisticsEx(&us, fam[i]) == NO_ERROR)
+            nx_post(w, "UDP  datagramas recebidos/enviados: %lu / %lu   sem porta: %lu   erros: %lu",
+                    (unsigned long)us.dwInDatagrams, (unsigned long)us.dwOutDatagrams,
+                    (unsigned long)us.dwNoPorts, (unsigned long)us.dwInErrors);
+        if (GetIpStatisticsEx(&ips, fam[i]) == NO_ERROR)
+            nx_post(w, "IP   pacotes recebidos/pedidos: %lu / %lu   descartados (in/out): %lu / %lu   erros de cabecalho: %lu",
+                    (unsigned long)ips.dwInReceives, (unsigned long)ips.dwOutRequests,
+                    (unsigned long)ips.dwInDiscards, (unsigned long)ips.dwOutDiscards,
+                    (unsigned long)ips.dwInHdrErrors);
+    }
+    nx_post(w, "");
+    nx_post(w, "Dica: retransmissao acima de ~2%% ou descartes a subir indicam rede/Wi-Fi com problemas.");
+}
+
+/* ------------------------------------------------------------------ */
+/* Ferramenta 5: Wake-on-LAN (1 pacote UDP de 102 bytes)              */
+/* ------------------------------------------------------------------ */
+
+static int nx_parse_mac(const char *s, unsigned char mac[6])
+{
+    int n = 0, nib = 0, cur = 0;
+
+    for (; *s && *s != ' ' && *s != '\t'; s++)
+    {
+        if (*s == ':' || *s == '-')
+        {
+            if (nib != 2 || n >= 5)
+                return 0;
+            mac[n++] = (unsigned char)cur;
+            nib = 0;
+            cur = 0;
+        }
+        else if (isxdigit((unsigned char)*s))
+        {
+            if (nib >= 2)
+                return 0;
+            cur = cur * 16 + (isdigit((unsigned char)*s) ? *s - '0' : (tolower((unsigned char)*s) - 'a' + 10));
+            nib++;
+        }
+        else
+            return 0;
+    }
+    if (nib != 2 || n != 5)
+        return 0;
+    mac[n] = (unsigned char)cur;
+    return 1;
+}
+
+static void nx_tool_wol(HWND w, const char *arg)
+{
+    unsigned char mac[6], pkt[102];
+    char bc[64] = "255.255.255.255";
+    const char *p = arg;
+    SOCKET s;
+    struct sockaddr_in to;
+    BOOL on = TRUE;
+    int i, r;
+
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (!nx_parse_mac(p, mac))
+    {
+        nx_post(w, "MAC invalido. Use o formato AA:BB:CC:DD:EE:FF (ou com '-').");
+        nx_post(w, "Opcional: segundo valor com o broadcast da sub-rede, ex.: AA:BB:CC:DD:EE:FF 192.168.1.255");
+        return;
+    }
+    while (*p && *p != ' ' && *p != '\t')
+        p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p)
+        sscanf(p, "%63s", bc);
+    memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET;
+    to.sin_port = htons(9);
+    to.sin_addr.s_addr = inet_addr(bc);
+    if (to.sin_addr.s_addr == INADDR_NONE && strcmp(bc, "255.255.255.255") != 0)
+    {
+        nx_post(w, "Endereco de broadcast invalido: %s", bc);
+        return;
+    }
+    memset(pkt, 0xFF, 6);
+    for (i = 0; i < 16; i++)
+        memcpy(pkt + 6 + i * 6, mac, 6);
+    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET)
+    {
+        nx_post(w, "Falha ao criar o socket (erro %d).", WSAGetLastError());
+        return;
+    }
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&on, sizeof on);
+    r = sendto(s, (const char *)pkt, (int)sizeof pkt, 0, (struct sockaddr *)&to, (int)sizeof to);
+    closesocket(s);
+    if (r == (int)sizeof pkt)
+        nx_post(w, "Pacote magic enviado para %02X:%02X:%02X:%02X:%02X:%02X via %s:9",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], bc);
+    else
+        nx_post(w, "Falha ao enviar (erro %d).", WSAGetLastError());
+    nx_post(w, "O PC de destino tem de ter Wake-on-LAN ativo na BIOS e na placa de rede.");
+}
+
+/* ------------------------------------------------------------------ */
 /* Thread de trabalho                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -773,6 +905,12 @@ static DWORD WINAPI nx_thread(LPVOID p)
         case 2:
             nx_tool_scan(w, j->arg);
             break;
+        case 4:
+            nx_tool_protostats(w);
+            break;
+        case 5:
+            nx_tool_wol(w, j->arg);
+            break;        
         default:
             break;
         }
@@ -793,17 +931,19 @@ static DWORD WINAPI nx_thread(LPVOID p)
 
 static void nx_update_hint(void)
 {
-    static const char *hints[] = {
+        static const char *hints[] = {
         "Sem argumentos: mostra as placas ativas, IPs, gateway e DNS.",
         "Hosts separados por virgula. Vazio = gateway, 1.1.1.1 e 8.8.8.8.",
         "host [portas]  ex.: 192.168.1.1 22,80,443,8000-8010  (vazio = portas comuns; so IPs privados)",
-        "Sem argumentos: dados recebidos/enviados hoje e neste mes."};
+        "Sem argumentos: dados recebidos/enviados hoje e neste mes.",
+        "Sem argumentos: contadores TCP/UDP/IP (retransmissoes, erros, descartes).",
+        "MAC [broadcast]  ex.: AA:BB:CC:DD:EE:FF  ou  AA:BB:CC:DD:EE:FF 192.168.1.255"};
     int t = (int)SendMessageA(nxTool, CB_GETCURSEL, 0, 0);
 
-    if (t < 0 || t > 3)
+    if (t < 0 || t > 5)
         t = 0;
     SetWindowTextA(nxHint, hints[t]);
-    EnableWindow(nxArg, t == 1 || t == 2);
+    EnableWindow(nxArg, t == 1 || t == 2 || t == 5);
 }
 
 static void nx_run(HWND hwnd)
@@ -861,7 +1001,8 @@ static LRESULT CALLBACK nx_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HINSTANCE hi = GetModuleHandleA(NULL);
         HFONT fUi = hFontUI ? hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         HFONT fMono = hFontMonitor ? hFontMonitor : (HFONT)GetStockObject(ANSI_FIXED_FONT);
-        static const char *nomes[] = {"Adaptadores", "Monitor de hosts", "Scan de portas", "Consumo de dados"};
+        static const char *nomes[] = {"Adaptadores", "Monitor de hosts", "Scan de portas", "Consumo de dados",
+                              "Estatisticas de protocolo", "Wake-on-LAN"};
         int i;
 
         nxTool = CreateWindowExA(0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
@@ -876,7 +1017,7 @@ static LRESULT CALLBACK nx_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                     ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
                                 0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_NX_OUT, hi, NULL);
-        for (i = 0; i < 4; i++)
+        for (i = 0; i < 6; i++)
             SendMessageA(nxTool, CB_ADDSTRING, 0, (LPARAM)nomes[i]);
         SendMessageA(nxTool, CB_SETCURSEL, 0, 0);
         SendMessageA(nxOut, EM_SETLIMITTEXT, 2000000, 0);
