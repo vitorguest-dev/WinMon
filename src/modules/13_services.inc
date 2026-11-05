@@ -449,6 +449,9 @@ static BOOL WM_ServiceContainsText(
     return FALSE;
 }
 
+static LRESULT CALLBACK WM_ServicesListSubclass(
+       HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+
 /* ============================================================
    CRIAR LISTVIEW
    ============================================================ */
@@ -481,6 +484,8 @@ static HWND WM_ServicesCreateListView(HWND parent)
         LVS_EX_GRIDLINES |
         LVS_EX_DOUBLEBUFFER);
 
+    SetWindowSubclass(list, WM_ServicesListSubclass, 1, 0);    
+
     LVCOLUMNA column = {0};
 
     column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -490,7 +495,7 @@ static HWND WM_ServicesCreateListView(HWND parent)
     ListView_InsertColumn(list, 0, &column);
 
     column.cx = 250;
-    column.pszText = "Serviço";
+    column.pszText = "Servico";
     ListView_InsertColumn(list, 1, &column);
 
     column.cx = 130;
@@ -936,6 +941,812 @@ static WinServiceInfo *WM_ServicesGetSelected(HWND list)
 static WinServiceInfo *WM_ServicesGetSelectedVisible(void)
 {
     return WM_ServicesGetSelected(hListViewServicos);
+}
+
+
+#define IDM_SVC_START 6200
+#define IDM_SVC_STOP 6201
+#define IDM_SVC_RESTART 6202
+#define IDM_SVC_PAUSE 6203
+#define IDM_SVC_RESUME 6204
+#define IDM_SVC_BOOT_AUTO 6205
+#define IDM_SVC_BOOT_MANUAL 6206
+#define IDM_SVC_BOOT_OFF 6207
+#define IDM_SVC_DETAILS 6208
+#define IDM_SVC_COPY_NAME 6209
+#define IDM_SVC_COPY_DISPLAY 6210
+#define IDM_SVC_COPY_PATH 6211
+#define IDM_SVC_OPEN_FOLDER 6212
+#define IDM_SVC_KILL_PROC 6213
+#define IDM_SVC_OPEN_MSC 6214
+#define IDM_SVC_REFRESH 6215
+
+/* ---------- utilitarios ---------- */
+
+static void WM_SvcShowError(HWND owner, DWORD code)
+{
+    char sys[512] = {0};
+    char msg[700];
+
+    FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, code, 0, sys, (DWORD)sizeof(sys), NULL);
+
+    snprintf(
+        msg, sizeof(msg),
+        "A operacao falhou (erro %lu).\n\n%s%s",
+        (unsigned long)code,
+        sys,
+        (code == ERROR_ACCESS_DENIED)
+            ? "\nExecute o WinMon como administrador."
+            : "");
+
+    MessageBoxA(owner, msg, "WinMon - Servicos", MB_OK | MB_ICONWARNING);
+}
+
+/* Acrescenta texto formatado ao fim de buf sem estourar o tamanho. */
+static void WM_SvcAppend(char *buf, size_t size, const char *fmt, ...)
+{
+    size_t len = strlen(buf);
+    va_list ap;
+
+    if (len + 1 >= size)
+        return;
+
+    va_start(ap, fmt);
+    vsnprintf(buf + len, size - len, fmt, ap);
+    va_end(ap);
+}
+
+static void WM_SvcCopyText(HWND owner, const char *text)
+{
+    if (text == NULL || text[0] == '\0')
+        return;
+
+    size_t len = strlen(text) + 1;
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, len);
+
+    if (mem == NULL)
+        return;
+
+    char *dst = (char *)GlobalLock(mem);
+
+    if (dst == NULL)
+    {
+        GlobalFree(mem);
+        return;
+    }
+
+    memcpy(dst, text, len);
+    GlobalUnlock(mem);
+
+    if (!OpenClipboard(owner))
+    {
+        GlobalFree(mem);
+        return;
+    }
+
+    EmptyClipboard();
+
+    if (SetClipboardData(CF_TEXT, mem) == NULL)
+        GlobalFree(mem);
+
+    CloseClipboard();
+}
+
+/* Extrai o .exe de uma linha de comando de servico
+ * ("C:\x\a.exe" -k grupo   ou   C:\x\a.exe -k grupo). */
+static void WM_SvcExtractExePath(const char *cmd, char *out, size_t outSize)
+{
+    char tmp[MAX_SERVICE_PATH];
+
+    if (out == NULL || outSize < 2)
+        return;
+
+    out[0] = '\0';
+
+    if (cmd == NULL || cmd[0] == '\0')
+        return;
+
+    if (cmd[0] == '"')
+    {
+        const char *end = strchr(cmd + 1, '"');
+        size_t len = end ? (size_t)(end - (cmd + 1)) : strlen(cmd + 1);
+
+        if (len >= sizeof(tmp))
+            len = sizeof(tmp) - 1;
+
+        memcpy(tmp, cmd + 1, len);
+        tmp[len] = '\0';
+    }
+    else
+    {
+        lstrcpynA(tmp, cmd, (int)sizeof(tmp));
+
+        for (char *p = tmp; *p; p++)
+        {
+            if (_strnicmp(p, ".exe", 4) == 0)
+            {
+                p[4] = '\0';
+                break;
+            }
+        }
+    }
+
+    DWORD n = ExpandEnvironmentStringsA(tmp, out, (DWORD)outSize);
+
+    if (n == 0 || n > (DWORD)outSize)
+        lstrcpynA(out, tmp, (int)outSize);
+}
+
+/* ---------- estado ao vivo ---------- */
+
+/* Le o estado atual no SCM e atualiza a estrutura. */
+static BOOL WM_SvcQueryLive(WinServiceInfo *svc, DWORD *accepted)
+{
+    BOOL ok = FALSE;
+
+    if (accepted)
+        *accepted = 0;
+
+    if (svc == NULL)
+        return FALSE;
+
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+
+    if (scm == NULL)
+        return FALSE;
+
+    SC_HANDLE h = OpenServiceA(scm, svc->serviceName, SERVICE_QUERY_STATUS);
+
+    if (h != NULL)
+    {
+        SERVICE_STATUS_PROCESS ssp;
+        DWORD needed = 0;
+
+        if (QueryServiceStatusEx(
+                h, SC_STATUS_PROCESS_INFO,
+                (LPBYTE)&ssp, sizeof(ssp), &needed))
+        {
+            svc->state = ssp.dwCurrentState;
+            svc->processId = ssp.dwProcessId;
+            svc->win32ExitCode = ssp.dwWin32ExitCode;
+
+            if (accepted)
+                *accepted = ssp.dwControlsAccepted;
+
+            ok = TRUE;
+        }
+
+        CloseServiceHandle(h);
+    }
+
+    CloseServiceHandle(scm);
+
+    return ok;
+}
+
+static BOOL WM_SvcWaitState(SC_HANDLE h, DWORD wanted, DWORD timeoutMs)
+{
+    SERVICE_STATUS_PROCESS ssp;
+    DWORD needed = 0;
+    DWORD start = GetTickCount();
+
+    for (;;)
+    {
+        if (!QueryServiceStatusEx(
+                h, SC_STATUS_PROCESS_INFO,
+                (LPBYTE)&ssp, sizeof(ssp), &needed))
+            return FALSE;
+
+        if (ssp.dwCurrentState == wanted)
+            return TRUE;
+
+        if (GetTickCount() - start >= timeoutMs)
+            return FALSE;
+
+        Sleep(200);
+    }
+}
+
+/* Repovoa a lista (respeitando o filtro) e volta a selecionar o servico. */
+static void WM_SvcRepopulate(DWORD index)
+{
+    if (hListViewServicos == NULL)
+        return;
+
+    WM_ServicesApplyFilter();
+
+    int n = ListView_GetItemCount(hListViewServicos);
+
+    for (int i = 0; i < n; i++)
+    {
+        LVITEMA it = {0};
+
+        it.mask = LVIF_PARAM;
+        it.iItem = i;
+
+        if (ListView_GetItem(hListViewServicos, &it) &&
+            (DWORD)it.lParam == index)
+        {
+            ListView_SetItemState(
+                hListViewServicos, i,
+                LVIS_SELECTED | LVIS_FOCUSED,
+                LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(hListViewServicos, i, FALSE);
+            break;
+        }
+    }
+}
+
+/* ---------- acoes ---------- */
+
+static void WM_SvcRunAction(HWND owner, WinServiceInfo *svc, UINT cmd)
+{
+    DWORD access = SERVICE_QUERY_STATUS;
+    DWORD err = ERROR_SUCCESS;
+    SERVICE_STATUS ss;
+    DWORD index = (DWORD)(svc - g_services);
+
+    switch (cmd)
+    {
+    case IDM_SVC_START:
+        access |= SERVICE_START;
+        break;
+    case IDM_SVC_STOP:
+        access |= SERVICE_STOP;
+        break;
+    case IDM_SVC_RESTART:
+        access |= SERVICE_START | SERVICE_STOP;
+        break;
+    default:
+        access |= SERVICE_PAUSE_CONTINUE;
+        break;
+    }
+
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+
+    if (scm == NULL)
+    {
+        WM_SvcShowError(owner, GetLastError());
+        return;
+    }
+
+    SC_HANDLE h = OpenServiceA(scm, svc->serviceName, access);
+
+    if (h == NULL)
+    {
+        DWORD e = GetLastError();
+
+        CloseServiceHandle(scm);
+        WM_SvcShowError(owner, e);
+        return;
+    }
+
+    HCURSOR oldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+
+    switch (cmd)
+    {
+    case IDM_SVC_START:
+        if (!StartServiceA(h, 0, NULL) &&
+            GetLastError() != ERROR_SERVICE_ALREADY_RUNNING)
+            err = GetLastError();
+        else
+            WM_SvcWaitState(h, SERVICE_RUNNING, 10000);
+        break;
+
+    case IDM_SVC_STOP:
+        if (!ControlService(h, SERVICE_CONTROL_STOP, &ss))
+            err = GetLastError();
+        else
+            WM_SvcWaitState(h, SERVICE_STOPPED, 10000);
+        break;
+
+    case IDM_SVC_RESTART:
+        if (!ControlService(h, SERVICE_CONTROL_STOP, &ss))
+            err = GetLastError();
+        else if (!WM_SvcWaitState(h, SERVICE_STOPPED, 15000))
+            err = ERROR_SERVICE_REQUEST_TIMEOUT;
+        else if (!StartServiceA(h, 0, NULL))
+            err = GetLastError();
+        else
+            WM_SvcWaitState(h, SERVICE_RUNNING, 10000);
+        break;
+
+    case IDM_SVC_PAUSE:
+        if (!ControlService(h, SERVICE_CONTROL_PAUSE, &ss))
+            err = GetLastError();
+        else
+            WM_SvcWaitState(h, SERVICE_PAUSED, 5000);
+        break;
+
+    case IDM_SVC_RESUME:
+        if (!ControlService(h, SERVICE_CONTROL_CONTINUE, &ss))
+            err = GetLastError();
+        else
+            WM_SvcWaitState(h, SERVICE_RUNNING, 5000);
+        break;
+    }
+
+    SetCursor(oldCursor);
+
+    CloseServiceHandle(h);
+    CloseServiceHandle(scm);
+
+    WM_SvcQueryLive(svc, NULL);
+    WM_SvcRepopulate(index);
+
+    if (err != ERROR_SUCCESS)
+        WM_SvcShowError(owner, err);
+}
+
+static void WM_SvcSetStartType(HWND owner, WinServiceInfo *svc, DWORD type)
+{
+    DWORD index = (DWORD)(svc - g_services);
+
+    if (type == SERVICE_DISABLED)
+    {
+        if (MessageBoxA(
+                owner,
+                "Desativar este servico impede-o de arrancar.\n\nContinuar?",
+                "WinMon - Servicos",
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+            return;
+    }
+
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+
+    if (scm == NULL)
+    {
+        WM_SvcShowError(owner, GetLastError());
+        return;
+    }
+
+    SC_HANDLE h = OpenServiceA(scm, svc->serviceName, SERVICE_CHANGE_CONFIG);
+
+    if (h == NULL)
+    {
+        DWORD e = GetLastError();
+
+        CloseServiceHandle(scm);
+        WM_SvcShowError(owner, e);
+        return;
+    }
+
+    BOOL ok = ChangeServiceConfigA(
+        h,
+        SERVICE_NO_CHANGE,
+        type,
+        SERVICE_NO_CHANGE,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    DWORD e = ok ? ERROR_SUCCESS : GetLastError();
+
+    CloseServiceHandle(h);
+    CloseServiceHandle(scm);
+
+    if (ok)
+    {
+        svc->startType = type;
+        WM_SvcRepopulate(index);
+    }
+    else
+    {
+        WM_SvcShowError(owner, e);
+    }
+}
+
+static void WM_SvcKillProcess(HWND owner, const WinServiceInfo *svc)
+{
+    if (svc->processId == 0)
+        return;
+
+    char msg[512];
+
+    snprintf(
+        msg, sizeof(msg),
+        "Terminar o processo com PID %lu?\n\n"
+        "Se for um svchost.exe partilhado, todos os servicos "
+        "que correm nele serao terminados.",
+        (unsigned long)svc->processId);
+
+    if (MessageBoxA(
+            owner, msg, "WinMon - Servicos",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+
+    HANDLE hp = OpenProcess(PROCESS_TERMINATE, FALSE, svc->processId);
+
+    if (hp == NULL)
+    {
+        WM_SvcShowError(owner, GetLastError());
+        return;
+    }
+
+    if (!TerminateProcess(hp, 1))
+        WM_SvcShowError(owner, GetLastError());
+
+    CloseHandle(hp);
+}
+
+static void WM_SvcOpenFolder(HWND owner, const WinServiceInfo *svc)
+{
+    char exe[MAX_SERVICE_PATH];
+    char args[MAX_SERVICE_PATH + 32];
+
+    WM_SvcExtractExePath(svc->binaryPath, exe, sizeof(exe));
+
+    if (exe[0] == '\0' || GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES)
+    {
+        MessageBoxA(
+            owner, "Nao foi possivel localizar o ficheiro do servico.",
+            "WinMon - Servicos", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    snprintf(args, sizeof(args), "/select,\"%s\"", exe);
+    ShellExecuteA(owner, "open", "explorer.exe", args, NULL, SW_SHOWNORMAL);
+}
+
+/* ---------- janela de detalhes ---------- */
+
+static void WM_SvcShowDetails(HWND owner, WinServiceInfo *svc)
+{
+    char text[4096];
+    DWORD accepted = 0;
+
+    text[0] = '\0';
+
+    BOOL live = WM_SvcQueryLive(svc, &accepted);
+
+    WM_ServiceLoadDescription(svc);
+
+    WM_SvcAppend(text, sizeof(text),
+                 "Nome interno: %s\nNome: %s\n",
+                 svc->serviceName, svc->displayName);
+
+    if (svc->description[0] != '\0')
+        WM_SvcAppend(text, sizeof(text), "Descricao: %s\n", svc->description);
+
+    WM_SvcAppend(text, sizeof(text),
+                 "\nEstado: %s\n", WM_ServiceStateText(svc->state));
+
+    if (svc->processId != 0)
+        WM_SvcAppend(text, sizeof(text),
+                     "PID: %lu\n", (unsigned long)svc->processId);
+
+    if (svc->win32ExitCode != 0)
+        WM_SvcAppend(text, sizeof(text),
+                     "Ultimo codigo de saida: %lu\n",
+                     (unsigned long)svc->win32ExitCode);
+
+    if (live)
+        WM_SvcAppend(text, sizeof(text), "Aceita: %s%s\n",
+                     (accepted & SERVICE_ACCEPT_STOP) ? "parar " : "",
+                     (accepted & SERVICE_ACCEPT_PAUSE_CONTINUE) ? "pausar/retomar" : "");
+
+    /* configuracao */
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+    SC_HANDLE h = scm ? OpenServiceA(scm, svc->serviceName,
+                                     SERVICE_QUERY_CONFIG)
+                      : NULL;
+
+    if (h != NULL)
+    {
+        DWORD required = 0;
+
+        QueryServiceConfigA(h, NULL, 0, &required);
+
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
+            required >= sizeof(QUERY_SERVICE_CONFIGA))
+        {
+            QUERY_SERVICE_CONFIGA *cfg =
+                (QUERY_SERVICE_CONFIGA *)malloc(required);
+
+            if (cfg != NULL)
+            {
+                if (QueryServiceConfigA(h, cfg, required, &required))
+                {
+                    DWORD kind = cfg->dwServiceType &
+                                 (SERVICE_WIN32_OWN_PROCESS |
+                                  SERVICE_WIN32_SHARE_PROCESS);
+                    const char *kindText =
+                        (kind == SERVICE_WIN32_OWN_PROCESS)     ? "Processo proprio"
+                        : (kind == SERVICE_WIN32_SHARE_PROCESS) ? "Processo partilhado"
+                                                                : "Outro";
+
+                    WM_SvcAppend(text, sizeof(text), "\nTipo: %s\n", kindText);
+
+                    WM_SvcAppend(text, sizeof(text), "Arranque: %s",
+                                 WM_ServiceStartTypeText(cfg->dwStartType));
+
+                    if (cfg->dwStartType == SERVICE_AUTO_START)
+                    {
+                        DWORD need2 = 0;
+                        SERVICE_DELAYED_AUTO_START_INFO di = {0};
+
+                        if (QueryServiceConfig2A(
+                                h, SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                                (LPBYTE)&di, sizeof(di), &need2) &&
+                            di.fDelayedAutostart)
+                        {
+                            WM_SvcAppend(text, sizeof(text), " (atrasado)");
+                        }
+                    }
+
+                    WM_SvcAppend(text, sizeof(text), "\n");
+
+                    if (cfg->lpServiceStartName != NULL)
+                        WM_SvcAppend(text, sizeof(text),
+                                     "Conta: %s\n", cfg->lpServiceStartName);
+
+                    if (cfg->lpBinaryPathName != NULL)
+                        WM_SvcAppend(text, sizeof(text),
+                                     "Executavel: %s\n", cfg->lpBinaryPathName);
+
+                    if (cfg->lpLoadOrderGroup != NULL &&
+                        cfg->lpLoadOrderGroup[0] != '\0')
+                        WM_SvcAppend(text, sizeof(text),
+                                     "Grupo: %s\n", cfg->lpLoadOrderGroup);
+
+                    if (cfg->lpDependencies != NULL &&
+                        cfg->lpDependencies[0] != '\0')
+                    {
+                        const char *p = cfg->lpDependencies;
+                        int first = 1;
+
+                        WM_SvcAppend(text, sizeof(text), "Dependencias: ");
+
+                        while (*p)
+                        {
+                            WM_SvcAppend(text, sizeof(text), "%s%s",
+                                         first ? "" : ", ",
+                                         (*p == '+') ? p + 1 : p);
+                            first = 0;
+                            p += strlen(p) + 1;
+                        }
+
+                        WM_SvcAppend(text, sizeof(text), "\n");
+                    }
+                }
+
+                free(cfg);
+            }
+        }
+
+        CloseServiceHandle(h);
+    }
+
+    if (scm != NULL)
+        CloseServiceHandle(scm);
+
+    MessageBoxA(owner, text, "WinMon - Detalhes do servico",
+                MB_OK | MB_ICONINFORMATION);
+}
+
+/* ---------- o menu ---------- */
+
+static void WM_ServicesShowContextMenu(HWND list, POINT pt)
+{
+    WinServiceInfo *svc = WM_ServicesGetSelected(list);
+
+    if (svc == NULL)
+        return;
+
+    HWND owner = GetParent(list);
+    DWORD index = (DWORD)(svc - g_services);
+    DWORD accepted = 0;
+    DWORD oldState = svc->state;
+    DWORD oldPid = svc->processId;
+
+    /* estado atual (a lista pode estar desatualizada) */
+    BOOL live = WM_SvcQueryLive(svc, &accepted);
+
+    if (svc->state != oldState || svc->processId != oldPid)
+        WM_SvcRepopulate(index);
+
+    DWORD st = svc->state;
+    BOOL canStart = live && st == SERVICE_STOPPED &&
+                    svc->startType != SERVICE_DISABLED;
+    BOOL canStop = live &&
+                   (st == SERVICE_RUNNING || st == SERVICE_PAUSED) &&
+                   (accepted & SERVICE_ACCEPT_STOP);
+    BOOL canRestart = canStop && st == SERVICE_RUNNING;
+    BOOL canPause = live && st == SERVICE_RUNNING &&
+                    (accepted & SERVICE_ACCEPT_PAUSE_CONTINUE);
+    BOOL canResume = live && st == SERVICE_PAUSED &&
+                     (accepted & SERVICE_ACCEPT_PAUSE_CONTINUE);
+
+    HMENU menu = CreatePopupMenu();
+    HMENU boot = CreatePopupMenu();
+
+    if (menu == NULL || boot == NULL)
+    {
+        if (menu)
+            DestroyMenu(menu);
+        if (boot)
+            DestroyMenu(boot);
+        return;
+    }
+
+    AppendMenuA(boot, MF_STRING, IDM_SVC_BOOT_AUTO, "Automatico");
+    AppendMenuA(boot, MF_STRING, IDM_SVC_BOOT_MANUAL, "Manual");
+    AppendMenuA(boot, MF_STRING, IDM_SVC_BOOT_OFF, "Desativado");
+
+    if (svc->startType == SERVICE_AUTO_START)
+        CheckMenuRadioItem(boot, IDM_SVC_BOOT_AUTO, IDM_SVC_BOOT_OFF,
+                           IDM_SVC_BOOT_AUTO, MF_BYCOMMAND);
+    else if (svc->startType == SERVICE_DEMAND_START)
+        CheckMenuRadioItem(boot, IDM_SVC_BOOT_AUTO, IDM_SVC_BOOT_OFF,
+                           IDM_SVC_BOOT_MANUAL, MF_BYCOMMAND);
+    else if (svc->startType == SERVICE_DISABLED)
+        CheckMenuRadioItem(boot, IDM_SVC_BOOT_AUTO, IDM_SVC_BOOT_OFF,
+                           IDM_SVC_BOOT_OFF, MF_BYCOMMAND);
+
+    AppendMenuA(menu, MF_STRING | (canStart ? MF_ENABLED : MF_GRAYED),
+                IDM_SVC_START, "Iniciar");
+    AppendMenuA(menu, MF_STRING | (canStop ? MF_ENABLED : MF_GRAYED),
+                IDM_SVC_STOP, "Parar");
+    AppendMenuA(menu, MF_STRING | (canRestart ? MF_ENABLED : MF_GRAYED),
+                IDM_SVC_RESTART, "Reiniciar");
+    AppendMenuA(menu, MF_STRING | (canPause ? MF_ENABLED : MF_GRAYED),
+                IDM_SVC_PAUSE, "Pausar");
+    AppendMenuA(menu, MF_STRING | (canResume ? MF_ENABLED : MF_GRAYED),
+                IDM_SVC_RESUME, "Retomar");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_POPUP, (UINT_PTR)boot, "Tipo de arranque");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_SVC_DETAILS, "Detalhes...");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_SVC_COPY_NAME, "Copiar nome interno");
+    AppendMenuA(menu, MF_STRING, IDM_SVC_COPY_DISPLAY, "Copiar nome do servico");
+    AppendMenuA(menu, MF_STRING | (svc->binaryPath[0] ? MF_ENABLED : MF_GRAYED),
+                IDM_SVC_COPY_PATH, "Copiar caminho do executavel");
+    AppendMenuA(menu, MF_STRING | (svc->binaryPath[0] ? MF_ENABLED : MF_GRAYED),
+                IDM_SVC_OPEN_FOLDER, "Abrir localizacao do ficheiro");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+
+    {
+        char killText[64];
+
+        snprintf(killText, sizeof(killText),
+                 "Terminar processo (PID %lu)...",
+                 (unsigned long)svc->processId);
+
+        AppendMenuA(menu,
+                    MF_STRING | (svc->processId != 0 ? MF_ENABLED : MF_GRAYED),
+                    IDM_SVC_KILL_PROC, killText);
+    }
+
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, IDM_SVC_OPEN_MSC, "Abrir services.msc");
+    AppendMenuA(menu, MF_STRING, IDM_SVC_REFRESH, "Atualizar lista");
+
+    SetForegroundWindow(owner);
+
+    UINT cmd = (UINT)TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+        pt.x, pt.y, 0, owner, NULL);
+
+    PostMessageA(owner, WM_NULL, 0, 0);
+
+    DestroyMenu(menu); /* destroi tambem o submenu */
+
+    switch (cmd)
+    {
+    case IDM_SVC_START:
+    case IDM_SVC_STOP:
+    case IDM_SVC_RESTART:
+    case IDM_SVC_PAUSE:
+    case IDM_SVC_RESUME:
+        WM_SvcRunAction(owner, svc, cmd);
+        break;
+
+    case IDM_SVC_BOOT_AUTO:
+        WM_SvcSetStartType(owner, svc, SERVICE_AUTO_START);
+        break;
+    case IDM_SVC_BOOT_MANUAL:
+        WM_SvcSetStartType(owner, svc, SERVICE_DEMAND_START);
+        break;
+    case IDM_SVC_BOOT_OFF:
+        WM_SvcSetStartType(owner, svc, SERVICE_DISABLED);
+        break;
+
+    case IDM_SVC_DETAILS:
+        WM_SvcShowDetails(owner, svc);
+        break;
+
+    case IDM_SVC_COPY_NAME:
+        WM_SvcCopyText(owner, svc->serviceName);
+        break;
+    case IDM_SVC_COPY_DISPLAY:
+        WM_SvcCopyText(owner, svc->displayName);
+        break;
+    case IDM_SVC_COPY_PATH:
+        WM_SvcCopyText(owner, svc->binaryPath);
+        break;
+
+    case IDM_SVC_OPEN_FOLDER:
+        WM_SvcOpenFolder(owner, svc);
+        break;
+
+    case IDM_SVC_KILL_PROC:
+        WM_SvcKillProcess(owner, svc);
+        WM_SvcQueryLive(svc, NULL);
+        WM_SvcRepopulate(index);
+        break;
+
+    case IDM_SVC_OPEN_MSC:
+        ShellExecuteA(owner, "open", "services.msc", NULL, NULL, SW_SHOWNORMAL);
+        break;
+
+    case IDM_SVC_REFRESH:
+        WM_ServicesRefreshPanel(); /* svc fica invalido: nada a fazer depois */
+        break;
+    }
+}
+
+/* ---------- subclass do ListView (apanha o botao direito) ---------- */
+
+static LRESULT CALLBACK WM_ServicesListSubclass(
+    HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR subId, DWORD_PTR refData)
+{
+    (void)refData;
+
+    switch (msg)
+    {
+    case WM_CONTEXTMENU:
+    {
+        POINT pt;
+        int item;
+
+        if (GET_X_LPARAM(lParam) == -1 && GET_Y_LPARAM(lParam) == -1)
+        {
+            /* teclado (Shift+F10 / tecla de menu): usa o item selecionado */
+            RECT r;
+
+            item = ListView_GetNextItem(hwnd, -1, LVNI_SELECTED);
+
+            if (item < 0 || !ListView_GetItemRect(hwnd, item, &r, LVIR_LABEL))
+                return 0;
+
+            pt.x = r.left + 8;
+            pt.y = r.bottom;
+            ClientToScreen(hwnd, &pt);
+        }
+        else
+        {
+            LVHITTESTINFO hit = {0};
+
+            pt.x = GET_X_LPARAM(lParam);
+            pt.y = GET_Y_LPARAM(lParam);
+
+            hit.pt = pt;
+            ScreenToClient(hwnd, &hit.pt);
+
+            item = ListView_HitTest(hwnd, &hit);
+
+            if (item < 0)
+                return 0;
+
+            ListView_SetItemState(
+                hwnd, item,
+                LVIS_SELECTED | LVIS_FOCUSED,
+                LVIS_SELECTED | LVIS_FOCUSED);
+        }
+
+        WM_ServicesShowContextMenu(hwnd, pt);
+        return 0;
+    }
+
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, WM_ServicesListSubclass, subId);
+        break;
+    }
+
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 /* ============================================================
