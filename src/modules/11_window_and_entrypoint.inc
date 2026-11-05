@@ -238,7 +238,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lParam;
 
         if (dis && dis->CtlType == ODT_BUTTON &&
-            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_REDE_LOCAL)
+            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_SERVICOS)
         {
             DesenharBotaoNavegacao(dis);
             return TRUE;
@@ -512,10 +512,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         return 0;
 
     case WM_COMMAND:
+        if (WM_ServicesCommand(
+            hwnd,
+            LOWORD(wParam),
+            HIWORD(wParam)))
+            return 0;
         if (RedeLocalComando(hwnd, LOWORD(wParam), HIWORD(wParam)))
             return 0;
         if (LOWORD(wParam) >= TAB_RESUMO &&
-            LOWORD(wParam) <= TAB_REDE_LOCAL &&
+            LOWORD(wParam) <= TAB_SERVICOS &&
             HIWORD(wParam) == BN_CLICKED)
         {
             int indice = LOWORD(wParam) - TAB_RESUMO;
@@ -815,6 +820,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
             hRichEditLib = NULL;
         }
 
+        WM_ServicesCleanup();
         PostQuitMessage(0);
         return 0;
     }

@@ -545,7 +545,7 @@ static void CriarAbas(HWND hwnd)
 {
     TCITEMA item;
     const char *nomes[] = {
-        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local"};
+        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos"};
     int i;
 
     hTab = CreateWindowExA(
@@ -565,7 +565,7 @@ static void CriarAbas(HWND hwnd)
 
     {
         const char *navNomes[] = {
-            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local"};
+            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos"};
 
         for (i = 0; i < NUM_ABAS; i++)
         {
@@ -637,6 +637,8 @@ static void CriarAbas(HWND hwnd)
     CriarPainelLigacoes(hwnd);
     CriarPainelRedeLocal(hwnd);
     CriarPainelDefinicoes(hwnd);
+
+    WM_ServicesCreatePanel(hwnd);
 
     hCompact = CreateWindowExA(
         0, "WinMonCompactClass", "",

@@ -408,6 +408,7 @@ static void MostrarAba(int indice)
     {
         RedeLocalMostrar(indice == 10);
     }
+    WM_ServicesShow(indice == 11);
 
     AtualizarDefinicoesVisibilidade();
     InvalidateRect(hMainWindow, NULL, TRUE);
@@ -595,6 +596,7 @@ static void RedimensionarConteudo(HWND hwnd)
             int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
             RedeLocalRedimensionar(cx, cy, cw, ch);
         }
+        WM_ServicesLayout(&rc);
     }
 }
 

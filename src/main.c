@@ -91,6 +91,10 @@ static const IID LOCAL_IID_IWbemLocator =
 #define ID_TRAY_ICON 1
 #define MAX_CORES 64
 #define MAX_GPU_COUNTERS 256
+#define MAX_SERVICE_NAME     256
+#define MAX_SERVICE_DISPLAY  256
+#define MAX_SERVICE_PATH     1024
+#define MAX_SERVICE_DESC     512
 
 /* Tipos de engine GPU (mesmos que o Gestor de Tarefas monitoriza) */
 #define GPU_ENG_3D 0
@@ -120,6 +124,7 @@ static const IID LOCAL_IID_IWbemLocator =
 #define ID_SESSION_RESET 1015
 #define ID_SETTINGS_HELP 8021
 #define ID_NET_EXTRAS 1016 /* abre as ferramentas de rede (12_network_extras.inc) */
+
 
 #define OVERLAY_CLASS_NAME "WinMonOverlayClass"
 
@@ -153,8 +158,9 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_LIGACOES 2009
 #define TAB_DEFINICOES 2010
 #define TAB_REDE_LOCAL 2011
+#define TAB_SERVICOS 2012
 #define NAV_LARGURA 188
-#define NUM_ABAS 11
+#define NUM_ABAS 12
 #define ALERT_HISTORY_MAX 100
 
 #define MAX_TEMP_ZONAS 16
@@ -293,6 +299,25 @@ typedef struct
     int restaurarComDuploClique;
 } TrayConfig;
 
+typedef struct
+{
+    char serviceName[MAX_SERVICE_NAME];
+    char displayName[MAX_SERVICE_DISPLAY];
+
+    DWORD state;
+    DWORD processId;
+    DWORD win32ExitCode;
+    DWORD startType;
+
+    char binaryPath[MAX_SERVICE_PATH];
+    char description[MAX_SERVICE_DESC];
+
+} WinServiceInfo;
+
+static WinServiceInfo *g_services = NULL;
+static DWORD g_servicesCount = 0;
+static DWORD g_servicesCapacity = 0;
+
 static MainUiConfig g_mainConfig = {
     .fonteEdit = {
         .lfHeight = -15,
@@ -391,11 +416,25 @@ HWND hLabelProcCount = NULL;   /* "N processos" */
 #define IDC_SETTINGS_COMPACT 8019
 #define IDC_SETTINGS_ALERT_HISTORY 8020
 #define IDC_ALERT_HISTORY_CLEAR 8030
+#define IDC_SERVICES_LIST 6100
+#define IDC_SERVICES_SEARCH     6101
+#define IDC_SERVICES_REFRESH    6102
+#define IDC_SERVICES_COUNT      6103
+#define IDC_SERVICES_DETAILS    6104
+#define IDC_SERVICES_FILTER     6105
 
 static HWND hSettingsTitle = NULL;
 static HWND hSettingsHeaders[SETTINGS_SECTIONS] = {NULL};
 static HWND hSettingsActions[SETTINGS_SECTIONS][4] = {{NULL}};
 static int g_settingsOpen[SETTINGS_SECTIONS] = {1, 1, 1, 1, 1};
+
+static HWND hPainelServicos = NULL;
+static HWND hListViewServicos = NULL;
+static HWND hEditPesquisaServicos = NULL;
+static HWND hLabelServicosCount = NULL;
+static HWND hLabelServicosDetails = NULL;
+static HWND hBtnRefreshServicos = NULL;
+static HWND hComboFiltroServicos = NULL;
 
 /* estado de ordenação do ListView */
 static int g_lvSortCol = 1;  /* 0=Nome,1=PID,2=CPU,3=RAM,4=Download,5=Upload */
@@ -575,6 +614,12 @@ static int ovTotalH = 0;
 static ProcessoInfo listaProcessos[MAX_PROCESSES];
 static HistoricoMonitor historico;
 
+static void WM_ServicesCreatePanel(HWND hwndPai);
+static void WM_ServicesShow(int visible);
+static void WM_ServicesLayout(const RECT *rc);
+static int WM_ServicesCommand(HWND hwnd, UINT id, UINT codigo);
+static void WM_ServicesCleanup(void);
+static BOOL WM_ServicesRefreshPanel(void);
 
 /* Implementacao organizada por areas; compilada como uma unica unidade (ver README). */
 #include "modules/01_network_status.inc"
@@ -589,3 +634,4 @@ static HistoricoMonitor historico;
 #include "modules/09_style_dialogs.inc"
 #include "modules/10_overlay.inc"
 #include "modules/11_window_and_entrypoint.inc"
+#include "modules/13_services.inc"
