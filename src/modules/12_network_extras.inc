@@ -883,6 +883,210 @@ static void nx_tool_wol(HWND w, const char *arg)
 }
 
 /* ------------------------------------------------------------------ */
+/* Ferramenta 6: MTU do caminho (ICMP com DF + pesquisa binaria)      */
+/* ------------------------------------------------------------------ */
+
+#ifndef NX_IP_FLAG_DF
+#define NX_IP_FLAG_DF 0x02
+#endif
+#define NX_MTU_MAX_PAYLOAD 1472 /* 1500 - 20 (IP) - 8 (ICMP) */
+
+static int nx_mtu_probe(HANDLE icmp, ULONG addr, const unsigned char *data, int payload,
+                        unsigned char *reply, DWORD rsz)
+{
+    IP_OPTION_INFORMATION opt;
+    DWORD n;
+
+    memset(&opt, 0, sizeof opt);
+    opt.Ttl = 128;
+    opt.Flags = NX_IP_FLAG_DF;
+    n = IcmpSendEcho(icmp, addr, (LPVOID)data, (WORD)payload, &opt, reply, rsz, 1000);
+    return n > 0 && ((ICMP_ECHO_REPLY *)reply)->Status == IP_SUCCESS;
+}
+
+static void nx_tool_mtu(HWND w, const char *arg)
+{
+    char host[64] = "1.1.1.1", ip[16];
+    struct in_addr ia;
+    unsigned char data[NX_MTU_MAX_PAYLOAD];
+    unsigned char *reply;
+    DWORD rsz = (DWORD)(sizeof(ICMP_ECHO_REPLY) + NX_MTU_MAX_PAYLOAD + 64);
+    HANDLE icmp;
+    int lo = 32, hi = NX_MTU_MAX_PAYLOAD, probes = 2;
+
+    if (arg)
+        sscanf(arg, "%63s", host); /* vazio: mantem 1.1.1.1 */
+    if (!nx_resolve_v4(host, &ia))
+    {
+        nx_post(w, "Nao foi possivel resolver '%s' (so IPv4).", host);
+        return;
+    }
+    inet_ntop(AF_INET, &ia, ip, sizeof ip);
+    icmp = IcmpCreateFile();
+    if (icmp == INVALID_HANDLE_VALUE)
+    {
+        nx_post(w, "Falha ao abrir o canal ICMP.");
+        return;
+    }
+    reply = (unsigned char *)malloc(rsz);
+    if (!reply)
+    {
+        IcmpCloseHandle(icmp);
+        return;
+    }
+    memset(data, 'a', sizeof data);
+
+    nx_post(w, "MTU do caminho para %s (%s)...", host, ip);
+    if (!nx_mtu_probe(icmp, ia.s_addr, data, 32, reply, rsz))
+        nx_post(w, "O destino nao responde a ICMP (ou bloqueia-o): impossivel medir.");
+    else
+    {
+        if (nx_mtu_probe(icmp, ia.s_addr, data, NX_MTU_MAX_PAYLOAD, reply, rsz))
+            lo = NX_MTU_MAX_PAYLOAD;
+        else
+        {
+            while (hi - lo > 1 && !nxCancel)
+            {
+                int mid = (lo + hi) / 2;
+                probes++;
+                if (nx_mtu_probe(icmp, ia.s_addr, data, mid, reply, rsz))
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+        }
+        if (!nxCancel)
+        {
+            int mtu = lo + 28;
+            IP_ADAPTER_ADDRESSES *ads = nx_get_adapters(), *a;
+            char nome[64];
+
+            nx_post(w, "");
+            nx_post(w, "MTU do caminho: %d bytes  (payload maximo %d + 28 de cabecalhos, %d sondas)", mtu, lo, probes);
+            if (mtu >= 1500)
+                nx_post(w, "Normal para Ethernet: nada a corrigir.");
+            else if (mtu >= 1480)
+                nx_post(w, "Ligeiramente abaixo de 1500 (ex.: PPPoE = 1492): normal em muitas ligacoes.");
+            else
+                nx_post(w, "Bem abaixo do normal (VPN/tunel?): pode causar paginas que bloqueiam ou ficam lentas.");
+            for (a = ads; a; a = a->Next)
+            {
+                if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+                    !a->FirstGatewayAddress)
+                    continue;
+                nx_w2a(a->FriendlyName, nome, sizeof nome);
+                nx_post(w, "Interface local %-24s MTU %lu", nome, (unsigned long)a->Mtu);
+            }
+            free(ads);
+        }
+    }
+    free(reply);
+    IcmpCloseHandle(icmp);
+}
+
+/* ------------------------------------------------------------------ */
+/* Ferramenta 7: tabela de rotas (IPv4 + IPv6)                        */
+/* ------------------------------------------------------------------ */
+
+static int nx_inet_text(const SOCKADDR_INET *a, char *out, size_t cap)
+{
+    out[0] = 0;
+    if (a->si_family == AF_INET)
+        return inet_ntop(AF_INET, (void *)&a->Ipv4.sin_addr, out, cap) != NULL;
+    if (a->si_family == AF_INET6)
+        return inet_ntop(AF_INET6, (void *)&a->Ipv6.sin6_addr, out, cap) != NULL;
+    return 0;
+}
+
+static int nx_inet_is_zero(const SOCKADDR_INET *a)
+{
+    if (a->si_family == AF_INET)
+        return a->Ipv4.sin_addr.s_addr == 0;
+    if (a->si_family == AF_INET6)
+    {
+        const unsigned char *b = a->Ipv6.sin6_addr.u.Byte;
+        int i;
+        for (i = 0; i < 16; i++)
+            if (b[i])
+                return 0;
+    }
+    return 1;
+}
+
+static IP_ADAPTER_ADDRESSES *nx_find_if(IP_ADAPTER_ADDRESSES *list, ULONG idx, int v6)
+{
+    IP_ADAPTER_ADDRESSES *a;
+    for (a = list; a; a = a->Next)
+        if ((v6 ? a->Ipv6IfIndex : a->IfIndex) == idx)
+            return a;
+    return NULL;
+}
+
+static void nx_routes_family(HWND w, ADDRESS_FAMILY fam, IP_ADAPTER_ADDRESSES *ads)
+{
+    PMIB_IPFORWARD_TABLE2 t = NULL;
+    ULONG i;
+    int defaults = 0;
+
+    if (GetIpForwardTable2(fam, &t) != NO_ERROR || !t)
+    {
+        nx_post(w, "Nao foi possivel ler a tabela de rotas.");
+        return;
+    }
+    nx_post(w, "%-44s %-30s %-8s %s", "Destino", "Proximo salto", "Metrica", "Interface");
+    for (i = 0; i < t->NumEntries; i++)
+    {
+        const MIB_IPFORWARD_ROW2 *r = &t->Table[i];
+        IP_ADAPTER_ADDRESSES *a = nx_find_if(ads, r->InterfaceIndex, fam == AF_INET6);
+        char dst[64], via[64], pfx[80], nome[64];
+        int isdef = r->DestinationPrefix.PrefixLength == 0;
+
+        if (a && a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        if (fam == AF_INET)
+        {
+            DWORD h = ntohl(r->DestinationPrefix.Prefix.Ipv4.sin_addr.s_addr);
+            if ((h >> 28) == 0xE || h == 0xFFFFFFFF) /* multicast / broadcast */
+                continue;
+        }
+        else if (r->DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte[0] == 0xFF) /* ff00::/8 */
+            continue;
+        if (r->DestinationPrefix.PrefixLength == (fam == AF_INET ? 32 : 128)) /* rotas de host (os teus proprios IPs) */
+            continue;
+        nx_inet_text(&r->DestinationPrefix.Prefix, dst, sizeof dst);
+        snprintf(pfx, sizeof pfx, "%s/%u", dst, (unsigned)r->DestinationPrefix.PrefixLength);
+        if (nx_inet_is_zero(&r->NextHop))
+            snprintf(via, sizeof via, "(diretamente ligado)");
+        else
+            nx_inet_text(&r->NextHop, via, sizeof via);
+        if (a)
+            nx_w2a(a->FriendlyName, nome, sizeof nome);
+        else
+            snprintf(nome, sizeof nome, "if%lu", (unsigned long)r->InterfaceIndex);
+        if (isdef)
+            defaults++;
+        nx_post(w, "%-44s %-30s %-8lu %s%s", pfx, via, (unsigned long)r->Metric, nome,
+                isdef ? "   <- predefinida" : "");
+    }
+    FreeMibTable(t);
+    if (defaults > 1)
+        nx_post(w, "Aviso: %d rotas predefinidas; ganha a de menor metrica total (rota + interface).", defaults);
+}
+
+static void nx_tool_routes(HWND w)
+{
+    IP_ADAPTER_ADDRESSES *ads = nx_get_adapters();
+
+    nx_post(w, "=== IPv4 ===");
+    nx_routes_family(w, AF_INET, ads);
+    nx_post(w, "");
+    nx_post(w, "=== IPv6 ===");
+    nx_routes_family(w, AF_INET6, ads);
+    nx_post(w, "");
+    nx_post(w, "Notas: rotas de loopback, multicast e broadcast omitidas; a metrica mostrada e so a da rota (a total soma a da interface).");
+}
+
+/* ------------------------------------------------------------------ */
 /* Thread de trabalho                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -910,7 +1114,13 @@ static DWORD WINAPI nx_thread(LPVOID p)
             break;
         case 5:
             nx_tool_wol(w, j->arg);
-            break;        
+            break;   
+        case 6:
+            nx_tool_mtu(w, j->arg);
+            break;
+        case 7:
+            nx_tool_routes(w);
+            break;     
         default:
             break;
         }
@@ -937,13 +1147,15 @@ static void nx_update_hint(void)
         "host [portas]  ex.: 192.168.1.1 22,80,443,8000-8010  (vazio = portas comuns; so IPs privados)",
         "Sem argumentos: dados recebidos/enviados hoje e neste mes.",
         "Sem argumentos: contadores TCP/UDP/IP (retransmissoes, erros, descartes).",
-        "MAC [broadcast]  ex.: AA:BB:CC:DD:EE:FF  ou  AA:BB:CC:DD:EE:FF 192.168.1.255"};
+        "MAC [broadcast]  ex.: AA:BB:CC:DD:EE:FF  ou  AA:BB:CC:DD:EE:FF 192.168.1.255",
+        "Host destino (vazio = 1.1.1.1). Descobre o maior pacote que passa sem fragmentar.",
+        "Sem argumentos: rotas IPv4/IPv6 com proximo salto, metrica e interface."};
     int t = (int)SendMessageA(nxTool, CB_GETCURSEL, 0, 0);
 
-    if (t < 0 || t > 5)
+    if (t < 0 || t > 7)
         t = 0;
     SetWindowTextA(nxHint, hints[t]);
-    EnableWindow(nxArg, t == 1 || t == 2 || t == 5);
+    EnableWindow(nxArg, t == 1 || t == 2 || t == 5 || t == 6);
 }
 
 static void nx_run(HWND hwnd)
@@ -1002,7 +1214,7 @@ static LRESULT CALLBACK nx_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HFONT fUi = hFontUI ? hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         HFONT fMono = hFontMonitor ? hFontMonitor : (HFONT)GetStockObject(ANSI_FIXED_FONT);
         static const char *nomes[] = {"Adaptadores", "Monitor de hosts", "Scan de portas", "Consumo de dados",
-                              "Estatisticas de protocolo", "Wake-on-LAN"};
+                              "Estatisticas de protocolo", "Wake-on-LAN", "MTU do caminho", "Tabela de rotas"};
         int i;
 
         nxTool = CreateWindowExA(0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
@@ -1017,7 +1229,7 @@ static LRESULT CALLBACK nx_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                     ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
                                 0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_NX_OUT, hi, NULL);
-        for (i = 0; i < 6; i++)
+        for (i = 0; i < 8; i++)
             SendMessageA(nxTool, CB_ADDSTRING, 0, (LPARAM)nomes[i]);
         SendMessageA(nxTool, CB_SETCURSEL, 0, 0);
         SendMessageA(nxOut, EM_SETLIMITTEXT, 2000000, 0);
