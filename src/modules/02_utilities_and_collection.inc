@@ -10,6 +10,15 @@ static void EnviarBalloon(const char *titulo, const char *msg)
         (ULONGLONG)BALLOON_COOLDOWN_SEGUNDOS * 1000ULL)
         return;
 
+    /* Com o overlay ativo, a notificacao e apresentada logo abaixo dele.
+       Sem overlay, mantem-se o balloon tradicional da area de notificacao. */
+    if (overlayAtivo && hOverlay)
+    {
+        MostrarAlertaAbaixoOverlay(titulo, msg);
+        ultimoBalloonTick = agora;
+        return;
+    }
+
     if (!trayIconAtivo)
     {
         Shell_NotifyIconA(NIM_ADD, &nid);

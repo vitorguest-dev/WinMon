@@ -25,6 +25,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[0].mostrarVram = 0;
     ovPerfis[0].mostrarFreq = 0;
     ovPerfis[0].clickThrough = 1;
+    ovPerfis[0].modoTransparente = 0;
     ovPerfis[0].corBg = RGB(14, 14, 16);
     ovPerfis[0].corBorda = RGB(60, 63, 70);
     ovPerfis[0].corTextoLabel = RGB(100, 190, 255);
@@ -51,6 +52,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[1].mostrarVram = 0;
     ovPerfis[1].mostrarFreq = 0;
     ovPerfis[1].clickThrough = 0;
+    ovPerfis[1].modoTransparente = 0;
     ovPerfis[1].corBg = RGB(20, 22, 26);
     ovPerfis[1].corBorda = RGB(70, 75, 85);
     ovPerfis[1].corTextoLabel = RGB(120, 200, 255);
@@ -77,6 +79,7 @@ static void InicializarPerfisOverlay(void)
     ovPerfis[2].mostrarVram = 0;
     ovPerfis[2].mostrarFreq = 0;
     ovPerfis[2].clickThrough = 0;
+    ovPerfis[2].modoTransparente = 0;
     ovPerfis[2].corBg = RGB(14, 14, 16);
     ovPerfis[2].corBorda = RGB(60, 63, 70);
     ovPerfis[2].corTextoLabel = RGB(100, 190, 255);
@@ -149,6 +152,8 @@ static void GravarPerfisOverlay(void)
         RegSetValueExA(hk, "MostrarFreq", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
         v = (DWORD)ovPerfis[i].clickThrough;
         RegSetValueExA(hk, "ClickThrough", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+        v = (DWORD)ovPerfis[i].modoTransparente;
+        RegSetValueExA(hk, "ModoTransparente", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
 
         v = (DWORD)ovPerfis[i].corBg;
         RegSetValueExA(hk, "CorBg", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
@@ -247,6 +252,8 @@ static void CarregarPerfisOverlay(void)
             ovPerfis[i].mostrarFreq = (int)v;
         if (RegQueryValueExA(hk, "ClickThrough", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].clickThrough = (int)v;
+        if (RegQueryValueExA(hk, "ModoTransparente", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
+            ovPerfis[i].modoTransparente = (int)v;
 
         if (RegQueryValueExA(hk, "CorBg", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS)
             ovPerfis[i].corBg = (COLORREF)v;
@@ -279,8 +286,7 @@ static void CarregarPerfisOverlay(void)
             ovPerfis[i].fontePt = OV_FONT_MIN;
         if (ovPerfis[i].fontePt > OV_FONT_MAX)
             ovPerfis[i].fontePt = OV_FONT_MAX;
-        if (ovPerfis[i].opacidade < 30)
-            ovPerfis[i].opacidade = 30;
+        /* 0 = totalmente transparente; 255 = totalmente opaco. */
         if (ovPerfis[i].fonteNome[0] == '\0')
             strncpy_s(ovPerfis[i].fonteNome, sizeof(ovPerfis[i].fonteNome), "Consolas", _TRUNCATE);
 
@@ -300,11 +306,21 @@ static void AtivarPerfil(int idx)
 
     if (hOverlay && overlayAtivo)
     {
-        SetLayeredWindowAttributes(hOverlay, 0, OV_OPACIDADE, LWA_ALPHA);
+        AplicarAtributosOverlay();
         AplicarClickThrough();
         RecalcOverlaySize();
         InvalidateRect(hOverlay, NULL, FALSE);
     }
+}
+
+static void AplicarAtributosOverlay(void)
+{
+    if (!hOverlay) return;
+    if (ovPerfis[ovPerfilActivo].modoTransparente)
+        SetLayeredWindowAttributes(hOverlay, ovPerfis[ovPerfilActivo].corBg,
+                                   OV_OPACIDADE, LWA_ALPHA | LWA_COLORKEY);
+    else
+        SetLayeredWindowAttributes(hOverlay, 0, OV_OPACIDADE, LWA_ALPHA);
 }
 
 static void AplicarClickThrough(void)
@@ -320,7 +336,7 @@ static void AplicarClickThrough(void)
         ex &= ~WS_EX_TRANSPARENT;
 
     SetWindowLongPtr(hOverlay, GWL_EXSTYLE, ex);
-    SetLayeredWindowAttributes(hOverlay, 0, OV_OPACIDADE, LWA_ALPHA);
+    AplicarAtributosOverlay();
 }
 
 typedef struct
@@ -1000,6 +1016,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 
     case WM_DESTROY:
         KillTimer(hwnd, OVERLAY_ALERT_TIMER);
+        if (hOverlayToast) DestroyWindow(hOverlayToast);
         overlayAlertaVisivel = 0;
         hOverlay = NULL;
         overlayAtivo = 0;
@@ -1037,6 +1054,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg,
 #define IDC_OV_SEPARADORES 4023
 #define IDC_OV_BORDERW 4024
 #define IDC_OV_MONITOR 4025
+#define IDC_OV_TRANSPARENTE 4030
 
 static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
                                                  WPARAM wParam, LPARAM lParam)
@@ -1086,6 +1104,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
         CheckDlgButton(hDlg, IDC_OV_VRAM, OV_VRAM ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_FREQ, OV_FREQ ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, OV_CLICKTHRU ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_OV_TRANSPARENTE, ovPerfis[ovPerfilActivo].modoTransparente ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[ovPerfilActivo].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[ovPerfilActivo].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
         snprintf(buf, sizeof(buf), "%d", ovPerfis[ovPerfilActivo].espessuraBorda);
@@ -1121,6 +1140,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
                 CheckDlgButton(hDlg, IDC_OV_VRAM, ovPerfis[sel].mostrarVram ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_FREQ, ovPerfis[sel].mostrarFreq ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_CLICKTHRU, ovPerfis[sel].clickThrough ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(hDlg, IDC_OV_TRANSPARENTE, ovPerfis[sel].modoTransparente ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_BARRAS, ovPerfis[sel].mostrarBarras ? BST_CHECKED : BST_UNCHECKED);
                 CheckDlgButton(hDlg, IDC_OV_SEPARADORES, ovPerfis[sel].mostrarSeparadores ? BST_CHECKED : BST_UNCHECKED);
                 snprintf(buf, sizeof(buf), "%d", ovPerfis[sel].espessuraBorda);
@@ -1254,8 +1274,8 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
             GetDlgItemTextA(hDlg, IDC_OV_OPACITY, buf, sizeof(buf));
             {
                 int op = atoi(buf);
-                if (op < 30)
-                    op = 30;
+                if (op < 0)
+                    op = 0;
                 if (op > 255)
                     op = 255;
                 ovPerfis[sel].opacidade = (BYTE)op;
@@ -1269,6 +1289,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
             ovPerfis[sel].mostrarVram = (IsDlgButtonChecked(hDlg, IDC_OV_VRAM) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarFreq = (IsDlgButtonChecked(hDlg, IDC_OV_FREQ) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].clickThrough = (IsDlgButtonChecked(hDlg, IDC_OV_CLICKTHRU) == BST_CHECKED) ? 1 : 0;
+            ovPerfis[sel].modoTransparente = (IsDlgButtonChecked(hDlg, IDC_OV_TRANSPARENTE) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarBarras = (IsDlgButtonChecked(hDlg, IDC_OV_BARRAS) == BST_CHECKED) ? 1 : 0;
             ovPerfis[sel].mostrarSeparadores = (IsDlgButtonChecked(hDlg, IDC_OV_SEPARADORES) == BST_CHECKED) ? 1 : 0;
             GetDlgItemTextA(hDlg, IDC_OV_BORDERW, buf, sizeof(buf));
@@ -1313,7 +1334,7 @@ static INT_PTR CALLBACK DialogoConfigOverlayProc(HWND hDlg, UINT uMsg,
 
 static void MostrarDialogoConfigOverlay(HWND hwndPai)
 {
-    static WORD dlgBuf[1024];
+    static WORD dlgBuf[1400];
     WORD *p = dlgBuf;
 
 #define WRITE_STR_W(s)             \
@@ -1351,11 +1372,11 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     DLGTEMPLATE *dt = (DLGTEMPLATE *)p;
     dt->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT;
     dt->dwExtendedStyle = 0;
-    dt->cdit = 39;
+    dt->cdit = 40;
     dt->x = 0;
     dt->y = 0;
     dt->cx = 280;
-    dt->cy = 259;
+    dt->cy = 289;
     p += sizeof(DLGTEMPLATE) / sizeof(WORD);
     *p++ = 0;
     *p++ = 0;
@@ -1379,7 +1400,7 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 82, 61, 40, 10, -1, 0x0082, L"Nome:");
     ADD_CTRL(WS_CHILD | WS_VISIBLE | WS_BORDER, 0, 120, 59, 115, 12, IDC_OV_FONTNAME, 0x0081, L"");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 78, 75, 10, -1, 0x0082, L"Opac. (30-255):");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 78, 75, 10, -1, 0x0082, L"Opac. (0-255):");
     ADD_CTRL(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 0, 90, 76, 35, 12, IDC_OV_OPACITY, 0x0081, L"");
 
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 96, 38, 12, IDC_OV_NET, 0x0080, L"Rede");
@@ -1391,32 +1412,85 @@ static void MostrarDialogoConfigOverlay(HWND hwndPai)
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 47, 113, 85, 12, IDC_OV_FREQ, 0x0080, L"Frequ\u00EAncia CPU");
 
     ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 128, 226, 12, IDC_OV_CLICKTHRU, 0x0080, L"Click-through (cliques passam para janelas por baixo)");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 7, 141, 226, 12, IDC_OV_TRANSPARENTE, 0x0080, L"Modo transparente (remove a cor de fundo)");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 147, 70, 13, IDC_OV_BTN_COR_BG, 0x0080, L"Cor Fundo");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 82, 147, 70, 13, IDC_OV_BTN_COR_BORDA, 0x0080, L"Cor Borda");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 157, 147, 75, 13, IDC_OV_BTN_COR_LABEL, 0x0080, L"Cor Labels");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 163, 70, 13, IDC_OV_BTN_COR_VALOR, 0x0080, L"Cor Valores");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 82, 163, 70, 13, IDC_OV_BTN_COR_CPU, 0x0080, L"Cor Barra CPU");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 157, 163, 75, 13, IDC_OV_BTN_COR_RAM, 0x0080, L"Cor Barra RAM");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 179, 85, 13, IDC_OV_BTN_COR_TEMP, 0x0080, L"Cor Temp");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 97, 179, 85, 13, IDC_OV_BTN_COR_DISCO, 0x0080, L"Cor Disco");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 187, 179, 45, 13, IDC_OV_BTN_COR_NET, 0x0080, L"Cor Net");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 196, 85, 13, IDC_OV_BTN_COR_SEP, 0x0080, L"Cor Separador");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 97, 196, 75, 13, IDC_OV_BARRAS, 0x0080, L"Mostrar barras");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 174, 196, 80, 13, IDC_OV_SEPARADORES, 0x0080, L"Separadores");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 214, 95, 10, -1, 0x0082, L"Espessura borda:");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 0, 105, 212, 28, 12, IDC_OV_BORDERW, 0x0081, L"1");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 161, 70, 13, IDC_OV_BTN_COR_BG, 0x0080, L"Cor Fundo");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 82, 161, 70, 13, IDC_OV_BTN_COR_BORDA, 0x0080, L"Cor Borda");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 157, 161, 75, 13, IDC_OV_BTN_COR_LABEL, 0x0080, L"Cor Labels");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 177, 70, 13, IDC_OV_BTN_COR_VALOR, 0x0080, L"Cor Valores");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 82, 177, 70, 13, IDC_OV_BTN_COR_CPU, 0x0080, L"Cor Barra CPU");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 157, 177, 75, 13, IDC_OV_BTN_COR_RAM, 0x0080, L"Cor Barra RAM");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 193, 85, 13, IDC_OV_BTN_COR_TEMP, 0x0080, L"Cor Temp");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 97, 193, 85, 13, IDC_OV_BTN_COR_DISCO, 0x0080, L"Cor Disco");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 187, 193, 45, 13, IDC_OV_BTN_COR_NET, 0x0080, L"Cor Net");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 7, 210, 85, 13, IDC_OV_BTN_COR_SEP, 0x0080, L"Cor Separador");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 97, 210, 75, 13, IDC_OV_BARRAS, 0x0080, L"Mostrar barras");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 174, 210, 80, 13, IDC_OV_SEPARADORES, 0x0080, L"Separadores");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 228, 95, 10, -1, 0x0082, L"Espessura borda:");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 0, 105, 226, 28, 12, IDC_OV_BORDERW, 0x0081, L"1");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 230, 260, 10, -1, 0x0082, L"Scroll no overlay altera o tamanho da fonte.");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 7, 244, 260, 10, -1, 0x0082, L"Scroll no overlay altera o tamanho da fonte.");
 
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 70, 243, 60, 14, IDOK, 0x0080, L"OK");
-    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 145, 243, 60, 14, IDCANCEL, 0x0080, L"Cancelar");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 70, 257, 60, 14, IDOK, 0x0080, L"OK");
+    ADD_CTRL(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 145, 257, 60, 14, IDCANCEL, 0x0080, L"Cancelar");
 
     DialogBoxIndirectA(GetModuleHandle(NULL), (LPDLGTEMPLATE)dlgBuf, hwndPai, DialogoConfigOverlayProc);
 
 #undef WRITE_STR_W
 #undef ALIGN_DW
 #undef ADD_CTRL
+}
+
+
+/* Notificacao WinMon posicionada imediatamente abaixo do overlay. */
+#define OV_TOAST_TIMER 0x7A31
+static char ovToastTitulo[128];
+static char ovToastMensagem[384];
+
+static LRESULT CALLBACK OverlayToastProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    (void)wp; (void)lp;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps); RECT rc;
+        HBRUSH bg = CreateSolidBrush(RGB(28, 30, 35));
+        GetClientRect(hwnd, &rc); FillRect(dc, &rc, bg); DeleteObject(bg);
+        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(245, 190, 90));
+        rc.left += 12; rc.top += 8; rc.right -= 10;
+        DrawTextA(dc, ovToastTitulo, -1, &rc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        rc.top += 22; rc.bottom -= 5; SetTextColor(dc, RGB(235, 237, 240));
+        DrawTextA(dc, ovToastMensagem, -1, &rc, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+        EndPaint(hwnd, &ps); return 0;
+    }
+    if (msg == WM_TIMER && wp == OV_TOAST_TIMER) {
+        KillTimer(hwnd, OV_TOAST_TIMER); ShowWindow(hwnd, SW_HIDE); DestroyWindow(hwnd); return 0;
+    }
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if (msg == WM_DESTROY) { if (hOverlayToast == hwnd) hOverlayToast = NULL; return 0; }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void MostrarAlertaAbaixoOverlay(const char *titulo, const char *mensagem)
+{
+    WNDCLASSA wc; RECT wr; int x, y, w, h = 76;
+    if (!hOverlay || !overlayAtivo) return;
+    strncpy_s(ovToastTitulo, sizeof(ovToastTitulo), titulo ? titulo : "WinMon", _TRUNCATE);
+    strncpy_s(ovToastMensagem, sizeof(ovToastMensagem), mensagem ? mensagem : "", _TRUNCATE);
+    if (!GetClassInfoA(GetModuleHandleA(NULL), "WinMonOverlayToast", &wc)) {
+        ZeroMemory(&wc, sizeof(wc)); wc.lpfnWndProc = OverlayToastProc;
+        wc.hInstance = GetModuleHandleA(NULL); wc.lpszClassName = "WinMonOverlayToast";
+        wc.hbrBackground = NULL; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        RegisterClassA(&wc);
+    }
+    if (hOverlayToast) { KillTimer(hOverlayToast, OV_TOAST_TIMER); DestroyWindow(hOverlayToast); }
+    GetWindowRect(hOverlay, &wr); w = wr.right - wr.left;
+    x = wr.left; y = wr.bottom + 5;
+    hOverlayToast = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        "WinMonOverlayToast", "WinMon Alerta", WS_POPUP, x, y, w, h,
+        NULL, NULL, GetModuleHandleA(NULL), NULL);
+    if (!hOverlayToast) return;
+    SetLayeredWindowAttributes(hOverlayToast, 0, 238, LWA_ALPHA);
+    ShowWindow(hOverlayToast, SW_SHOWNOACTIVATE); UpdateWindow(hOverlayToast);
+    SetTimer(hOverlayToast, OV_TOAST_TIMER, 5000, NULL);
 }
 
 static void CriarOverlay(void)
@@ -1454,7 +1528,7 @@ static void CriarOverlay(void)
     if (!hOverlay)
         return;
 
-    SetLayeredWindowAttributes(hOverlay, 0, OV_OPACIDADE, LWA_ALPHA);
+    AplicarAtributosOverlay();
     AplicarClickThrough();
     ShowWindow(hOverlay, SW_SHOWNOACTIVATE);
     UpdateWindow(hOverlay);

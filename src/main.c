@@ -248,6 +248,7 @@ typedef struct
     int mostrarVram; /* coluna VRAM (memoria da GPU) */
     int mostrarFreq; /* coluna FREQ (frequencia do CPU) */
     int clickThrough;
+    int modoTransparente;
 
     COLORREF corBg;
     COLORREF corBorda;
@@ -622,6 +623,9 @@ static void WM_ServicesCleanup(void);
 static BOOL WM_ServicesRefreshPanel(void);
 
 /* Implementacao organizada por areas; compilada como uma unica unidade (ver README). */
+static void MostrarAlertaAbaixoOverlay(const char *titulo, const char *mensagem);
+static void AplicarAtributosOverlay(void);
+static HWND hOverlayToast = NULL;
 #include "modules/01_network_status.inc"
 #include "modules/02_utilities_and_collection.inc"
 #include "modules/03_graphics.inc"
