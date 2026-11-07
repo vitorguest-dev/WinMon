@@ -35,7 +35,7 @@
 
 ## Visão geral
 
-O **WinMon** é uma aplicação Win32 em C que apresenta métricas do sistema em tempo real, organizadas por abas: **Resumo, CPU, Memória, Temperatura, Disco, Rede, GPU, Processos, Ligações, Definições e Rede Local**.
+O **WinMon** é uma aplicação Win32 em C que apresenta métricas do sistema em tempo real, organizadas por abas: **Resumo, CPU, Memória, Temperatura, Disco, Rede, GPU, Processos, Ligações, Definições, Rede Local, Serviços, Bateria e Ventoinhas**.
 
 Esta versão corresponde ao ficheiro original `main(4).c`, separado em ficheiros por área funcional para facilitar a leitura e a evolução, **preservando a ordem original da implementação**.
 
@@ -49,6 +49,9 @@ Esta versão corresponde ao ficheiro original `main(4).c`, separado em ficheiros
 | **Ligações de rede** | Visualização das ligações ativas do sistema |
 | **Rede local** | Descoberta de dispositivos via ARP, traceroute e testes DNS |
 | **Estado da rede** | Ping e informação de Wi-Fi |
+| **Qualidade da ligação** | Latência, jitter, perda de pacotes e tempos mínimo/médio/máximo por destino (Ferramentas de rede → Latência / jitter / perda) |
+| **Bateria** | Carga, alimentação AC/bateria, estado de carga e autonomia estimada |
+| **Ventoinhas** | Consulta de ventoinhas e velocidade desejada via WMI, quando o fabricante/driver expõe `Win32_Fan` |
 | **Sessões, logging e alertas** | Registo de sessões, exportação CSV e alertas configuráveis |
 | **Personalização** | Diálogos de estilo, com seleção de cores e fontes |
 | **Overlay** | Sobreposição de métricas no ecrã, com perfis |
@@ -82,7 +85,10 @@ WinMon-modular/
         ├── 08_sessions_logging_alerts.inc
         ├── 09_style_dialogs.inc
         ├── 10_overlay.inc
-        └── 11_window_and_entrypoint.inc
+        ├── 11_window_and_entrypoint.inc
+        ├── 12_network_extras.inc
+        ├── 13_services.inc
+        └── 14_hardware_extras.inc
 ```
 
 ## Módulos
@@ -99,6 +105,9 @@ WinMon-modular/
 | `08_sessions_logging_alerts.inc` | Sessões, CSV e alertas |
 | `09_style_dialogs.inc` | Diálogos de estilo e personalização |
 | `10_overlay.inc` | Overlay, perfis e desenho do overlay |
+| `12_network_extras.inc` | Ferramentas de rede, incluindo latência, jitter, perda e CSV de histórico |
+| `13_services.inc` | Monitorização de serviços Windows |
+| `14_hardware_extras.inc` | Monitorização da bateria e consulta WMI de ventoinhas |
 | `11_window_and_entrypoint.inc` | `WindowProc` e `WinMain` |
 
 ## Requisitos
@@ -151,7 +160,7 @@ Se o linker indicar uma biblioteca em falta, confirme que o Windows SDK está in
 
 1. Compile o executável (ver acima).
 2. Execute `WinMon.exe` num computador Windows.
-3. Explore as abas: Resumo, CPU, Memória, Temperatura, Disco, Rede, GPU, Processos, Ligações, Definições e Rede Local.
+3. Explore as abas: Resumo, CPU, Memória, Temperatura, Disco, Rede, GPU, Processos, Ligações, Definições, Rede Local, Serviços, Bateria e Ventoinhas.
 4. Use **Definições** para ajustar alertas, aparência, overlay, intervalo de atualização e logging, quando disponíveis.
 
 **Notas:**
@@ -169,7 +178,9 @@ Se o linker indicar uma biblioteca em falta, confirme que o Windows SDK está in
 - **Configure alertas em Definições** para ser avisado quando uma métrica ultrapassar os limites que definir.
 - **Use a exportação CSV** das sessões para analisar os dados numa folha de cálculo.
 - **Use os filtros e a ordenação** na aba Processos para encontrar rapidamente os maiores consumidores de recursos.
-- **Temperatura e GPU** podem aparecer vazias em alguns computadores: depende do hardware, dos drivers e dos serviços do Windows.
+- **Temperatura, GPU e RPM das ventoinhas** podem não estar disponíveis: dependem do hardware, dos drivers e dos fornecedores WMI. A página Ventoinhas indica quando `Win32_Fan` não é exposto.
+- A API nativa de energia do Windows fornece carga e autonomia estimada, mas não uma medição universal da saúde/capacidade máxima da bateria.
+- Para testar a qualidade da ligação, abra **Rede Local → Ferramentas de rede** e selecione **Latência / jitter / perda**. O teste envia 10 pedidos ICMP por destino; firewalls ou destinos que bloqueiem ICMP podem produzir perda aparente. Os resultados são acrescentados a `winmon_rede.csv`, junto ao executável.
 
 ### Problemas comuns
 
@@ -342,7 +353,10 @@ WinMon-modular/
         ├── 08_sessions_logging_alerts.inc
         ├── 09_style_dialogs.inc
         ├── 10_overlay.inc
-        └── 11_window_and_entrypoint.inc
+        ├── 11_window_and_entrypoint.inc
+        ├── 12_network_extras.inc
+        ├── 13_services.inc
+        └── 14_hardware_extras.inc
 ```
 
 ## Modules

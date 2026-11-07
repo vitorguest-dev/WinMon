@@ -159,8 +159,10 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_DEFINICOES 2010
 #define TAB_REDE_LOCAL 2011
 #define TAB_SERVICOS 2012
+#define TAB_ENERGIA 2013
+#define TAB_VENTOINHAS 2014
 #define NAV_LARGURA 188
-#define NUM_ABAS 12
+#define NUM_ABAS 14
 #define ALERT_HISTORY_MAX 100
 
 #define MAX_TEMP_ZONAS 16
@@ -388,6 +390,8 @@ HWND hGraphDisk = NULL;
 HWND hGraphNet = NULL;
 HWND hGraphGPU = NULL;
 HWND hGraphProcesses = NULL;
+HWND hEditEnergia = NULL;
+HWND hEditVentoinhas = NULL;
 
 /* --- Painel de processos full (aba Processos) --- */
 HWND hPainelProcessos = NULL;  /* container panel */
@@ -639,3 +643,4 @@ static HWND hOverlayToast = NULL;
 #include "modules/10_overlay.inc"
 #include "modules/11_window_and_entrypoint.inc"
 #include "modules/13_services.inc"
+#include "modules/14_hardware_extras.inc"

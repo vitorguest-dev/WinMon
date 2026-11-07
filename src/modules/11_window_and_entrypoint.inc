@@ -238,7 +238,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lParam;
 
         if (dis && dis->CtlType == ODT_BUTTON &&
-            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_SERVICOS)
+            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_VENTOINHAS)
         {
             DesenharBotaoNavegacao(dis);
             return TRUE;
@@ -520,7 +520,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         if (RedeLocalComando(hwnd, LOWORD(wParam), HIWORD(wParam)))
             return 0;
         if (LOWORD(wParam) >= TAB_RESUMO &&
-            LOWORD(wParam) <= TAB_SERVICOS &&
+            LOWORD(wParam) <= TAB_VENTOINHAS &&
             HIWORD(wParam) == BN_CLICKED)
         {
             int indice = LOWORD(wParam) - TAB_RESUMO;
@@ -969,6 +969,10 @@ static void ToggleCompactMode(void)
             ShowWindow(hLabelLigCount, SW_HIDE);
         if (hListViewLig)
             ShowWindow(hListViewLig, SW_HIDE);
+        if (hEditEnergia)
+            ShowWindow(hEditEnergia, SW_HIDE);
+        if (hEditVentoinhas)
+            ShowWindow(hEditVentoinhas, SW_HIDE);
         if (hSettingsTitle)
             ShowWindow(hSettingsTitle, SW_HIDE);
         for (int i = 0; i < SETTINGS_SECTIONS; i++)

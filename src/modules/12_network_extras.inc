@@ -268,6 +268,36 @@ static void nx_tool_adapters(HWND w)
 /* ------------------------------------------------------------------ */
 /* Ferramenta 1: monitor de hosts (ICMP)                              */
 /* ------------------------------------------------------------------ */
+/* Registo persistente dos testes de qualidade de ligacao. */
+static void nx_log_ping(const char *host, const char *ip, int sent, int recv,
+                        double minMs, double avgMs, double maxMs, double jitterMs)
+{
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    char *slash;
+    FILE *f = NULL;
+    SYSTEMTIME st;
+    int exists;
+    if (!n || n >= MAX_PATH) return;
+    slash = strrchr(path, '\\');
+    if (!slash) slash = strrchr(path, '/');
+    if (!slash) return;
+    slash[1] = 0;
+    if (strlen(path) + sizeof("winmon_rede.csv") >= sizeof path) return;
+    strcat_s(path, sizeof path, "winmon_rede.csv");
+    exists = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    if (fopen_s(&f, path, "a") != 0 || !f) return;
+    if (!exists)
+        fputs("timestamp,host,ip,enviados,recebidos,perda_pct,min_ms,media_ms,max_ms,jitter_ms\n", f);
+    GetLocalTime(&st);
+    fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u,%s,%s,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+            host, ip, sent, recv, sent ? 100.0 * (sent - recv) / sent : 100.0,
+            recv ? minMs : -1.0, recv ? avgMs : -1.0, recv ? maxMs : -1.0,
+            recv ? jitterMs : -1.0);
+    fclose(f);
+}
+
 
 static void nx_ping_host(HWND w, HANDLE icmp, const char *host)
 {
@@ -321,10 +351,18 @@ static void nx_ping_host(HWND w, HANDLE icmp, const char *host)
     if (sent == 0)
         return;
     if (recv == 0)
+    {
         nx_post(w, "%-24s %-15s 100%% perda (%d enviados)", host, ip, sent);
+        nx_log_ping(host, ip, sent, recv, -1.0, -1.0, -1.0, -1.0);
+    }
     else
+    {
+        double avg = sum / recv;
+        double jitter = jn ? jsum / jn : 0.0;
         nx_post(w, "%-24s %-15s perda %3.0f%%  min/med/max %.0f/%.1f/%.0f ms  jitter %.1f ms",
-                host, ip, 100.0 * (sent - recv) / sent, mn, sum / recv, mx, jn ? jsum / jn : 0.0);
+                host, ip, 100.0 * (sent - recv) / sent, mn, avg, mx, jitter);
+        nx_log_ping(host, ip, sent, recv, mn, avg, mx, jitter);
+    }
 }
 
 static void nx_tool_hosts(HWND w, const char *arg)
@@ -1143,7 +1181,7 @@ static void nx_update_hint(void)
 {
         static const char *hints[] = {
         "Sem argumentos: mostra as placas ativas, IPs, gateway e DNS.",
-        "Hosts separados por virgula. Vazio = gateway, 1.1.1.1 e 8.8.8.8.",
+        "Hosts separados por virgula. Vazio = gateway, 1.1.1.1 e 8.8.8.8. 10 pings; guarda historico em winmon_rede.csv.",
         "host [portas]  ex.: 192.168.1.1 22,80,443,8000-8010  (vazio = portas comuns; so IPs privados)",
         "Sem argumentos: dados recebidos/enviados hoje e neste mes.",
         "Sem argumentos: contadores TCP/UDP/IP (retransmissoes, erros, descartes).",
@@ -1213,7 +1251,7 @@ static LRESULT CALLBACK nx_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HINSTANCE hi = GetModuleHandleA(NULL);
         HFONT fUi = hFontUI ? hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         HFONT fMono = hFontMonitor ? hFontMonitor : (HFONT)GetStockObject(ANSI_FIXED_FONT);
-        static const char *nomes[] = {"Adaptadores", "Monitor de hosts", "Scan de portas", "Consumo de dados",
+        static const char *nomes[] = {"Adaptadores", "Latencia / jitter / perda", "Scan de portas", "Consumo de dados",
                               "Estatisticas de protocolo", "Wake-on-LAN", "MTU do caminho", "Tabela de rotas"};
         int i;
 

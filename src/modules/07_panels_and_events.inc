@@ -545,7 +545,7 @@ static void CriarAbas(HWND hwnd)
 {
     TCITEMA item;
     const char *nomes[] = {
-        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos"};
+        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos", "Bateria", "Ventoinhas"};
     int i;
 
     hTab = CreateWindowExA(
@@ -565,14 +565,14 @@ static void CriarAbas(HWND hwnd)
 
     {
         const char *navNomes[] = {
-            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos"};
+            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos", "Bateria", "Ventoinhas"};
 
         for (i = 0; i < NUM_ABAS; i++)
         {
             hNav[i] = CreateWindowExA(
                 0, "BUTTON", navNomes[i],
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
-                12, 42 + i * 38, NAV_LARGURA - 24, 30,
+                12, 62 + i * 31, NAV_LARGURA - 24, 28,
                 hwnd, (HMENU)(UINT_PTR)(TAB_RESUMO + i),
                 GetModuleHandle(NULL), NULL);
 
@@ -639,6 +639,7 @@ static void CriarAbas(HWND hwnd)
     CriarPainelDefinicoes(hwnd);
 
     WM_ServicesCreatePanel(hwnd);
+    HardwareExtrasCriar(hwnd);
 
     hCompact = CreateWindowExA(
         0, "WinMonCompactClass", "",

@@ -409,6 +409,7 @@ static void MostrarAba(int indice)
         RedeLocalMostrar(indice == 10);
     }
     WM_ServicesShow(indice == 11);
+    HardwareExtrasMostrar(indice);
 
     AtualizarDefinicoesVisibilidade();
     InvalidateRect(hMainWindow, NULL, TRUE);
@@ -470,8 +471,8 @@ static void RedimensionarConteudo(HWND hwnd)
         for (int i = 0; i < NUM_ABAS; i++)
         {
             if (hNav[i])
-                MoveWindow(hNav[i], 12, 66 + i * 39,
-                           NAV_LARGURA - 24, 34, TRUE);
+                MoveWindow(hNav[i], 12, 62 + i * 31,
+                           NAV_LARGURA - 24, 28, TRUE);
         }
 
         if (hEdit)
@@ -596,6 +597,7 @@ static void RedimensionarConteudo(HWND hwnd)
             int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
             RedeLocalRedimensionar(cx, cy, cw, ch);
         }
+        HardwareExtrasLayout(&rc);
         WM_ServicesLayout(&rc);
     }
 }
