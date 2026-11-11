@@ -328,13 +328,22 @@ static void CriarPainelProcessos(HWND hwndPai)
         (HMENU)(UINT_PTR)IDC_LABEL_PROC_COUNT,
         hInst, NULL);
 
-    /* Checkbox "Agrupar por nome" */
+    /* Checkbox "Nome" */
     hChkAgrupar = CreateWindowExA(
-        0, "BUTTON", "Agrupar por nome",
+        0, "BUTTON", "Nome",
         WS_CHILD | BS_AUTOCHECKBOX,
         0, 0, 140, 22,
         hwndPai,
         (HMENU)(UINT_PTR)IDC_CHK_AGRUPAR,
+        hInst, NULL);
+
+    /* Checkbox "Arvore" (pai/filho) */
+    hChkArvore = CreateWindowExA(
+        0, "BUTTON", "Arvore",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        0, 0, 130, 22,
+        hwndPai,
+        (HMENU)(UINT_PTR)IDC_CHK_ARVORE,
         hInst, NULL);
 
     /* ListView virtual — filho directo da janela principal */
@@ -545,7 +554,7 @@ static void CriarAbas(HWND hwnd)
 {
     TCITEMA item;
     const char *nomes[] = {
-        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos", "Bateria", "Ventoinhas"};
+        "Resumo", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos", "Bateria", "Ventoinhas", "Sistema"};
     int i;
 
     hTab = CreateWindowExA(
@@ -565,14 +574,14 @@ static void CriarAbas(HWND hwnd)
 
     {
         const char *navNomes[] = {
-            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos", "Bateria", "Ventoinhas"};
+            "Visao geral", "CPU", "Memoria", "Temperatura", "Disco", "Rede", "GPU", "Processos", "Ligacoes", "Definicoes", "Rede Local", "Servicos", "Bateria", "Ventoinhas", "Sistema"};
 
         for (i = 0; i < NUM_ABAS; i++)
         {
             hNav[i] = CreateWindowExA(
                 0, "BUTTON", navNomes[i],
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
-                12, 62 + i * 31, NAV_LARGURA - 24, 28,
+                12, 62 + i * 29, NAV_LARGURA - 24, 26,
                 hwnd, (HMENU)(UINT_PTR)(TAB_RESUMO + i),
                 GetModuleHandle(NULL), NULL);
 
@@ -640,6 +649,7 @@ static void CriarAbas(HWND hwnd)
 
     WM_ServicesCreatePanel(hwnd);
     HardwareExtrasCriar(hwnd);
+    SistemaInfoCriar(hwnd);
 
     hCompact = CreateWindowExA(
         0, "WinMonCompactClass", "",

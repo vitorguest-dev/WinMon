@@ -161,8 +161,10 @@ static const IID LOCAL_IID_IWbemLocator =
 #define TAB_SERVICOS 2012
 #define TAB_ENERGIA 2013
 #define TAB_VENTOINHAS 2014
+#define TAB_SISTEMA 2015
+#define WM_SYSINFO_DONE (WM_APP + 30) /* aba Sistema: texto WMI pronto (15_system_info.inc) */
 #define NAV_LARGURA 188
-#define NUM_ABAS 14
+#define NUM_ABAS 15
 #define ALERT_HISTORY_MAX 100
 
 #define MAX_TEMP_ZONAS 16
@@ -182,6 +184,9 @@ typedef struct
     int instancias; /* >1 apenas em linhas agrupadas (aba Processos) */
     double netDownBps; /* bytes/s recebidos pelo processo (TCP EStats) */
     double netUpBps;   /* bytes/s enviados pelo processo (TCP EStats) */
+    DWORD ppid;        /* PID do processo pai (Toolhelp) */
+    ULONGLONG criacao; /* instante de criacao (FILETIME); 0 = desconhecido */
+    int nivel;         /* profundidade na vista em arvore (0 = raiz) */
 } ProcessoInfo;
 
 typedef struct
@@ -392,6 +397,7 @@ HWND hGraphGPU = NULL;
 HWND hGraphProcesses = NULL;
 HWND hEditEnergia = NULL;
 HWND hEditVentoinhas = NULL;
+HWND hEditSistema = NULL;
 
 /* --- Painel de processos full (aba Processos) --- */
 HWND hPainelProcessos = NULL;  /* container panel */
@@ -447,9 +453,12 @@ static int g_lvSortDesc = 1; /* 1=descendente, 0=ascendente */
 
 /* agrupamento de processos pelo nome (ex.: 30x chrome.exe -> 1 linha) */
 #define IDC_CHK_AGRUPAR 6004
+#define IDC_CHK_ARVORE 6005
 static int g_lvAgrupar = 0;    /* 1 = vista agrupada */
 static int g_lvAgruparUI = -1; /* ultimo estado refletido na UI */
 HWND hChkAgrupar = NULL;
+static int g_lvArvore = 0; /* 1 = vista em arvore pai/filho (exclusiva do agrupamento) */
+HWND hChkArvore = NULL;
 
 /* aba Ligacoes */
 HWND hPainelLig = NULL;     /* label "Filtrar" */
@@ -626,6 +635,19 @@ static int WM_ServicesCommand(HWND hwnd, UINT id, UINT codigo);
 static void WM_ServicesCleanup(void);
 static BOOL WM_ServicesRefreshPanel(void);
 
+/* aba Sistema (15_system_info.inc) */
+static void SistemaInfoCriar(HWND parent);
+static void SistemaInfoMostrar(int indice);
+static void SistemaInfoLayout(const RECT *rc);
+static void SistemaInfoAtualizar(void);
+static void SistemaInfoMensagem(LPARAM lParam);
+
+/* ferramentas de processos (16_process_tools.inc) */
+static void MenuContextoProcesso(HWND hwnd, const ProcessoInfo *p);
+static int ProcDefinirPrioridade(DWORD pid, DWORD classe);
+static DWORD ProcClasseDoIndice(int i);
+static void ProcAnexarMenuPrioridade(HMENU sub, DWORD atual, UINT idBase);
+
 /* Implementacao organizada por areas; compilada como uma unica unidade (ver README). */
 static void MostrarAlertaAbaixoOverlay(const char *titulo, const char *mensagem);
 static void AplicarAtributosOverlay(void);
@@ -644,3 +666,5 @@ static HWND hOverlayToast = NULL;
 #include "modules/11_window_and_entrypoint.inc"
 #include "modules/13_services.inc"
 #include "modules/14_hardware_extras.inc"
+#include "modules/15_system_info.inc"
+#include "modules/16_process_tools.inc"

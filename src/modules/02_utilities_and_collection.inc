@@ -1053,6 +1053,7 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset)
 
                 SIZE_T memUsageMB = 0;
                 double cpuPercent = 0.0;
+                ULONGLONG criacao = 0;
 
                 if (hProcess)
                 {
@@ -1068,6 +1069,7 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset)
                                             &ftKernel, &ftUser))
                         {
                             ULONGLONG kernelU64 = FileTimeToU64(ftKernel);
+                            criacao = FileTimeToU64(ftCreate);
                             ULONGLONG userU64 = FileTimeToU64(ftUser);
                             ULONGLONG totalProcTime = kernelU64 + userU64;
                             ProcessoCpuHistorico *hist =
@@ -1115,6 +1117,9 @@ void MonitorarProcessos(char *buffer, size_t size, size_t *offset)
                 listaProcessos[totalProcessos].cpuPercent = cpuPercent;
                 listaProcessos[totalProcessos].netDownBps = 0.0;
                 listaProcessos[totalProcessos].netUpBps = 0.0;
+                listaProcessos[totalProcessos].ppid = pe32.th32ParentProcessID;
+                listaProcessos[totalProcessos].criacao = criacao;
+                listaProcessos[totalProcessos].nivel = 0;
 
                 strncpy_s(listaProcessos[totalProcessos].exeFile, MAX_PATH,
                           pe32.szExeFile, _TRUNCATE);

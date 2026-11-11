@@ -392,6 +392,12 @@ static void CarregarConfigIni(void)
                                         0, INI_FICHEIRO)
                       ? 1
                       : 0;
+    g_lvArvore = GetPrivateProfileIntA(INI_SECAO_GERAL, "ArvoreProcessos",
+                                       0, INI_FICHEIRO)
+                     ? 1
+                     : 0;
+    if (g_lvArvore)
+        g_lvAgrupar = 0; /* modos exclusivos */
 
     if (!_finite(limiteCpuPercent) || limiteCpuPercent < 1.0 || limiteCpuPercent > 100.0)
         limiteCpuPercent = LIMITE_CPU_PERCENT_DEFAULT;
@@ -423,6 +429,12 @@ static void GravarConfigIni(void)
 static void DefinirAgrupamentoProcessos(int ligado, int persistir)
 {
     g_lvAgrupar = ligado ? 1 : 0;
+    if (g_lvAgrupar)
+    {
+        g_lvArvore = 0; /* modos exclusivos */
+        if (persistir)
+            WritePrivateProfileStringA(INI_SECAO_GERAL, "ArvoreProcessos", "0", INI_FICHEIRO);
+    }
 
     /* ordenar por PID nao faz sentido em grupos: passa a RAM (desc) */
     if (g_lvAgrupar && g_lvSortCol == 1)
@@ -436,6 +448,26 @@ static void DefinirAgrupamentoProcessos(int ligado, int persistir)
     if (persistir)
         WritePrivateProfileStringA(INI_SECAO_GERAL, "AgruparProcessos",
                                    g_lvAgrupar ? "1" : "0", INI_FICHEIRO);
+
+    AtualizarListViewProcessos();
+}
+
+/* Liga/desliga a vista em arvore (pai/filho). Exclusiva do agrupamento. */
+static void DefinirArvoreProcessos(int ligado, int persistir)
+{
+    g_lvArvore = ligado ? 1 : 0;
+    if (g_lvArvore)
+    {
+        g_lvAgrupar = 0;
+        if (persistir)
+            WritePrivateProfileStringA(INI_SECAO_GERAL, "AgruparProcessos", "0", INI_FICHEIRO);
+    }
+
+    SincronizarUIAgrupamento();
+
+    if (persistir)
+        WritePrivateProfileStringA(INI_SECAO_GERAL, "ArvoreProcessos",
+                                   g_lvArvore ? "1" : "0", INI_FICHEIRO);
 
     AtualizarListViewProcessos();
 }

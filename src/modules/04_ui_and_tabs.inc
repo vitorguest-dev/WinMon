@@ -385,6 +385,8 @@ static void MostrarAba(int indice)
             ShowWindow(hLabelProcCount, visProc);
         if (hChkAgrupar)
             ShowWindow(hChkAgrupar, visProc);
+        if (hChkArvore)
+            ShowWindow(hChkArvore, visProc);
         if (hListViewProc)
             ShowWindow(hListViewProc, visProc);
     }
@@ -410,6 +412,7 @@ static void MostrarAba(int indice)
     }
     WM_ServicesShow(indice == 11);
     HardwareExtrasMostrar(indice);
+    SistemaInfoMostrar(indice);
 
     AtualizarDefinicoesVisibilidade();
     InvalidateRect(hMainWindow, NULL, TRUE);
@@ -471,8 +474,8 @@ static void RedimensionarConteudo(HWND hwnd)
         for (int i = 0; i < NUM_ABAS; i++)
         {
             if (hNav[i])
-                MoveWindow(hNav[i], 12, 62 + i * 31,
-                           NAV_LARGURA - 24, 28, TRUE);
+                MoveWindow(hNav[i], 12, 62 + i * 29,
+                           NAV_LARGURA - 24, 26, TRUE);
         }
 
         if (hEdit)
@@ -538,14 +541,18 @@ static void RedimensionarConteudo(HWND hwnd)
 
             {
                 int chkW = 140;
+                int arvW = 130;
                 int xChk = cx + 4 + lblW + 4 + editW + 8;
-                int xCnt = xChk + chkW + 4;
+                int xArv = xChk + chkW + 4;
+                int xCnt = xArv + arvW + 4;
                 int wCnt = cx + cw - xCnt - 4;
                 if (wCnt < 0)
                     wCnt = 0;
 
                 if (hChkAgrupar)
                     MoveWindow(hChkAgrupar, xChk, cy + 4, chkW, 22, TRUE);
+                if (hChkArvore)
+                    MoveWindow(hChkArvore, xArv, cy + 4, arvW, 22, TRUE);
                 if (hLabelProcCount)
                     MoveWindow(hLabelProcCount, xCnt, cy + 4, wCnt, 22, TRUE);
             }
@@ -598,6 +605,7 @@ static void RedimensionarConteudo(HWND hwnd)
             RedeLocalRedimensionar(cx, cy, cw, ch);
         }
         HardwareExtrasLayout(&rc);
+        SistemaInfoLayout(&rc);
         WM_ServicesLayout(&rc);
     }
 }

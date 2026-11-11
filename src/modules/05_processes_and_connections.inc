@@ -89,6 +89,117 @@ static int EncontrarGrupoLv(const char *nome, int n)
     return -1;
 }
 
+/* --- Vista em arvore (pai/filho) -------------------------------------------
+ * Constroi g_lvProcessos como lista "achatada" em pre-ordem: cada processo
+ * aparece logo abaixo do pai, com .nivel = profundidade (indentada em
+ * LvProcGetDispInfo). Os irmaos seguem a coluna de ordenacao ativa.
+ * Com filtro de texto, mostram-se os processos que coincidem e os seus
+ * antepassados, para manter o contexto. */
+static ProcessoInfo g_arvOrd[MAX_PROCESSES];
+static int g_arvPai[MAX_PROCESSES];
+static int g_arvFilho[MAX_PROCESSES];
+static int g_arvIrmao[MAX_PROCESSES];
+static unsigned char g_arvVis[MAX_PROCESSES];
+static unsigned char g_arvInc[MAX_PROCESSES];
+
+/* Indice do pai de arr[i] em arr[0..n), ou -1. Um PID reutilizado nao conta:
+ * o pai verdadeiro e sempre criado antes do filho. */
+static int ArvoreEncontrarPai(const ProcessoInfo *arr, int n, int i)
+{
+    int j;
+
+    if (arr[i].ppid == 0 || arr[i].ppid == arr[i].pid)
+        return -1;
+    for (j = 0; j < n; j++)
+    {
+        if (arr[j].pid != arr[i].ppid)
+            continue;
+        if (arr[j].criacao && arr[i].criacao && arr[j].criacao > arr[i].criacao)
+            continue;
+        return j;
+    }
+    return -1;
+}
+
+static void ArvoreEmitir(int no, int nivel)
+{
+    int f;
+
+    if (no < 0 || g_arvVis[no] || g_lvTotal >= MAX_PROCESSES)
+        return;
+    g_arvVis[no] = 1;
+    g_lvProcessos[g_lvTotal] = g_arvOrd[no];
+    g_lvProcessos[g_lvTotal].nivel = nivel;
+    g_lvProcessos[g_lvTotal].instancias = 1;
+    g_lvTotal++;
+    for (f = g_arvFilho[no]; f >= 0; f = g_arvIrmao[f])
+        ArvoreEmitir(f, nivel + 1);
+}
+
+static void ConstruirArvoreProcessos(const char *filtroLow)
+{
+    int n = g_totalProcessosBruto, i, j, m = 0, raiz = -1;
+
+    if (n > MAX_PROCESSES)
+        n = MAX_PROCESSES;
+
+    if (filtroLow[0] == '\0')
+        memset(g_arvInc, 1, (size_t)n);
+    else
+    {
+        memset(g_arvInc, 0, (size_t)n);
+        for (i = 0; i < n; i++)
+        {
+            int k = i, guarda = 0;
+
+            if (!ProcessoPassaFiltro(&listaProcessos[i], filtroLow))
+                continue;
+            while (k >= 0 && !g_arvInc[k] && guarda++ < 64)
+            {
+                g_arvInc[k] = 1;
+                k = ArvoreEncontrarPai(listaProcessos, n, k);
+            }
+        }
+    }
+
+    for (i = 0; i < n; i++)
+        if (g_arvInc[i])
+            g_arvOrd[m++] = listaProcessos[i];
+    if (m > 1)
+        qsort(g_arvOrd, (size_t)m, sizeof(ProcessoInfo), CompararLvProc);
+
+    for (j = 0; j < m; j++)
+    {
+        g_arvFilho[j] = -1;
+        g_arvIrmao[j] = -1;
+        g_arvVis[j] = 0;
+        g_arvPai[j] = ArvoreEncontrarPai(g_arvOrd, m, j);
+    }
+    /* de tras para a frente, para que as listas de irmaos fiquem ordenadas */
+    for (j = m - 1; j >= 0; j--)
+    {
+        int p = g_arvPai[j];
+
+        if (p < 0)
+        {
+            g_arvIrmao[j] = raiz;
+            raiz = j;
+        }
+        else
+        {
+            g_arvIrmao[j] = g_arvFilho[p];
+            g_arvFilho[p] = j;
+        }
+    }
+
+    g_lvTotal = 0;
+    for (j = raiz; j >= 0; j = g_arvIrmao[j])
+        ArvoreEmitir(j, 0);
+    for (j = 0; j < m; j++) /* ciclos residuais (PIDs reutilizados) */
+        if (!g_arvVis[j])
+            ArvoreEmitir(j, 0);
+}
+
 /* Preenche g_lvProcessos com base no filtro de texto actual.
  * Com g_lvAgrupar ativo, as instancias com o mesmo nome fundem-se numa
  * linha (CPU e RAM somados). O filtro aplica-se antes de agrupar. */
@@ -102,6 +213,12 @@ static void FiltrarListaProcessos(void)
     if (hEditPesquisaProc)
         GetWindowTextA(hEditPesquisaProc, filtro, (int)sizeof(filtro));
     ParaMinusculas(filtroLow, sizeof(filtroLow), filtro);
+
+    if (g_lvArvore)
+    {
+        ConstruirArvoreProcessos(filtroLow);
+        return;
+    }
 
     for (i = 0; i < g_totalProcessosBruto && n < MAX_PROCESSES; i++)
     {
@@ -170,6 +287,8 @@ static void SincronizarUIAgrupamento(void)
 {
     if (hChkAgrupar)
         Button_SetCheck(hChkAgrupar, g_lvAgrupar ? BST_CHECKED : BST_UNCHECKED);
+    if (hChkArvore)
+        Button_SetCheck(hChkArvore, g_lvArvore ? BST_CHECKED : BST_UNCHECKED);
 
     if (hListViewProc)
     {
@@ -227,7 +346,7 @@ static void MenuContextoGrupo(HWND hwnd, const ProcessoInfo *grupo)
     char txt[256];
     DWORD pidPrincipal = grupo->pid;
     int inst = grupo->instancias;
-    HMENU hMenu;
+    HMENU hMenu, hSub;
     POINT pt;
     UINT cmd;
     int i;
@@ -240,8 +359,13 @@ static void MenuContextoGrupo(HWND hwnd, const ProcessoInfo *grupo)
 
     snprintf(txt, sizeof(txt), "Terminar todas as instancias (%d)", inst);
     AppendMenuA(hMenu, MF_STRING, 1, txt);
-    snprintf(txt, sizeof(txt), "Definir Prioridade Alta (%d instancias)", inst);
-    AppendMenuA(hMenu, MF_STRING, 2, txt);
+    snprintf(txt, sizeof(txt), "Prioridade (%d instancias)", inst);
+    hSub = CreatePopupMenu();
+    if (hSub)
+    {
+        ProcAnexarMenuPrioridade(hSub, 0, 100);
+        AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hSub, txt);
+    }
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, 3, "Ver instancias individuais");
     AppendMenuA(hMenu, MF_STRING, 4, "Abrir Localizacao do Ficheiro");
@@ -252,6 +376,29 @@ static void MenuContextoGrupo(HWND hwnd, const ProcessoInfo *grupo)
     cmd = (UINT)TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                pt.x, pt.y, 0, hwnd, NULL);
     DestroyMenu(hMenu);
+
+    if (cmd >= 100 && cmd < 105)
+    {
+        int total = 0, ok = 0;
+
+        for (i = 0; i < totalListaProcessos; i++)
+        {
+            if (_stricmp(listaProcessos[i].exeFile, nome) != 0)
+                continue;
+            total++;
+            if (ProcDefinirPrioridade(listaProcessos[i].pid, ProcClasseDoIndice((int)cmd - 100)))
+                ok++;
+        }
+        if (ok < total)
+        {
+            snprintf(txt, sizeof(txt),
+                     "Prioridade alterada em %d de %d instancias "
+                     "(as restantes exigem mais permissoes).",
+                     ok, total);
+            MessageBoxA(hwnd, txt, "WinMon", MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
 
     switch (cmd)
     {
@@ -291,21 +438,6 @@ static void MenuContextoGrupo(HWND hwnd, const ProcessoInfo *grupo)
         }
         break;
     }
-    case 2:
-        for (i = 0; i < totalListaProcessos; i++)
-        {
-            HANDLE hProc;
-
-            if (_stricmp(listaProcessos[i].exeFile, nome) != 0)
-                continue;
-            hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, listaProcessos[i].pid);
-            if (hProc)
-            {
-                SetPriorityClass(hProc, HIGH_PRIORITY_CLASS);
-                CloseHandle(hProc);
-            }
-        }
-        break;
     case 3:
         MostrarInstanciasGrupo(nome);
         break;
@@ -375,8 +507,17 @@ static void LvProcGetDispInfo(NMLVDISPINFOA *pdi)
     switch (pdi->item.iSubItem)
     {
     case 0: /* Nome */
-        strncpy_s(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
-                  g_lvProcessos[idx].exeFile, _TRUNCATE);
+        if (g_lvArvore && g_lvProcessos[idx].nivel > 0)
+        {
+            int sp = g_lvProcessos[idx].nivel * 3;
+            if (sp > 60)
+                sp = 60;
+            snprintf(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
+                     "%*s|_ %s", sp, "", g_lvProcessos[idx].exeFile);
+        }
+        else
+            strncpy_s(pdi->item.pszText, (size_t)pdi->item.cchTextMax,
+                      g_lvProcessos[idx].exeFile, _TRUNCATE);
         break;
     case 1: /* PID (ou n.o de instancias num grupo) */
         if (g_lvAgrupar && g_lvProcessos[idx].instancias > 1)

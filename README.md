@@ -35,7 +35,7 @@
 
 ## Visão geral
 
-O **WinMon** é uma aplicação Win32 em C que apresenta métricas do sistema em tempo real, organizadas por abas: **Resumo, CPU, Memória, Temperatura, Disco, Rede, GPU, Processos, Ligações, Definições, Rede Local, Serviços, Bateria e Ventoinhas**.
+O **WinMon** é uma aplicação Win32 em C que apresenta métricas do sistema em tempo real, organizadas por abas: **Resumo, CPU, Memória, Temperatura, Disco, Rede, GPU, Processos, Ligações, Definições, Rede Local, Serviços, Bateria, Ventoinhas e Sistema**.
 
 Esta versão corresponde ao ficheiro original `main(4).c`, separado em ficheiros por área funcional para facilitar a leitura e a evolução, **preservando a ordem original da implementação**.
 
@@ -45,13 +45,14 @@ Esta versão corresponde ao ficheiro original `main(4).c`, separado em ficheiros
 |---|---|
 | **Monitorização em tempo real** | Métricas de CPU, memória, temperatura, disco, rede e GPU, apresentadas em abas dedicadas e num resumo geral |
 | **Gráficos interativos** | Desenho dos gráficos em tempo real, com interação e exportação |
-| **Processos** | Lista de processos com filtros e ordenação |
+| **Processos** | Lista de processos com filtros e ordenação, vista agrupada ou em árvore (pai/filho), menu de contexto com prioridade, afinidade de CPU, detalhes (caminho, linha de comandos, processo pai) e cópia da linha de comandos |
 | **Ligações de rede** | Visualização das ligações ativas do sistema |
 | **Rede local** | Descoberta de dispositivos via ARP, traceroute e testes DNS |
 | **Estado da rede** | Ping e informação de Wi-Fi |
 | **Qualidade da ligação** | Latência, jitter, perda de pacotes e tempos mínimo/médio/máximo por destino (Ferramentas de rede → Latência / jitter / perda) |
 | **Bateria** | Carga, alimentação AC/bateria, estado de carga e autonomia estimada |
 | **Ventoinhas** | Consulta de ventoinhas e velocidade desejada via WMI, quando o fabricante/driver expõe `Win32_Fan` |
+| **Sistema** | Sistema operativo, equipamento, placa-mãe, BIOS/UEFI, processador, módulos de RAM e placa gráfica (WMI, lido em segundo plano) |
 | **Sessões, logging e alertas** | Registo de sessões, exportação CSV e alertas configuráveis |
 | **Personalização** | Diálogos de estilo, com seleção de cores e fontes |
 | **Overlay** | Sobreposição de métricas no ecrã, com perfis |
@@ -88,7 +89,9 @@ WinMon-modular/
         ├── 11_window_and_entrypoint.inc
         ├── 12_network_extras.inc
         ├── 13_services.inc
-        └── 14_hardware_extras.inc
+        ├── 14_hardware_extras.inc
+        ├── 15_system_info.inc
+        └── 16_process_tools.inc
 ```
 
 ## Módulos
@@ -108,6 +111,8 @@ WinMon-modular/
 | `12_network_extras.inc` | Ferramentas de rede, incluindo latência, jitter, perda e CSV de histórico |
 | `13_services.inc` | Monitorização de serviços Windows |
 | `14_hardware_extras.inc` | Monitorização da bateria e consulta WMI de ventoinhas |
+| `15_system_info.inc` | Aba Sistema: consultas WMI (SO, BIOS, placa-mãe, CPU, RAM, GPU) numa thread própria |
+| `16_process_tools.inc` | Menu de contexto de processos: prioridade, afinidade de CPU, detalhes e linha de comandos |
 | `11_window_and_entrypoint.inc` | `WindowProc` e `WinMain` |
 
 ## Requisitos
@@ -160,7 +165,7 @@ Se o linker indicar uma biblioteca em falta, confirme que o Windows SDK está in
 
 1. Compile o executável (ver acima).
 2. Execute `WinMon.exe` num computador Windows.
-3. Explore as abas: Resumo, CPU, Memória, Temperatura, Disco, Rede, GPU, Processos, Ligações, Definições, Rede Local, Serviços, Bateria e Ventoinhas.
+3. Explore as abas: Resumo, CPU, Memória, Temperatura, Disco, Rede, GPU, Processos, Ligações, Definições, Rede Local, Serviços, Bateria, Ventoinhas e Sistema.
 4. Use **Definições** para ajustar alertas, aparência, overlay, intervalo de atualização e logging, quando disponíveis.
 
 **Notas:**
@@ -356,7 +361,9 @@ WinMon-modular/
         ├── 11_window_and_entrypoint.inc
         ├── 12_network_extras.inc
         ├── 13_services.inc
-        └── 14_hardware_extras.inc
+        ├── 14_hardware_extras.inc
+        ├── 15_system_info.inc
+        └── 16_process_tools.inc
 ```
 
 ## Modules

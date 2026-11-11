@@ -238,7 +238,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lParam;
 
         if (dis && dis->CtlType == ODT_BUTTON &&
-            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_VENTOINHAS)
+            dis->CtlID >= TAB_RESUMO && dis->CtlID <= TAB_SISTEMA)
         {
             DesenharBotaoNavegacao(dis);
             return TRUE;
@@ -339,79 +339,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
                         return 0;
                     }
 
-                    DWORD pid = g_lvProcessos[pnm->iItem].pid;
-                    char pidStr[16];
-                    snprintf(pidStr, sizeof(pidStr), "%u", pid);
-                    char exeNome[MAX_PATH];
-                    strncpy_s(exeNome, sizeof(exeNome), g_lvProcessos[pnm->iItem].exeFile, _TRUNCATE);
-
-                    HMENU hMenu = CreatePopupMenu();
-                    AppendMenuA(hMenu, MF_STRING, 1, "Terminar Processo");
-                    AppendMenuA(hMenu, MF_STRING, 2, "Definir Prioridade Alta");
-                    AppendMenuA(hMenu, MF_STRING, 3, "Abrir Localizacao do Ficheiro");
-                    AppendMenuA(hMenu, MF_STRING, 4, "Copiar PID");
-                    AppendMenuA(hMenu, MF_STRING, 5, "Ver ligacoes deste processo");
-
-                    POINT pt;
-                    GetCursorPos(&pt);
-                    UINT cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-                    DestroyMenu(hMenu);
-
-                    HANDLE hProc;
-                    switch (cmd)
-                    {
-                    case 1:
-                        if (MessageBoxA(hwnd, "Terminar este processo pode causar instabilidade. Deseja continuar?", "Aviso", MB_YESNO | MB_ICONWARNING) == IDYES)
-                        {
-                            hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-                            if (hProc)
-                            {
-                                TerminateProcess(hProc, 0);
-                                CloseHandle(hProc);
-                            }
-                        }
-                        break;
-                    case 2:
-                        hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
-                        if (hProc)
-                        {
-                            SetPriorityClass(hProc, HIGH_PRIORITY_CLASS);
-                            CloseHandle(hProc);
-                        }
-                        break;
-                    case 3:
-                        hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                        if (hProc)
-                        {
-                            char path[MAX_PATH];
-                            DWORD size = MAX_PATH;
-                            if (QueryFullProcessImageNameA(hProc, 0, path, &size))
-                            {
-                                char args[MAX_PATH + 32];
-                                snprintf(args, sizeof(args), "/select,\"%s\"", path);
-                                ShellExecuteA(NULL, "open", "explorer.exe", args, NULL, SW_SHOW);
-                            }
-                            CloseHandle(hProc);
-                        }
-                        break;
-                    case 4:
-                        if (OpenClipboard(hwnd))
-                        {
-                            EmptyClipboard();
-                            HGLOBAL hGlb = GlobalAlloc(GMEM_MOVEABLE, strlen(pidStr) + 1);
-                            if (hGlb)
-                            {
-                                memcpy(GlobalLock(hGlb), pidStr, strlen(pidStr) + 1);
-                                GlobalUnlock(hGlb);
-                                SetClipboardData(CF_TEXT, hGlb);
-                            }
-                            CloseClipboard();
-                        }
-                        break;
-                    case 5:
-                        MostrarLigacoesDoProcesso(exeNome);
-                        break;
-                    }
+                    MenuContextoProcesso(hwnd, &g_lvProcessos[pnm->iItem]);
                 }
                 return 0;
             }
@@ -511,6 +439,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         RedeLocalMensagem(uMsg, wParam, lParam);
         return 0;
 
+    case WM_SYSINFO_DONE:
+        SistemaInfoMensagem(lParam);
+        return 0;
+
     case WM_COMMAND:
         if (WM_ServicesCommand(
             hwnd,
@@ -520,7 +452,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         if (RedeLocalComando(hwnd, LOWORD(wParam), HIWORD(wParam)))
             return 0;
         if (LOWORD(wParam) >= TAB_RESUMO &&
-            LOWORD(wParam) <= TAB_VENTOINHAS &&
+            LOWORD(wParam) <= TAB_SISTEMA &&
             HIWORD(wParam) == BN_CLICKED)
         {
             int indice = LOWORD(wParam) - TAB_RESUMO;
@@ -545,6 +477,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg,
         {
             DefinirAgrupamentoProcessos(
                 Button_GetCheck(hChkAgrupar) == BST_CHECKED, 1);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_CHK_ARVORE &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            DefinirArvoreProcessos(
+                Button_GetCheck(hChkArvore) == BST_CHECKED, 1);
             return 0;
         }
         if (LOWORD(wParam) == IDC_EDIT_PESQUISA_PROC &&
@@ -877,6 +816,8 @@ static void AplicarVisibilidadeModoNormal(void)
         ShowWindow(hLabelProcCount, SW_SHOW);
     if (hChkAgrupar)
         ShowWindow(hChkAgrupar, SW_SHOW);
+    if (hChkArvore)
+        ShowWindow(hChkArvore, SW_SHOW);
     if (hListViewProc)
         ShowWindow(hListViewProc, SW_SHOW);
 
@@ -957,6 +898,8 @@ static void ToggleCompactMode(void)
             ShowWindow(hLabelProcCount, SW_HIDE);
         if (hChkAgrupar)
             ShowWindow(hChkAgrupar, SW_HIDE);
+        if (hChkArvore)
+            ShowWindow(hChkArvore, SW_HIDE);
         if (hListViewProc)
             ShowWindow(hListViewProc, SW_HIDE);
         if (hPainelLig)
@@ -973,6 +916,8 @@ static void ToggleCompactMode(void)
             ShowWindow(hEditEnergia, SW_HIDE);
         if (hEditVentoinhas)
             ShowWindow(hEditVentoinhas, SW_HIDE);
+        if (hEditSistema)
+            ShowWindow(hEditSistema, SW_HIDE);
         if (hSettingsTitle)
             ShowWindow(hSettingsTitle, SW_HIDE);
         for (int i = 0; i < SETTINGS_SECTIONS; i++)

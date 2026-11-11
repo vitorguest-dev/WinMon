@@ -1581,6 +1581,7 @@ void AtualizarMonitor()
     alertaGlobalAtivo = 0;
 
     HardwareExtrasAtualizar();
+    SistemaInfoAtualizar();
     MonitorarSistema(buffer, BUFFER_SIZE, &offset);
     MonitorarCPU(buffer, BUFFER_SIZE, &offset);
     LerTemperaturaCPU(buffer, BUFFER_SIZE, &offset);
