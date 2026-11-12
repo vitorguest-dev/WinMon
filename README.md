@@ -50,6 +50,9 @@ Esta versão corresponde ao ficheiro original `main(4).c`, separado em ficheiros
 | **Rede local** | Descoberta de dispositivos via ARP, traceroute e testes DNS |
 | **Estado da rede** | Ping e informação de Wi-Fi |
 | **Qualidade da ligação** | Latência, jitter, perda de pacotes e tempos mínimo/médio/máximo por destino (Ferramentas de rede → Latência / jitter / perda) |
+| **Diagnóstico HTTP/HTTPS** | Teste de URL com código HTTP, tempo até resposta e suporte de TLS/proxy do Windows |
+| **Consulta DNS** | Resolução IPv4 (A), IPv6 (AAAA) e tentativa de DNS inverso (PTR) |
+| **Wi-Fi** | SSID, qualidade do sinal, tipo PHY, velocidades de receção/emissão, BSSID e algoritmo de autenticação |
 | **Bateria** | Carga, alimentação AC/bateria, estado de carga e autonomia estimada |
 | **Ventoinhas** | Consulta de ventoinhas e velocidade desejada via WMI, quando o fabricante/driver expõe `Win32_Fan` |
 | **Sistema** | Sistema operativo, equipamento, placa-mãe, BIOS/UEFI, processador, módulos de RAM e placa gráfica (WMI, lido em segundo plano) |
@@ -108,7 +111,7 @@ WinMon-modular/
 | `08_sessions_logging_alerts.inc` | Sessões, CSV e alertas |
 | `09_style_dialogs.inc` | Diálogos de estilo e personalização |
 | `10_overlay.inc` | Overlay, perfis e desenho do overlay |
-| `12_network_extras.inc` | Ferramentas de rede, incluindo latência, jitter, perda e CSV de histórico |
+| `12_network_extras.inc` | Ferramentas de rede: adaptadores, latência/jitter/perda, scan TCP local, consumo, estatísticas, Wake-on-LAN, MTU, rotas, teste HTTP/HTTPS, consulta DNS e detalhes Wi-Fi |
 | `13_services.inc` | Monitorização de serviços Windows |
 | `14_hardware_extras.inc` | Monitorização da bateria e consulta WMI de ventoinhas |
 | `15_system_info.inc` | Aba Sistema: consultas WMI (SO, BIOS, placa-mãe, CPU, RAM, GPU) numa thread própria |
@@ -140,7 +143,7 @@ gcc -std=c11 -O2 -Wall -Wextra -municode -mwindows \
   -o WinMon.exe src/main.c \
   -lpdh -liphlpapi -lws2_32 -luser32 -lpsapi -lgdi32 \
   -lshell32 -lcomctl32 -lole32 -loleaut32 -lwbemuuid \
-  -ladvapi32 -lcomdlg32 -lwindowscodecs -ldnsapi -luuid
+  -ladvapi32 -lcomdlg32 -lwindowscodecs -ldnsapi -lwlanapi -lwinhttp -luuid
 ```
 
 > [!NOTE]
@@ -156,7 +159,7 @@ Abra a **x64 Native Tools Command Prompt for VS** ou a **Developer PowerShell fo
 cl /nologo /std:c11 /O2 /W4 /GS /sdl /guard:cf /DYNAMICBASE /NXCOMPAT /Fe:WinMon.exe src\main.c ^
   pdh.lib iphlpapi.lib ws2_32.lib user32.lib psapi.lib gdi32.lib shell32.lib ^
   comctl32.lib ole32.lib oleaut32.lib wbemuuid.lib advapi32.lib comdlg32.lib ^
-  windowscodecs.lib dnsapi.lib
+  windowscodecs.lib dnsapi.lib wlanapi.lib winhttp.lib
 ```
 
 Se o linker indicar uma biblioteca em falta, confirme que o Windows SDK está instalado e acrescente a biblioteca correspondente. As diretivas `#pragma comment(lib, ...)` do código também declaram várias dependências para MSVC.
@@ -407,7 +410,7 @@ gcc -std=c11 -O2 -Wall -Wextra -municode -mwindows \
   -o WinMon.exe src/main.c \
   -lpdh -liphlpapi -lws2_32 -luser32 -lpsapi -lgdi32 \
   -lshell32 -lcomctl32 -lole32 -loleaut32 -lwbemuuid \
-  -ladvapi32 -lcomdlg32 -lwindowscodecs -ldnsapi -luuid
+  -ladvapi32 -lcomdlg32 -lwindowscodecs -ldnsapi -lwlanapi -lwinhttp -luuid
 ```
 
 > [!NOTE]
@@ -423,7 +426,7 @@ Open the **x64 Native Tools Command Prompt for VS** or **Developer PowerShell fo
 cl /nologo /std:c11 /O2 /W4 /GS /sdl /guard:cf /DYNAMICBASE /NXCOMPAT /Fe:WinMon.exe src\main.c ^
   pdh.lib iphlpapi.lib ws2_32.lib user32.lib psapi.lib gdi32.lib shell32.lib ^
   comctl32.lib ole32.lib oleaut32.lib wbemuuid.lib advapi32.lib comdlg32.lib ^
-  windowscodecs.lib dnsapi.lib
+  windowscodecs.lib dnsapi.lib wlanapi.lib winhttp.lib
 ```
 
 If the linker reports a missing library, make sure the Windows SDK is installed and add the corresponding system library. The `#pragma comment(lib, ...)` directives in the code also declare several dependencies for MSVC.
