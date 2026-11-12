@@ -55,6 +55,8 @@
 #include <ctype.h>
 #include <wincodec.h>
 #include <icmpapi.h>
+#include <wlanapi.h>
+#include <winhttp.h>
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -70,6 +72,8 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "wlanapi.lib")
+#pragma comment(lib, "winhttp.lib")
 
 #define _WIN32_DCOM
 #include <wbemidl.h>

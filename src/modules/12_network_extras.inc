@@ -1125,6 +1125,237 @@ static void nx_tool_routes(HWND w)
 }
 
 /* ------------------------------------------------------------------ */
+/* Ferramenta 8: teste de endpoint HTTP/HTTPS                          */
+/* ------------------------------------------------------------------ */
+static void nx_tool_http(HWND w, const char *arg)
+{
+    WCHAR url[1024], host[256], path[768], extra[256];
+    URL_COMPONENTS uc;
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    DWORD status = 0, statusSz = sizeof status;
+    DWORD flags = 0;
+    ULONGLONG t0, elapsed;
+    int n;
+
+    if (!arg || !*arg)
+    {
+        nx_post(w, "Indica um URL, por exemplo: https://example.com/ ou http://192.168.1.1/health");
+        return;
+    }
+    n = MultiByteToWideChar(CP_ACP, 0, arg, -1, url, (int)(sizeof url / sizeof url[0]));
+    if (!n)
+    {
+        nx_post(w, "URL demasiado longo ou com codificacao invalida.");
+        return;
+    }
+    ZeroMemory(&uc, sizeof uc);
+    uc.dwStructSize = sizeof uc;
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = (DWORD)(sizeof host / sizeof host[0]);
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = (DWORD)(sizeof path / sizeof path[0]);
+    uc.lpszExtraInfo = extra;
+    uc.dwExtraInfoLength = (DWORD)(sizeof extra / sizeof extra[0]);
+    if (!WinHttpCrackUrl(url, 0, 0, &uc) ||
+        (uc.nScheme != INTERNET_SCHEME_HTTP && uc.nScheme != INTERNET_SCHEME_HTTPS) ||
+        uc.dwHostNameLength >= sizeof host / sizeof host[0] ||
+        uc.dwUrlPathLength >= sizeof path / sizeof path[0] ||
+        uc.dwExtraInfoLength >= sizeof extra / sizeof extra[0])
+    {
+        nx_post(w, "URL invalido: usa http:// ou https://.");
+        return;
+    }
+    if (uc.dwUrlPathLength == 0)
+        wcscpy_s(path, sizeof path / sizeof path[0], L"/");
+    else if (uc.dwUrlPathLength >= sizeof path / sizeof path[0])
+    {
+        nx_post(w, "Caminho do URL demasiado longo.");
+        return;
+    }
+    if (uc.dwUrlPathLength) path[uc.dwUrlPathLength] = 0;
+    if (uc.dwExtraInfoLength && wcslen(path) + uc.dwExtraInfoLength < sizeof path / sizeof path[0])
+    {
+        extra[uc.dwExtraInfoLength] = 0;
+        wcscat_s(path, sizeof path / sizeof path[0], extra);
+    }
+
+    nx_post(w, "A testar %s ...", arg);
+    t0 = GetTickCount64();
+    ses = WinHttpOpen(L"WinMon/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) goto failed;
+    WinHttpSetTimeouts(ses, 5000, 5000, 5000, 8000);
+    con = WinHttpConnect(ses, host, uc.nPort, 0);
+    if (!con) goto failed;
+    if (uc.nScheme == INTERNET_SCHEME_HTTPS) flags |= WINHTTP_FLAG_SECURE;
+    req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                             WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!req) goto failed;
+    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(req, NULL))
+        goto failed;
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSz, WINHTTP_NO_HEADER_INDEX))
+        goto failed;
+    elapsed = GetTickCount64() - t0;
+    nx_post(w, "Resultado: HTTP %lu %s", (unsigned long)status,
+            status >= 200 && status < 400 ? "(sucesso/redirecionamento)" : "(resposta HTTP nao-2xx/3xx)");
+    nx_post(w, "Tempo ate resposta: %llu ms | protocolo: %s | porta: %u",
+            (unsigned long long)elapsed, flags ? "HTTPS" : "HTTP", (unsigned)uc.nPort);
+    goto cleanup;
+failed:
+    nx_post(w, "Falha na ligacao/pedido (erro WinHTTP %lu). Verifica DNS, proxy, firewall, TLS e URL.",
+            (unsigned long)GetLastError());
+cleanup:
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+}
+
+/* ------------------------------------------------------------------ */
+/* Ferramenta 9: consulta DNS A/AAAA e DNS inverso                     */
+/* ------------------------------------------------------------------ */
+static void nx_tool_dns(HWND w, const char *arg)
+{
+    char host[256];
+    struct addrinfo hints, *res = NULL, *it;
+    int rc, count = 0;
+    if (!arg || sscanf(arg, "%255s", host) != 1)
+    {
+        nx_post(w, "Indica um nome ou endereco IP, por exemplo: openai.com ou 1.1.1.1");
+        return;
+    }
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_CANONNAME;
+    rc = getaddrinfo(host, NULL, &hints, &res);
+    if (rc != 0)
+    {
+        nx_post(w, "Resolucao de '%s' falhou (codigo Winsock %d).", host, rc);
+        return;
+    }
+    nx_post(w, "Registos de endereco para %s:", host);
+    for (it = res; it; it = it->ai_next)
+    {
+        char ip[INET6_ADDRSTRLEN], reverse[NI_MAXHOST];
+        if (it->ai_family != AF_INET && it->ai_family != AF_INET6) continue;
+        if (!nx_addr_text(it->ai_addr, (int)it->ai_addrlen, ip, sizeof ip)) continue;
+        if (getnameinfo(it->ai_addr, (socklen_t)it->ai_addrlen, reverse, sizeof reverse,
+                        NULL, 0, NI_NAMEREQD) != 0)
+            strcpy_s(reverse, sizeof reverse, "(sem PTR)");
+        nx_post(w, "  %-4s %s  PTR: %s", it->ai_family == AF_INET ? "A" : "AAAA", ip, reverse);
+        count++;
+    }
+    nx_post(w, "Total: %d endereco(s). A resposta depende do DNS configurado no Windows.", count);
+    freeaddrinfo(res);
+}
+
+/* ------------------------------------------------------------------ */
+/* Ferramenta 10: estado e qualidade das interfaces Wi-Fi              */
+/* ------------------------------------------------------------------ */
+static const char *nx_auth_name(DOT11_AUTH_ALGORITHM a)
+{
+    switch (a)
+    {
+    case DOT11_AUTH_ALGO_80211_OPEN: return "Aberta";
+    case DOT11_AUTH_ALGO_80211_SHARED_KEY: return "WEP/Shared";
+    case DOT11_AUTH_ALGO_WPA: return "WPA";
+    case DOT11_AUTH_ALGO_WPA_PSK: return "WPA-PSK";
+    case DOT11_AUTH_ALGO_RSNA: return "WPA2/802.1X";
+    case DOT11_AUTH_ALGO_RSNA_PSK: return "WPA2-PSK";
+#ifdef DOT11_AUTH_ALGO_WPA3
+    case DOT11_AUTH_ALGO_WPA3: return "WPA3";
+    case DOT11_AUTH_ALGO_WPA3_SAE: return "WPA3-SAE";
+#endif
+    default: return "Outro/nao identificado";
+    }
+}
+
+static const char *nx_phy_name(DOT11_PHY_TYPE p)
+{
+    /*
+     * Valores definidos pela enum DOT11_PHY_TYPE do Windows SDK.
+     * Usar os valores numericos evita depender dos nomes dos enumeradores,
+     * que nao estao expostos de forma consistente em algumas versoes MinGW-w64.
+     */
+    switch ((int)p)
+    {
+    case 1:  return "FHSS";
+    case 2:  return "DSSS";
+    case 3:  return "IR";
+    case 4:  return "802.11a/g";
+    case 5:  return "802.11b";
+    case 6:  return "802.11g";
+    case 7:  return "802.11n";
+    case 8:  return "802.11ac";
+    case 10: return "802.11ax";
+    case 11: return "802.11be";
+    default: return "Outro/nao identificado";
+    }
+}
+
+static void nx_tool_wifi(HWND w)
+{
+    HANDLE client = NULL;
+    DWORD version = 0, rc;
+    PWLAN_INTERFACE_INFO_LIST list = NULL;
+    DWORD i;
+    rc = WlanOpenHandle(2, NULL, &version, &client);
+    if (rc != ERROR_SUCCESS)
+    {
+        nx_post(w, "Nao foi possivel abrir WLAN API (erro %lu).", (unsigned long)rc);
+        return;
+    }
+    rc = WlanEnumInterfaces(client, NULL, &list);
+    if (rc != ERROR_SUCCESS || !list)
+    {
+        nx_post(w, "Nao foi possivel enumerar interfaces Wi-Fi (erro %lu).", (unsigned long)rc);
+        WlanCloseHandle(client, NULL);
+        return;
+    }
+    if (!list->dwNumberOfItems) nx_post(w, "Nao foram encontradas interfaces Wi-Fi.");
+    for (i = 0; i < list->dwNumberOfItems; i++)
+    {
+        WLAN_INTERFACE_INFO *inf = &list->InterfaceInfo[i];
+        WLAN_CONNECTION_ATTRIBUTES *attr = NULL;
+        DWORD size = 0;
+        WLAN_OPCODE_VALUE_TYPE type;
+        char name[256];
+        nx_w2a(inf->strInterfaceDescription, name, sizeof name);
+        nx_post(w, "Interface: %s | estado: %s", name,
+                inf->isState == wlan_interface_state_connected ? "ligada" : "desligada");
+        if (inf->isState != wlan_interface_state_connected) continue;
+        rc = WlanQueryInterface(client, &inf->InterfaceGuid, wlan_intf_opcode_current_connection,
+                                NULL, &size, (PVOID *)&attr, &type);
+        if (rc == ERROR_SUCCESS && attr)
+        {
+            char ssid[DOT11_SSID_MAX_LENGTH + 1];
+            DWORD q = attr->wlanAssociationAttributes.wlanSignalQuality;
+            size_t len = attr->wlanAssociationAttributes.dot11Ssid.uSSIDLength;
+            if (len > DOT11_SSID_MAX_LENGTH) len = DOT11_SSID_MAX_LENGTH;
+            memcpy(ssid, attr->wlanAssociationAttributes.dot11Ssid.ucSSID, len);
+            ssid[len] = 0;
+            nx_post(w, "  SSID: %s | sinal: %lu%% | PHY: %s",
+                    ssid, (unsigned long)q,
+                    nx_phy_name(attr->wlanAssociationAttributes.dot11PhyType));
+            nx_post(w, "  Velocidade PHY: rececao %lu Kbps / emissao %lu Kbps",
+                    (unsigned long)attr->wlanAssociationAttributes.ulRxRate,
+                    (unsigned long)attr->wlanAssociationAttributes.ulTxRate);
+            nx_post(w, "  Seguranca: %s | BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+                    nx_auth_name(attr->wlanSecurityAttributes.dot11AuthAlgorithm),
+                    attr->wlanAssociationAttributes.dot11Bssid[0], attr->wlanAssociationAttributes.dot11Bssid[1],
+                    attr->wlanAssociationAttributes.dot11Bssid[2], attr->wlanAssociationAttributes.dot11Bssid[3],
+                    attr->wlanAssociationAttributes.dot11Bssid[4], attr->wlanAssociationAttributes.dot11Bssid[5]);
+            WlanFreeMemory(attr);
+        }
+        else nx_post(w, "  Nao foi possivel consultar a ligacao (erro %lu).", (unsigned long)rc);
+    }
+    WlanFreeMemory(list);
+    WlanCloseHandle(client, NULL);
+}
+
+/* ------------------------------------------------------------------ */
 /* Thread de trabalho                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -1158,6 +1389,15 @@ static DWORD WINAPI nx_thread(LPVOID p)
             break;
         case 7:
             nx_tool_routes(w);
+            break;
+        case 8:
+            nx_tool_http(w, j->arg);
+            break;
+        case 9:
+            nx_tool_dns(w, j->arg);
+            break;
+        case 10:
+            nx_tool_wifi(w);
             break;     
         default:
             break;
@@ -1187,13 +1427,16 @@ static void nx_update_hint(void)
         "Sem argumentos: contadores TCP/UDP/IP (retransmissoes, erros, descartes).",
         "MAC [broadcast]  ex.: AA:BB:CC:DD:EE:FF  ou  AA:BB:CC:DD:EE:FF 192.168.1.255",
         "Host destino (vazio = 1.1.1.1). Descobre o maior pacote que passa sem fragmentar.",
-        "Sem argumentos: rotas IPv4/IPv6 com proximo salto, metrica e interface."};
+        "Sem argumentos: rotas IPv4/IPv6 com proximo salto, metrica e interface.",
+        "URL HTTP/HTTPS, ex.: https://example.com/health. Mede o tempo ate resposta e mostra o estado HTTP.",
+        "Nome ou IP para consultar A/AAAA e tentar resolucao inversa PTR.",
+        "Sem argumentos: SSID, sinal, tipo PHY, velocidades, BSSID e seguranca das interfaces Wi-Fi."};
     int t = (int)SendMessageA(nxTool, CB_GETCURSEL, 0, 0);
 
-    if (t < 0 || t > 7)
+    if (t < 0 || t > 10)
         t = 0;
     SetWindowTextA(nxHint, hints[t]);
-    EnableWindow(nxArg, t == 1 || t == 2 || t == 5 || t == 6);
+    EnableWindow(nxArg, t == 1 || t == 2 || t == 5 || t == 6 || t == 8 || t == 9);
 }
 
 static void nx_run(HWND hwnd)
@@ -1252,7 +1495,7 @@ static LRESULT CALLBACK nx_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HFONT fUi = hFontUI ? hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         HFONT fMono = hFontMonitor ? hFontMonitor : (HFONT)GetStockObject(ANSI_FIXED_FONT);
         static const char *nomes[] = {"Adaptadores", "Latencia / jitter / perda", "Scan de portas", "Consumo de dados",
-                              "Estatisticas de protocolo", "Wake-on-LAN", "MTU do caminho", "Tabela de rotas"};
+                              "Estatisticas de protocolo", "Wake-on-LAN", "MTU do caminho", "Tabela de rotas", "Teste HTTP/HTTPS", "Consulta DNS", "Detalhes Wi-Fi"};
         int i;
 
         nxTool = CreateWindowExA(0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
@@ -1267,7 +1510,7 @@ static LRESULT CALLBACK nx_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                     ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
                                 0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_NX_OUT, hi, NULL);
-        for (i = 0; i < 8; i++)
+        for (i = 0; i < 11; i++)
             SendMessageA(nxTool, CB_ADDSTRING, 0, (LPARAM)nomes[i]);
         SendMessageA(nxTool, CB_SETCURSEL, 0, 0);
         SendMessageA(nxOut, EM_SETLIMITTEXT, 2000000, 0);
